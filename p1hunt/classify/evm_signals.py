@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .signals import _IGNORE_DIRS, Signal, SignalHit
+from .signals import _IGNORE_DIRS, Signal, SignalHit, scan_artifacts
 
 # Threshold above which a Solidity codebase is considered "assembly-heavy / hardened".
 # Expressed as inline-assembly blocks per .sol file (a low bar: even one assembly block
@@ -166,3 +166,36 @@ def should_demote_keyword_signals(repo_path: str) -> bool:
     if not _sol_files(repo_path):
         return False
     return evm_assembly_density(repo_path) >= _ASSEMBLY_HEAVY_THRESHOLD
+
+
+def scan_combined(artifact_dir: str, *, max_files: int = 800) -> list[SignalHit]:
+    """The unified detection lens (spec §2.4): the generic detectors PLUS the EVM-specific
+    high-value detectors, with keyword noise demoted on hardened/assembly-heavy Solidity.
+
+    This is the gap that left hardened EVM targets (e.g. an assembly-heavy exchange) effectively
+    un-scanned: the run path used :func:`signals.scan_artifacts` alone, so the Solidity-aware
+    detectors in this module never fired on the very code class they were written for. Behaviour:
+
+    * **No ``.sol`` in the tree** → identical to :func:`scan_artifacts` (generic-only).
+    * **EVM present but not assembly-heavy** → generic hits + EVM hits (both lenses contribute).
+    * **EVM present and assembly-heavy/hardened** → generic hits inside ``.sol`` files are DROPPED
+      as low-signal keyword noise (generic hits in configs / CI / manifests are kept, they stay
+      relevant) and the EVM detectors lead. This implements the demotion that
+      :func:`should_demote_keyword_signals` only used to advise.
+
+    NOTHING PRESET (spec §1): every returned hit is still a derived pattern match against the
+    actual artifacts — never a per-target/per-program surface or hypothesis list.
+    """
+    generic = scan_artifacts(artifact_dir, max_files=max_files)
+    evm = scan_evm(artifact_dir)
+    if not evm:
+        return generic
+    if should_demote_keyword_signals(artifact_dir):
+        # Drop only the WEB/cloud keyword noise inside .sol files; KEEP the high-value EVM-class
+        # generic detectors (evm-tx-origin / evm-delegatecall / selfdestruct), which live in the
+        # generic SIGNALS list and only ever match .sol — demoting them would discard the strongest
+        # leads on exactly the hardened EVM targets this path serves.
+        generic = [h for h in generic
+                   if not h.file.lower().endswith(".sol") or h.signal.id.startswith("evm-")]
+    # EVM hits lead on EVM targets (the high-value lens), then the surviving generic hits.
+    return evm + generic

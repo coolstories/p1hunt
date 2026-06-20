@@ -43,6 +43,40 @@ _ESCAPE = re.compile(
     | \b(mkfs|fdisk|parted)\b | \bdd\b[^\n|;&]*\bof=\s*/dev/
     """,
 )
+# CATASTROPHIC ops that are NEVER allowed — not even as part of a tool install. These can brick the
+# host or wipe the disk, which no "install a tool" task can justify; checked before everything else.
+_CATASTROPHIC = re.compile(
+    r"""(?ix)
+    \b(shutdown|reboot|halt|poweroff)\b
+    | \b(mkfs\w*|mkswap|wipefs|fdisk|parted|sgdisk)\b
+    | \bdd\b[^\n|;&]*\bof=\s*/dev/
+    | :\s*\(\s*\)\s*\{                                  # fork bomb  :(){ :|:& };:
+    | \brm\b\s+(?:-\S+\s+)*(?:/|/\*|~|\$HOME)(?:\s|$)   # rm -rf /  ·  rm -rf ~
+    """,
+)
+# TOOL INSTALL — the agent may install ANY tool it needs to do the audit (compilers, analyzers,
+# fuzzers, Foundry, language toolchains, system packages), via the standard mechanisms INCLUDING
+# sudo package managers and official installer scripts. A command recognized here is permitted even
+# under a sudo block, an out-of-workspace write (installs land in /usr/local etc.), or a no-egress
+# posture (fetching a tool to install is PROVISIONING, not data egress to the target). Catastrophic
+# ops above are still denied first. Gated by PermissionPolicy.allow_install (default on).
+_TOOL_INSTALL = re.compile(
+    r"""(?ix)
+    (?:\bsudo\s+|\bdoas\s+)?                                  # optional privilege for system pkgs
+    (?:
+        (?:apt|apt-get|aptitude|yum|dnf|apk|pacman|zypper|snap|brew|port|nix-env|nix|emerge|pkg|xbps-install)
+            \s+(?:install|add|-S|-i|in|reinstall|update|upgrade|tap|bootstrap)
+      | (?:pip3?|pipx|uv|conda|mamba|poetry|pdm)\s+(?:install|add|sync)
+      | (?:npm|pnpm|yarn|bun)\s+(?:i|install|ci|add|global)
+      | cargo\s+(?:install|add|fetch|binstall)
+      | go\s+(?:install|get)
+      | (?:gem|luarocks|opam|cabal|stack|cpan|composer)\s+(?:install|add|i)
+      | (?:rustup|foundryup|nvm|asdf|sdk|gvm|pyenv|rbenv|goenv|volta|solc-select|svm)\b
+      | (?:add-apt-repository|apt-key)\b
+      | (?:make|cmake|ninja|meson)\s+install\b
+      | (?:curl|wget)\s+[^\n|]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh)   # official installer scripts
+    )""",
+)
 # Secret/credential paths — reading or touching them is out of scope (mirrors the file guard).
 _SENSITIVE_FS = re.compile(
     r"""(?ix)
@@ -177,14 +211,43 @@ async def _await_throttle(on_event: Callable, agent: str) -> None:
         await asyncio.sleep(min(rem, 20.0))
 
 
-def bash_safety(command: str, workspace: str | None = None) -> tuple[bool, str]:
+# Parent-A permission posture enforcement (PermissionPolicy). Network egress verbs and dependency
+# installs are allowed by DEFAULT (loosened jail); these patterns are consulted ONLY when Parent A
+# has tightened the posture (allow_network/allow_install False) — so the common path is unaffected.
+_NET_CMD = re.compile(
+    r"""(?ix)\b(curl|wget|nc|ncat|netcat|telnet|ssh|scp|sftp|ftp|rsync|aria2c)\b
+        | \bgit\s+(push|clone|fetch|pull|remote|ls-remote)\b""")
+_INSTALL_CMD = re.compile(
+    r"""(?ix)\b(npm|pnpm|yarn)\s+(i|install|ci|add)\b | \bpip3?\s+(install|download)\b
+        | \bcargo\s+(install|fetch)\b | \bgo\s+(get|install)\b | \b(apt|apt-get|yum|dnf|apk|brew|gem)\s+(install|add)\b
+        | \bforge\s+install\b""")
+
+
+def bash_safety(
+    command: str, workspace: str | None = None, egress_hosts: list[str] | None = None,
+    policy: "object | None" = None,
+) -> tuple[bool, str]:
     """WORKSPACE-JAIL model: the ONE hard guardrail is the in-scope folder (``workspace``). INSIDE
     it the agent may do WHATEVER it needs — build, install dependencies, run servers, make network
     calls, fuzz, create/delete files. We deny ONLY what reaches OUTSIDE the folder or breaks out of
     it: (1) privilege-escalation / system-control / catastrophic-disk commands (they escape the
     jail), (2) file creation/mutation/redirect targeting a path outside the workspace, and (3)
-    reads of known secret/credential paths outside the workspace. Network egress, package installs,
-    and inline interpreters are ALLOWED — they do not by themselves escape the folder boundary.
+    reads of known secret/credential paths outside the workspace.
+
+    TOOL INSTALLS: the agent may install ANY tool it needs for the audit — compilers, static
+    analyzers, fuzzers, Foundry, language toolchains, system packages — through the standard
+    mechanisms, INCLUDING sudo package managers and official installer scripts (``_TOOL_INSTALL``).
+    A recognized install is permitted even though it uses sudo, writes to /usr/local, or fetches
+    over the network under a no-egress posture (provisioning a tool is not a jail escape or target
+    egress). Only the CATASTROPHIC ops (``_CATASTROPHIC``: disk-wipe / power / rm -rf /) are denied
+    unconditionally, and the operator can still switch installs off via ``PermissionPolicy``.
+
+    NETWORK EGRESS: by default (``egress_hosts is None`` — pure static analysis) network egress and
+    package installs are ALLOWED; they do not escape the folder boundary. When live dynamic testing
+    is ARMED, the caller passes the authorized egress allowlist, and this becomes a NETWORK jail
+    too: any command that would contact a host outside the allowlist (and not loopback / a build
+    registry) is denied — so authorized testing can never reach a third party's or production
+    system. This is the safe-harbor enforcement point for live HTTP from the agent's shell.
 
     NOTE: comprehensive read-confinement for arbitrary bash is not enforceable here (a determined
     `cat /some/abs/path` is not fully blocked); the strict, fully-enforced read/write confinement
@@ -195,8 +258,31 @@ def bash_safety(command: str, workspace: str | None = None) -> tuple[bool, str]:
     cmd = command.strip()
     if all(ln.strip().startswith("#") for ln in cmd.splitlines() if ln.strip()):
         return True, "comment (no-op)"
+    # 0. CATASTROPHIC ops are denied unconditionally — even if combined with an install.
+    if _CATASTROPHIC.search(cmd):
+        return False, "out of scope: catastrophic disk/power command — denied"
+    # 1. TOOL INSTALL — the agent may install any tool it needs (compilers, analyzers, Foundry,
+    # package managers, toolchains), incl. via sudo / installer scripts. Permitted before the
+    # sudo/escape, egress, and out-of-workspace-write checks (an install writes to /usr/local and
+    # fetches from a registry — that is provisioning, not a jail escape or target egress). Honors
+    # the operator/Parent-A install posture and any explicitly blocked commands.
+    install_ok = getattr(policy, "allow_install", True) if policy is not None else True
+    if install_ok and _TOOL_INSTALL.search(cmd):
+        if policy is not None:
+            low = cmd.lower()
+            for d in (str(c).lower() for c in getattr(policy, "deny_commands", []) or []):
+                if d and d in low:
+                    return False, f"denied by Parent A's permission policy (blocked command: {d})"
+        return True, "tool install (provisioning) — allowed"
     if _ESCAPE.search(cmd):
         return False, "out of scope: privilege/system/disk command would escape the workspace jail — denied"
+    # NETWORK JAIL (only when live testing is armed): confine outbound contact to in-scope hosts.
+    if egress_hosts is not None:
+        from ..dynamic.egress import bash_egress_ok
+
+        ok, reason = bash_egress_ok(cmd, egress_hosts)
+        if not ok:
+            return False, reason
     # Reading a KNOWN secret/credential path that lies OUTSIDE the workspace is out of scope.
     if _SENSITIVE_FS.search(cmd):
         for p in _abs_path_tokens(cmd):
@@ -210,6 +296,19 @@ def bash_safety(command: str, workspace: str | None = None) -> tuple[bool, str]:
     m = _REDIRECT_TARGET.search(cmd)
     if m and _out_of_workspace(m.group(1), workspace):
         return False, f"out of scope: redirect into a path outside the workspace ({m.group(1)}) — denied"
+    # PARENT-A PERMISSION POSTURE (only restricts further; default policy=None is a no-op). Parent A
+    # may forbid network egress and/or dependency installs for this engagement (e.g. an offline
+    # crypto-lib audit), or block specific commands it deems unsafe for this target.
+    if policy is not None:
+        deny_cmds = [str(c).lower() for c in getattr(policy, "deny_commands", []) or []]
+        low = cmd.lower()
+        for d in deny_cmds:
+            if d and d in low:
+                return False, f"denied by Parent A's permission policy (blocked command: {d})"
+        if not getattr(policy, "allow_network", True) and _NET_CMD.search(cmd):
+            return False, "denied: network egress is OFF for this engagement (Parent A permission policy)"
+        if not getattr(policy, "allow_install", True) and _INSTALL_CMD.search(cmd):
+            return False, "denied: dependency installs are OFF for this engagement (Parent A permission policy)"
     return True, "allowed (in-workspace: free to do whatever it needs)"
 
 
@@ -331,12 +430,26 @@ class ClaudeSession:
         max_turns: int = 24,
         finding_sink: Callable[[dict], None] | None = None,
         allow_web: bool = True,
+        egress_hosts: list[str] | None = None,
+        perms: object | None = None,
+        web_budget: int | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.model = model
         self.on_event = on_event or (lambda *_: None)
         self.guard_check = guard_check
         self.max_turns = max_turns
+        # Hard cap on WebSearch/WebFetch calls for this session (None = uncapped). Stops a stuck
+        # agent from degenerating into endless web searching (e.g. looking up "<product> P1s")
+        # instead of analyzing the code — web is for technique/spec, not for the answer.
+        self.web_budget = web_budget
+        self._web_calls = 0
+        # When live testing is armed, the authorized egress allowlist confines the agent's bash
+        # network calls to in-scope hosts (None = static mode, no network confinement). §9.
+        self.egress_hosts = egress_hosts
+        # Parent A's per-engagement PermissionPolicy (network/install/deny posture). None = the
+        # default loosened jail. Honored in _decide for Bash and the web tools. §6/§9.
+        self.perms = perms
         # If set, exposes a write-only ``post_finding`` blackboard tool to this session: the
         # agent can WRITE findings the moment it confirms one, but gets no tool to READ the board
         # back (so a stuck hunter cannot copy another's work). §11 write-only access model.
@@ -363,8 +476,19 @@ class ClaudeSession:
                     updated_input = remapped
                     tool_input = remapped
             if tool_name in _RESEARCH_TOOLS:
-                return (self.allow_web, "web research" if self.allow_web else
-                        "web disabled for this agent — focus on the code", None)
+                # Web tools need both the agent's web grant AND Parent A's network permission.
+                net_ok = getattr(self.perms, "allow_network", True) if self.perms is not None else True
+                if not net_ok:
+                    return False, "web disabled: network egress is OFF for this engagement (Parent A policy)", None
+                if not self.allow_web:
+                    return False, "web disabled for this agent — focus on the code", None
+                # Budget cap: a few searches for technique/spec, then back to the code. Prevents the
+                # "gave up and kept searching for the product's known bugs" failure mode.
+                if self.web_budget is not None and self._web_calls >= self.web_budget:
+                    return False, (f"web research budget exhausted ({self.web_budget} searches) — "
+                                   "the answer is in the CODE, not the web; analyze it"), None
+                self._web_calls += 1
+                return True, "web research (technique/spec)", None
             if tool_name in ("Task", "Agent"):
                 # Sub-agent dispatch is allowed; the sub-agent's OWN tool calls hit this same hook,
                 # so the workspace-jail still gates everything it does.
@@ -382,7 +506,8 @@ class ClaudeSession:
                     return a, r, updated_input
                 return False, "no workspace guard configured", None
             if tool_name == "Bash":
-                a, r = bash_safety(str(tool_input.get("command", "")), workspace=cwd)
+                a, r = bash_safety(str(tool_input.get("command", "")), workspace=cwd,
+                                   egress_hosts=self.egress_hosts, policy=self.perms)
                 return a, r, None
             # Unknown tools (TodoWrite, etc.) are read-only/harmless to the workspace — allow.
             return True, f"{tool_name} (no workspace effect)", None
@@ -613,7 +738,11 @@ class ClaudeSession:
                 continue
             text = getattr(block, "text", None)
             if text and text.strip():
-                self.on_event(self.agent_name, "thinking", {"text": text.strip()[:6000]})
+                # The model's PRINTED ANSWER (not its reasoning). Emit it as a distinct "output"
+                # event so the UI shows it like Claude Code's response — separate from the dim,
+                # collapsible "thinking". (Was previously mislabeled "thinking", so the answer
+                # vanished into the collapsed reasoning.)
+                self.on_event(self.agent_name, "output", {"text": text.strip()[:6000]})
                 text_out = text
         return text_out
 

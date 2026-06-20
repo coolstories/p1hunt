@@ -14,6 +14,14 @@ SIGNAL_PROFILE: dict[str, tuple[str, float]] = {
     "evm-tx-origin": ("critical", 0.66),
     "evm-delegatecall": ("critical", 0.52),
     "evm-reentrancy": ("critical", 0.58),
+    # Hardened-EVM high-value detectors (classify/evm_signals.py EVM_SIGNALS). Tuned to SURVIVE on
+    # battle-tested, assembly-heavy code: a guard token nearby does not clear a low-level primitive
+    # class, so these persist as leads and are confirmed by depth (see reasoner._HARDENED_AWARE).
+    "evm-unchecked-call": ("critical", 0.58),
+    "evm-bare-ecrecover": ("critical", 0.62),
+    "evm-div-before-mul": ("high", 0.50),
+    "evm-raw-delegatecall": ("critical", 0.58),
+    "evm-reentrancy-call": ("critical", 0.56),
     "mass-assignment": ("critical", 0.54),
     "jwt-no-verify": ("critical", 0.58),
     "auth-missing": ("critical", 0.50),

@@ -15,7 +15,8 @@ from __future__ import annotations
 from collections import defaultdict
 
 from ..classify.classifier import classify_artifacts
-from ..classify.signals import SignalHit, scan_artifacts
+from ..classify.evm_signals import scan_combined
+from ..classify.signals import SignalHit
 from ..models import (
     EngagementPlan,
     ImpactSurface,
@@ -52,7 +53,7 @@ _ENV_BY_CLASS: dict[TargetClass, str] = {
 def derive_plan(scope: Scope, artifact_dir: str) -> EngagementPlan:
     target_class = classify_artifacts(artifact_dir, scope)
     toolset = list(_TOOLSET_BY_CLASS.get(target_class, _TOOLSET_BY_CLASS[TargetClass.OTHER]))
-    hits = scan_artifacts(artifact_dir)
+    hits = scan_combined(artifact_dir)
     surfaces = _rank_surfaces(target_class, hits, scope)
     hypothesis_seeds = _seed_hypotheses(surfaces)
     policy = derive_scopeguard_policy(scope, target_class)

@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 from .classify.classifier import classify_artifacts
-from .models import Asset, EngagementStatus, Scope
+from .models import Asset, DynamicTarget, EngagementStatus, Scope, TestIdentity
 from .safety.policies import derive_scopeguard_policy
 
 
@@ -24,6 +24,25 @@ def _asset(d: dict) -> Asset:
         kind=d.get("kind", d.get("type", "other")),
         value=d["value"],
         environment=d.get("environment", "unknown"),
+    )
+
+
+def _dynamic_target(d: dict) -> DynamicTarget:
+    return DynamicTarget(
+        base_url=d.get("base_url", ""),
+        environment=d.get("environment", "uat"),
+        kind=d.get("kind", "rest"),
+        note=d.get("note", ""),
+    )
+
+
+def _identity(d: dict) -> TestIdentity:
+    return TestIdentity(
+        name=d.get("name", ""),
+        token=d.get("token", ""),  # usually absent/redacted on disk — supplied via env at runtime
+        token_env=d.get("token_env", ""),
+        role=d.get("role", ""),
+        note=d.get("note", ""),
     )
 
 
@@ -40,6 +59,8 @@ def scope_from_dict(d: dict) -> Scope:
         rules=d.get("rules", []),
         rate_limit=d.get("rate_limit", ""),
         source_urls=d.get("source_urls", []),
+        dynamic_targets=[_dynamic_target(t) for t in d.get("dynamic_targets", [])],
+        test_identities=[_identity(i) for i in d.get("test_identities", [])],
     )
 
 
@@ -56,6 +77,14 @@ def scope_to_dict(scope: Scope) -> dict:
         "rules": scope.rules,
         "rate_limit": scope.rate_limit,
         "source_urls": scope.source_urls,
+        "dynamic_targets": [dataclasses.asdict(t) for t in scope.dynamic_targets],
+        # REDACT live credentials on disk: persist the env-var NAME, never the secret value. The
+        # token is re-supplied via the environment at runtime (see TestIdentity.resolve).
+        "test_identities": [
+            {"name": i.name, "token": "<redacted>" if i.token else "",
+             "token_env": i.token_env, "role": i.role, "note": i.note}
+            for i in scope.test_identities
+        ],
     }
 
 

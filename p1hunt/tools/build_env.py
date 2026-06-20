@@ -75,6 +75,8 @@ _PROVISION_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("cargo", "build"),
     ("go", "build", "./..."),
     ("make",),
+    ("cmake", "-S", ".", "-B", "build"),   # CMake configure (out-of-source)
+    ("cmake", "--build", "build"),          # CMake build
 )
 
 _REMEDIATION_FOUNDRY = "install foundry: curl -L https://foundry.paradigm.xyz | bash && foundryup"
@@ -212,12 +214,19 @@ def detect_build_system(repo_path: str) -> BuildPlan:
 
     # --- CMake before Make (a CMake project often ships a generated Makefile too).
     if (repo / "CMakeLists.txt").exists():
+        # Provision = (fetch submodules if any) then CONFIGURE out-of-source; build = compile that
+        # tree. Without the configure step `cmake --build` has nothing to build. Submodules /
+        # FetchContent dependencies reach the network, so flag it when submodules are present.
+        provision = []
+        if has_gitmodules:
+            provision.append("git submodule update --init --recursive")
+        provision.append("cmake -S . -B build")
         return BuildPlan(
             toolchain="cmake",
-            provision_commands=[],
-            build_command="cmake --build .",
-            config_files=["CMakeLists.txt"],
-            needs_network=False,
+            provision_commands=provision,
+            build_command="cmake --build build",
+            config_files=["CMakeLists.txt"] + ([".gitmodules"] if has_gitmodules else []),
+            needs_network=has_gitmodules,
         )
 
     # --- Make.
@@ -397,6 +406,154 @@ def _run_one(cmd: str, cwd: Path, timeout: float, on_event: EventEmit | None, re
         if on_event:
             on_event("build_env", "lifecycle", {"event": "command_error", "command": cmd, "reason": msg})
         return 1, msg
+
+
+_FOUNDRY_INSTALLER_URL = "https://foundry.paradigm.xyz"
+
+
+def _foundry_bin_dir() -> Path:
+    """Where foundryup installs the toolchain (honors FOUNDRY_DIR)."""
+    import os as _os
+
+    base = _os.environ.get("FOUNDRY_DIR", "").strip()
+    root = Path(base) if base else Path.home() / ".foundry"
+    return root / "bin"
+
+
+def _prepend_path(directory: Path) -> None:
+    """Make ``directory`` visible to this process (and children) for the rest of the run, so a
+    freshly-installed toolchain is usable immediately without a shell restart. Idempotent."""
+    import os as _os
+
+    d = str(directory)
+    parts = _os.environ.get("PATH", "").split(_os.pathsep)
+    if d not in parts:
+        _os.environ["PATH"] = d + _os.pathsep + _os.environ.get("PATH", "")
+
+
+def activate_foundry_path() -> bool:
+    """Make an ALREADY-installed Foundry discoverable: prepend ``~/.foundry/bin`` (or
+    ``$FOUNDRY_DIR/bin``) to this process's PATH when it exists. foundryup installs there but only
+    edits shell rc files, so a non-login process (a hunt, ``status``) otherwise can't see ``forge``.
+    Returns True if the dir exists. Idempotent; never raises."""
+    bin_dir = _foundry_bin_dir()
+    try:
+        if bin_dir.is_dir():
+            _prepend_path(bin_dir)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def ensure_foundry(
+    *,
+    on_event: EventEmit | None = None,
+    allow_network: bool = True,
+    allow_install: bool = False,
+    timeout: float = 600.0,
+) -> dict:
+    """Make the Foundry toolchain (``forge``/``anvil``) available — the single biggest unblocker
+    for confirmed criticals on EVM targets, since the reproduction gate cannot execute a harness
+    without it.
+
+    Returns ``{"forge", "anvil", "installed", "detail", "remediation"}``. Behaviour:
+
+    * ``forge`` already on PATH → short-circuit (``installed=False``), nothing executed.
+    * ``allow_install=False`` → report missing + remediation, execute nothing (the safe default).
+    * else run ``foundryup`` if present; otherwise (``allow_network``) download the OFFICIAL
+      installer to a temp file and run it to bootstrap ``foundryup``, then run ``foundryup``.
+
+    Every step is logged via ``on_event`` and bounded by ``timeout``. NEVER raises. This installs a
+    well-known toolchain only; it does NOT touch the artifact floor — promotion still requires a
+    deterministic reproduction. Executing a remote installer is gated behind ``allow_install`` on
+    purpose (off by default)."""
+    import os as _os
+    import tempfile
+    import urllib.request
+
+    bin_dir = _foundry_bin_dir()
+    _prepend_path(bin_dir)  # a prior install may already be on disk but off this process's PATH
+
+    def _result(detail: str, remediation: str = "") -> dict:
+        return {
+            "forge": toolchain_available("forge"),
+            "anvil": toolchain_available("anvil"),
+            "installed": toolchain_available("forge") and "short-circuit" not in detail,
+            "detail": detail,
+            "remediation": remediation,
+        }
+
+    if toolchain_available("forge"):
+        if on_event:
+            on_event("build_env", "lifecycle", {"event": "toolchain_present", "tool": "forge"})
+        return {"forge": True, "anvil": toolchain_available("anvil"), "installed": False,
+                "detail": "forge already on PATH (short-circuit)", "remediation": ""}
+
+    if not allow_install:
+        if on_event:
+            on_event("build_env", "lifecycle",
+                     {"event": "toolchain_missing", "tool": "forge",
+                      "detail": "auto-install disabled; reproduction gate cannot fire"})
+        return _result("forge missing and auto-install disabled", _REMEDIATION_FOUNDRY)
+
+    if not allow_network:
+        return _result("forge missing; auto-install needs network but allow_network=False",
+                       _REMEDIATION_FOUNDRY)
+
+    if on_event:
+        on_event("build_env", "lifecycle", {"event": "toolchain_install_start", "tool": "foundry"})
+
+    # 1) Bootstrap `foundryup` if it isn't installed yet (download the official installer, run it).
+    foundryup = shutil.which("foundryup") or str(bin_dir / "foundryup")
+    if not Path(foundryup).exists() and shutil.which("foundryup") is None:
+        try:
+            req = urllib.request.Request(  # a UA is required — the CDN 403s the default python-urllib agent
+                _FOUNDRY_INSTALLER_URL,
+                headers={"User-Agent": "p1hunt/0.1 (+safe-harbor toolchain provisioner)"},
+            )
+            with urllib.request.urlopen(req, timeout=min(timeout, 120)) as resp:  # noqa: S310 - https official installer
+                script = resp.read().decode("utf-8", "ignore")
+            with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+                fh.write(script)
+                installer = fh.name
+            if on_event:
+                on_event("build_env", "lifecycle",
+                         {"event": "installer_fetched", "url": _FOUNDRY_INSTALLER_URL, "bytes": len(script)})
+            code = subprocess.run(  # noqa: S603 - explicit bash on a fetched, logged installer (gated by allow_install)
+                ["bash", installer], capture_output=True, text=True, timeout=timeout, check=False,
+                env={**_os.environ, "FOUNDRY_DIR": str(bin_dir.parent)},
+            ).returncode
+            if on_event:
+                on_event("build_env", "lifecycle", {"event": "installer_done", "exit": code})
+        except Exception as exc:  # network/launch failure must never crash the hunt
+            if on_event:
+                on_event("build_env", "lifecycle", {"event": "installer_error", "detail": str(exc)})
+            return _result(f"foundryup bootstrap failed: {exc}", _REMEDIATION_FOUNDRY)
+        _prepend_path(bin_dir)
+        foundryup = shutil.which("foundryup") or str(bin_dir / "foundryup")
+
+    # 2) Run foundryup to install/refresh forge/anvil/cast into the foundry bin dir.
+    if not Path(foundryup).exists() and shutil.which("foundryup") is None:
+        return _result("foundryup not available after bootstrap", _REMEDIATION_FOUNDRY)
+    try:
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [foundryup], capture_output=True, text=True, timeout=timeout, check=False,
+            env={**_os.environ, "FOUNDRY_DIR": str(bin_dir.parent)},
+        )
+        if on_event:
+            on_event("build_env", "lifecycle",
+                     {"event": "foundryup_done", "exit": proc.returncode,
+                      "bytes": len((proc.stdout or "") + (proc.stderr or ""))})
+    except Exception as exc:
+        if on_event:
+            on_event("build_env", "lifecycle", {"event": "foundryup_error", "detail": str(exc)})
+        return _result(f"foundryup run failed: {exc}", _REMEDIATION_FOUNDRY)
+
+    _prepend_path(bin_dir)
+    ok = toolchain_available("forge")
+    return _result("installed forge via foundryup" if ok else "foundryup ran but forge still missing",
+                   "" if ok else _REMEDIATION_FOUNDRY)
 
 
 def bootstrap_environment(

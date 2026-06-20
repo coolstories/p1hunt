@@ -8,7 +8,7 @@ what the swarm needs to start. No research begins until authorization is recorde
 from __future__ import annotations
 
 from .acquire import fetch_text, looks_like_repo
-from .models import Asset, Scope
+from .models import Asset, DynamicTarget, Scope, TestIdentity
 from .samples import _TAXONOMY
 
 
@@ -56,6 +56,25 @@ def run_wizard() -> tuple[Scope, list[str]] | None:
     rate = _ask("Rate limit for any approved live checks", "30 requests per minute")
     disclosure = _ask("Disclosure channel (email / URL)", "(set before submission)")
 
+    # Optional LIVE dynamic target (the unblocker for web/API/auth criticals). Only a non-
+    # production authorized instance. Credentials are read from the ENVIRONMENT (never typed here),
+    # so they are not echoed or persisted; the wizard records only which env vars to read.
+    dynamic_targets: list[DynamicTarget] = []
+    test_identities: list[TestIdentity] = []
+    base_url = _ask("Authorized LIVE base URL to test (UAT/owned/testnet — blank to skip)")
+    if base_url:
+        live_env = _ask("Environment of that URL (uat/owned/testnet/staging/local)", "uat").lower()
+        if live_env == "production":
+            print("  production is never an authorized live target — recording as static-only.")
+        else:
+            kind = "graphql" if "graphql" in base_url.lower() else "rest"
+            dynamic_targets.append(DynamicTarget(base_url=base_url, environment=live_env, kind=kind))
+            print("  Provide two test principals' tokens via env vars (NOT typed here): "
+                  "P1HUNT_TOKEN_A and P1HUNT_TOKEN_B (the core of IDOR/BOLA testing).")
+            for nm in ("A", "B"):
+                if _ask(f"  Will P1HUNT_TOKEN_{nm} be set for principal {nm}? (yes/no)", "yes").lower() in ("y", "yes"):
+                    test_identities.append(TestIdentity(name=nm, token_env=f"P1HUNT_TOKEN_{nm}"))
+
     scope = Scope(
         program=program,
         platform=platform,
@@ -72,6 +91,8 @@ def run_wizard() -> tuple[Scope, list[str]] | None:
         rules=["Use only owned accounts or synthetic data.", "No production writes.", "No DoS."],
         rate_limit=rate,
         source_urls=source_urls,
+        dynamic_targets=dynamic_targets,
+        test_identities=test_identities,
     )
 
     print("\n--- Confirm scope (your authorization) ---")
@@ -79,6 +100,9 @@ def run_wizard() -> tuple[Scope, list[str]] | None:
     print(f"  In scope: {', '.join(in_scope)}")
     print(f"  Out of scope: {', '.join(out_scope) or 'none listed'}")
     print(f"  Rate limit: {rate}")
+    if dynamic_targets:
+        print(f"  Live target: {', '.join(t.base_url + ' [' + t.environment + ']' for t in dynamic_targets)}")
+        print(f"  Test identities (tokens from env): {', '.join(i.name for i in test_identities) or 'none'}")
     if _ask("Authorize this engagement and begin? (yes/no)", "yes").lower() not in ("y", "yes"):
         print("Not authorized. Aborting.")
         return None

@@ -33,13 +33,13 @@ from .claude_hunter import ClaudeHunter, ClaudePoCProver, ClaudeVerifier
 from .claude_session import ClaudeFinding
 from .fuzz_engine import ClaudeFuzzer
 from .derive import derive_plan
-from .harness_scaffold import detect_evm_entrypoints, scaffold_block
+from .harness_scaffold import detect_evm_entrypoints
 from .parent_a import HuntResult
 from ..corpus import CorpusStore
-from ..classify.evm_signals import evm_assembly_density
+from ..classify.evm_signals import evm_assembly_density, scan_combined
 from ..runners.base import ReproSpec, select_runner
 from ..severity import ImpactAssessment, SeverityMapper
-from ..tools.build_env import BuildReport, bootstrap_environment
+from ..tools.build_env import BuildReport, bootstrap_environment, ensure_foundry, toolchain_available
 from ..tools.evm_fork import fork_available, start_anvil_fork, stop_anvil_fork
 
 _LENSES = [
@@ -106,12 +106,53 @@ class ClaudeSwarm:
         self._corpus: CorpusStore | None = None  # cross-round fuzz corpus + coverage memory
         self._subclass: str = ""                # protocol category, only if Parent A names one in recon
         self._entrypoints_by_subsystem: dict[str, list[str]] = {}
+        # DERIVED static leads (Solidity-aware scan of the ACTUAL code) — concrete suspect
+        # primitives handed to each hunter so the live AI starts from "here is a P1, prove it"
+        # rather than a cold read. Populated in _arm_environment; never a preset playbook.
+        self._scan_hits: list = []
+        # --- live dynamic-testing state (armed in hunt()/_arm_environment when authorized) ---
+        # None = static mode (no live target / dry-run); a list = the authorized egress allowlist
+        # that confines every agent's outbound request to in-scope hosts (the live safe-harbor jail).
+        self._egress_hosts: list[str] | None = None
+        self._base_url: str = ""                 # the primary authorized dynamic target base URL
+        self._oob = None                         # running loopback OOB interaction listener
+        self._dynamic_env_keys: list[str] = []   # env vars _arm_dynamic exported (cleared on exit)
+        # COST GUARD: a never-quit run has no natural end, so accumulate spend (from session usage
+        # events) and, if the operator set a ceiling, stop GRACEFULLY when it's hit. Default off
+        # (None) so behavior is unchanged unless P1HUNT_MAX_COST_USD is set, but the running total
+        # is always emitted so spend is never invisible.
+        self._spend_usd: float = 0.0
+        try:
+            _cap = float(os.environ.get("P1HUNT_MAX_COST_USD", "0") or 0)
+        except ValueError:
+            _cap = 0.0
+        self._cost_cap: float | None = _cap if _cap > 0 else None
+        # CROSS-ENGAGEMENT MEMORY: learn from our OWN confirmed findings across engagements. Records
+        # on promote; recalled at arm time as fallible "hunt a new variant" priors (NOTHING PRESET —
+        # derived from past wins, not a baked-in catalog). Disable with P1HUNT_MEMORY=0.
+        self._memory = None
+        try:
+            from ..memory import MemoryStore, default_memory_path, memory_enabled
+            if memory_enabled():
+                self._memory = MemoryStore(default_memory_path(config.engagements_root))
+        except Exception:
+            self._memory = None
+        # PARENT-A-OWNED runtime permission posture (network/install/deny inside the jail). Starts
+        # derived from the program rules; Parent A TIGHTENS it during recon (_apply_permission_policy)
+        # and it is threaded into every agent session. §6 step 5 / §9.
+        from ..safety.policies import derive_permission_policy
+        self._perms = derive_permission_policy(scope)
         # Deterministic severity mapper bound to THIS program's own taxonomy (no preset tiers).
         self._severity = SeverityMapper(getattr(scope, "severity_taxonomy", {}) or {})
 
     def _emit(self, agent: str, kind: str, data: dict) -> None:
         import time as _t
         self._last_activity = _t.monotonic()  # any event = the swarm is alive (watchdog signal)
+        if kind == "usage":  # accumulate spend so a never-quit run can be cost-bounded + visible
+            try:
+                self._spend_usd += float(data.get("cost", 0) or 0)
+            except (TypeError, ValueError):
+                pass
         self.log.emit(agent, kind, data)
 
     # --- self-healing watchdog (§8 never-quit) ----------------------------
@@ -187,7 +228,8 @@ class ClaudeSwarm:
                     f"endlessly, delegate big reads to sub-agents, don't spiral. Return ONLY JSON: "
                     f'{{"rate_limited": true|false, "diagnosis": "...", "notice": "<the directive>"}}')
                 sess = ClaudeSession(agent_name=self.name, model=self.config.models.orchestrator,
-                                     on_event=self._emit, guard_check=None, max_turns=3, allow_web=False)
+                                     on_event=self._emit, guard_check=None, max_turns=3, allow_web=False,
+                                     perms=self._perms, egress_hosts=self._egress_hosts)
                 res = await asyncio.wait_for(sess.run(prompt, self.repo_path), timeout=90)
                 parsed = _parse_json_object(res.text)
                 if parsed.get("notice"):
@@ -231,14 +273,21 @@ class ClaudeSwarm:
             g = g.strip()
             if not g:
                 continue
-            if fnmatch.fnmatch(p, g) or p.startswith(g.rstrip("*").rstrip("/") + "/") or p.startswith(g.rstrip("*")):
+            # Match a glob, an exact path, or a DIRECTORY prefix (with a path-separator boundary).
+            # The boundary matters: a bare prefix test would wrongly mark `references/X.sol`
+            # out-of-scope for a glob `ref*` and silently drop an in-scope finding.
+            base = g.rstrip("*")
+            if fnmatch.fnmatch(p, g) or p == base.rstrip("/") or p.startswith(base.rstrip("/") + "/"):
                 return True
+            # A trailing-* glob (e.g. "reference/*", "test*") still matches by fnmatch above; a bare
+            # token without "/" or "*" is treated as a directory, handled by the boundary check above.
         return False
 
-    def _write_findings_json(self, findings, candidates) -> None:
+    def _write_findings_json(self, findings, candidates, needs_human=None) -> None:
         """Persist the current findings to ``findings.json`` in the engagement folder. Called at
         every round boundary (so it's always fresh) and on stop/cap — when the scan is stopped,
-        the latest findings are already on disk."""
+        the latest findings are already on disk. ``needs_human`` is the prominent tier of believed-
+        real, high-confidence P1s that could not be auto-reproduced (surfaced, not buried)."""
         import json as _json
         import time as _time
         from pathlib import Path
@@ -248,23 +297,33 @@ class ClaudeSwarm:
             return
         out = Path(path).with_name("findings.json")
         crits = [f for f in findings if f.severity == "critical"]
+        nh = needs_human or []
         doc = {
             "program": self.scope.program,
             "updated": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-            "counts": {"confirmed_critical": len(crits), "candidates": len(candidates)},
+            "counts": {"confirmed_critical": len(crits), "needs_human_review": len(nh),
+                       "candidates": len(candidates)},
             "confirmed_criticals": [
                 {"title": f.title, "severity": f.severity, "verified": getattr(f, "verified", True),
                  "location": getattr(f.poc, "path", ""), "root_cause": f.root_cause,
                  "counterfactual": f.counterfactual, "remediation": f.remediation}
                 for f in crits
             ],
+            # Reasoned P1s a human should look at FIRST — strong reasoning, only the mechanical
+            # proof is missing. Listed prominently above the raw candidate dump.
+            "needs_human_review": [
+                {"title": f.title, "severity": f.severity, "location": getattr(f.poc, "path", ""),
+                 "root_cause": f.root_cause, "counterfactual": f.counterfactual,
+                 "why_unproven": getattr(f.poc, "description", ""), "remediation": f.remediation}
+                for f in nh
+            ],
             "candidates": [c.__dict__ for c in candidates],
         }
         try:
             out.write_text(_json.dumps(doc, indent=2), encoding="utf-8")
             self._emit(self.name, "lifecycle",
-                       {"event": "findings_written", "path": str(out),
-                        "criticals": len(crits), "candidates": len(candidates)})
+                       {"event": "findings_written", "path": str(out), "criticals": len(crits),
+                        "needs_human_review": len(nh), "candidates": len(candidates)})
         except OSError:
             pass
 
@@ -295,7 +354,10 @@ class ClaudeSwarm:
                  "fuzz_mode": getattr(h, "fuzz_mode", ""),
                  "focus_files": list(h.focus_files), "investigate": list(h.investigate),
                  "invariants": list(getattr(h, "invariants", [])),
-                 "directive": getattr(h, "_directive", ""), "ruled_out": list(getattr(h, "_ruled_out", []))}
+                 "directive": getattr(h, "_directive", ""), "ruled_out": list(getattr(h, "_ruled_out", [])),
+                 # The accumulating subsystem MODEL — persisted so a resumed run keeps its depth
+                 # (round N+1 continues from the understanding built in rounds 1..N, never re-derives).
+                 "model": getattr(h, "_model", "")}
                 for h in hunters
             ],
             "candidates": [c.__dict__ for c in all_candidates],
@@ -378,6 +440,7 @@ class ClaudeSwarm:
         session = ClaudeSession(
             agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
             guard_check=self._guard_check(guard, self.name), max_turns=12,
+            perms=self._perms, egress_hosts=self._egress_hosts,
         )
         try:
             res = await session.run(self._resteer_prompt(digest, depth, critical_means, crit_count), self.repo_path)
@@ -467,23 +530,21 @@ class ClaudeSwarm:
         def check(tool: str, tinput: dict) -> tuple[bool, str]:
             workspace = Path(self._workspace_root).resolve()
             is_write = tool in write_tools
+            verb = "write" if is_write else "read"
             raw = tinput.get("file_path") or tinput.get("path")
             if not raw:  # Grep/Glob by pattern operate within the workspace CWD
-                guard.pre_tool_use(agent, tool, {"target": str(workspace), "read_only": not is_write})
+                # Record the JAIL's real verdict (the workspace is the authority for file ops), not a
+                # dry_run re-evaluation that would mis-stamp an in-scope op — so attestation is accurate.
+                guard.record(agent, tool, str(workspace), allow=True, reason="in-workspace pattern op")
                 return True, "in-workspace pattern op"
             p = Path(raw)
             if not p.is_absolute():
                 p = workspace / p
             inside = _within(p, workspace)
-            guard.pre_tool_use(agent, tool, {
-                "target": str(p), "read_only": not is_write,
-                "environment": "local" if inside else "out-of-scope",
-                "action": ("write" if is_write else "read") + ("" if inside else " OUT OF SCOPE"),
-            })
-            if inside:
-                return True, ("in-workspace write" if is_write else "in-workspace read")
-            verb = "write" if is_write else "read"
-            return False, f"OUT OF SCOPE: {verb} target is outside the workspace ({workspace}) — denied"
+            reason = (f"in-workspace {verb}" if inside
+                      else f"OUT OF SCOPE: {verb} target is outside the workspace ({workspace}) — denied")
+            guard.record(agent, tool, str(p), allow=inside, reason=reason)
+            return inside, reason
 
         return check
 
@@ -495,6 +556,15 @@ class ClaudeSwarm:
         stops the hunt; it just narrows what the team can do this run."""
         repo = self.repo_path
         tc = self._target_class
+
+        # Discover an already-installed Foundry (~/.foundry/bin) up front so the reproduction gate
+        # finds forge/anvil even when this process started without them on PATH.
+        if tc == "EVM_CONTRACT":
+            try:
+                from ..tools.build_env import activate_foundry_path
+                activate_foundry_path()
+            except Exception:
+                pass
 
         # 1) NOTHING PRESET: invariants and known bug-patterns come ONLY from Parent A's recon
         # (derived from the ACTUAL code + web research on THIS specific target — see _scope()).
@@ -515,6 +585,38 @@ class ClaudeSwarm:
                        {"event": "code_shape", "assembly_density": round(density, 2),
                         "hint": ("assembly-heavy — prefer invariant/differential search over keyword reading"
                                  if density >= 0.5 else "lean on derived invariants + differential testing")})
+
+        # DERIVED static leads: a Solidity-aware scan of the ACTUAL code surfaces concrete
+        # high-value bug-class primitives (unchecked low-level call, bare ecrecover, raw
+        # delegatecall, div-before-mul, reentrant external call) the hunters then reason about and
+        # PROVE-or-kill. These are derived from the target in front of us (NOTHING PRESET); they
+        # are hints, not a checklist, and findings still only promote on a reproduced artifact.
+        try:
+            self._scan_hits = scan_combined(repo)
+        except Exception:
+            self._scan_hits = []
+        if self._scan_hits:
+            self._emit(self.name, "lifecycle",
+                       {"event": "static_leads", "count": len(self._scan_hits),
+                        "sample": [f"{h.signal.id} @ {h.file}:{h.line}" for h in self._scan_hits[:4]]})
+
+        # 2b) TOOLCHAIN PROVISIONING — the biggest unblocker for confirmed criticals. The
+        # reproduction gate cannot EXECUTE a harness without forge, so on an EVM target with no
+        # forge every candidate is quarantined forever. When opted in (auto_install_toolchain +
+        # network), install Foundry now so the deterministic runner can actually fire. Off the
+        # event loop; fully graceful — a failed install just leaves the gate as it was.
+        if (tc == "EVM_CONTRACT" and self.config.auto_install_toolchain
+                and self.config.provision_network and not toolchain_available("forge")):
+            try:
+                tj = await asyncio.to_thread(
+                    ensure_foundry, on_event=self._emit, allow_network=self.config.provision_network,
+                    allow_install=True)
+                self._emit(self.name, "lifecycle",
+                           {"event": "toolchain_ready" if tj.get("forge") else "toolchain_unavailable",
+                            "forge": tj.get("forge"), "anvil": tj.get("anvil"),
+                            "installed": tj.get("installed"), "detail": tj.get("detail", "")[:200]})
+            except Exception as exc:  # provisioning must never abort a hunt
+                self._emit(self.name, "lifecycle", {"event": "toolchain_install_error", "detail": str(exc)})
 
         # 3) Build bootstrap — the unblocker. Compile the target (fetch submodules, install deps)
         # so the fuzz/PoC stages can deploy and run the REAL code. Off the event loop (subprocess).
@@ -556,6 +658,122 @@ class ClaudeSwarm:
             except Exception:
                 self._corpus = None
 
+        # 6) LIVE DYNAMIC TARGET (the bug-bounty unblocker for web/API/auth criticals). When an
+        # authorized non-production target was unlocked above, wire it up so the EXISTING web
+        # reproduction harnesses actually fire: export the env vars they read, ship the scope-
+        # enforced interaction client into the PoC sandbox, and start the loopback OOB listener so
+        # blind SSRF/injection can be CONFIRMED. All graceful — any failure just narrows the run.
+        if self._egress_hosts is not None:
+            self._arm_dynamic()
+
+        # 7) TOOLCHAIN CHECK (loud). The confirmed-critical gate can ONLY fire if the class's
+        # reproduction toolchain is installed — without it EVERY finding is quarantined forever, no
+        # matter how good the reasoning. Warn unmissably (and say how to fix) so this never fails silently.
+        self._warn_if_no_repro_toolchain()
+
+        # 8) CROSS-ENGAGEMENT MEMORY recall: seed known_patterns with OUR OWN past confirmed findings
+        # on similar targets (fallible priors — hunt NEW variants; the old instances are likely
+        # patched). Merged into the SAME channel recon already uses; Parent A still derives the hunt.
+        if self._memory is not None:
+            try:
+                priors = self._memory.recall(self._target_class, self._subclass, limit=8)
+            except Exception:
+                priors = []
+            if priors:
+                have = {p.lower()[:80] for p in self._known_patterns}
+                added = [p for p in priors if p.lower()[:80] not in have]
+                self._known_patterns = (self._known_patterns + added)[:16]
+                if added:
+                    self._emit(self.name, "lifecycle",
+                               {"event": "memory_recalled", "count": len(added),
+                                "source": "own confirmed findings on similar targets",
+                                "sample": added[:3]})
+
+    def _repro_tools_for_class(self) -> list[str]:
+        """The reproduction toolchain(s) that can EXECUTE a PoC for the derived class (any one
+        suffices). Class-level routing only — no per-target knowledge."""
+        tc = (self._target_class or "").upper()
+        return {
+            "EVM_CONTRACT": ["forge"],
+            "CRYPTO_LIB": ["go", "cargo", "pytest", "cc", "gcc", "clang", "c++", "g++", "clang++"],
+            "WEB_API": ["pytest", "node", "npx"],
+            "INFRA": ["semgrep", "conftest", "checkov"],
+            "SUPPLY_CHAIN": ["npm", "python3", "semgrep"],
+            "MOBILE_APP": ["apkanalyzer"],
+        }.get(tc, ["pytest", "node", "go", "cargo"])
+
+    def _warn_if_no_repro_toolchain(self) -> None:
+        """Emit a loud warning when NO reproduction toolchain for the class is on PATH — confirmed
+        P1s are impossible until one is installed. Mobile is static-only (manifest reads need no
+        tool), so it is exempt."""
+        tc = (self._target_class or "").upper()
+        if tc == "MOBILE_APP":
+            return
+        tools = self._repro_tools_for_class()
+        if any(toolchain_available(t) for t in tools):
+            return
+        how = ("set P1HUNT_AUTO_INSTALL_TOOLCHAIN=1 (with network) to auto-install Foundry"
+               if tc == "EVM_CONTRACT" else f"install one of: {', '.join(tools[:4])}")
+        self._emit(self.name, "lifecycle",
+                   {"event": "toolchain_missing_warning", "severity": "HIGH", "class": tc,
+                    "needed_any_of": tools[:6],
+                    "impact": "NO confirmed P1 can be produced — every finding will be quarantined "
+                              "as a candidate / needs-human until a reproduction toolchain exists",
+                    "fix": how})
+
+    def _arm_dynamic(self) -> None:
+        """Export the live-target environment the web harnesses + shipped client read, ship the
+        client into the PoC sandbox, and start the OOB listener. Fully graceful. Every env var it
+        sets is recorded in ``self._dynamic_env_keys`` so ``_disarm_dynamic`` can clear exactly
+        those on hunt exit — a later in-process run can NEVER inherit this target's allowlist or
+        credentials (the values are run-scoped, so plain assignment is used, not setdefault)."""
+        keys: list[str] = []
+
+        def _set(key: str, value: str) -> None:
+            os.environ[key] = value
+            keys.append(key)
+
+        # Export the egress allowlist so the shipped client + harnesses enforce the same jail.
+        _set("P1HUNT_EGRESS_ALLOWLIST", ",".join(self._egress_hosts or []))
+        # Base URLs by kind (rest vs graphql), so the right harness env var is populated.
+        for tgt in self.scope.dynamic_targets:
+            if not tgt.base_url or tgt.environment.lower() == "production":
+                continue
+            _set("P1HUNT_GQL_URL" if (tgt.kind or "rest").lower() == "graphql" else "P1HUNT_BASE_URL",
+                 tgt.base_url)
+        # Test identities -> the token env vars the harnesses/client resolve (A/B/LOW/default).
+        for ident in self.scope.test_identities:
+            tok = ident.resolve()
+            if not tok:
+                continue
+            name = (ident.name or "").strip().lower()
+            _set("P1HUNT_TOKEN" if name in ("", "default") else f"P1HUNT_TOKEN_{name.upper()}", tok)
+        # OOB interaction listener (loopback) for blind SSRF/injection confirmation.
+        try:
+            from ..dynamic.oob import start_oob_listener
+            hits = self.poc_dir / "oob_hits.jsonl"
+            self._oob = start_oob_listener(hits)
+            if self._oob is not None:
+                _set("P1HUNT_OOB_URL", self._oob.url)
+                _set("P1HUNT_OOB_HITS", str(hits))
+        except Exception:
+            self._oob = None
+        self._dynamic_env_keys = keys
+        # Ship the scope-enforced client into the PoC sandbox so harnesses can `import p1hunt_dyn`.
+        shipped = False
+        try:
+            from ..dynamic import client as _client_mod
+            src = Path(_client_mod.__file__).read_text(encoding="utf-8")
+            (self.poc_dir / "p1hunt_dyn.py").write_text(src, encoding="utf-8")
+            shipped = True
+        except Exception:
+            shipped = False
+        idents = [i.name for i in self.scope.test_identities if i.resolve()]
+        self._emit(self.name, "lifecycle",
+                   {"event": "dynamic_armed", "base_url": self._base_url,
+                    "egress": list(self._egress_hosts or []), "identities": idents,
+                    "oob": bool(self._oob), "client_shipped": shipped})
+
     def _stop_fork(self) -> None:
         """Tear down the local fork (no-op when none was started). Called at every hunt exit.
         Also clears the inherited fork-URL env var so a torn-down (dead) endpoint can't leak into
@@ -567,6 +785,18 @@ class ClaudeSwarm:
                 self._fork_handle = None
         self._fork_url = ""
         os.environ.pop("P1HUNT_FORK_URL", None)
+        # Clear EVERY env var dynamic-arming exported (egress allowlist, base/gql URLs, identity
+        # tokens, OOB) so a subsequent in-process hunt can't inherit this target's scope/creds.
+        for key in getattr(self, "_dynamic_env_keys", []) or []:
+            os.environ.pop(key, None)
+        self._dynamic_env_keys = []
+        # Tear down the live-testing OOB listener too (this is the universal hunt-exit hook).
+        if self._oob is not None:
+            try:
+                self._oob.stop()
+            finally:
+                self._oob = None
+        os.environ.pop("P1HUNT_OOB_URL", None)
 
     def _build_status_line(self) -> str:
         """One line telling hunters/fuzzers whether the target compiles — gated FIRST so they
@@ -595,18 +825,80 @@ class ClaudeSwarm:
                 self._entrypoints_by_subsystem[subsystem] = []
         return self._entrypoints_by_subsystem[subsystem]
 
-    def _scaffold_for(self, subsystem: str, focus_files: list[str]) -> str:
-        """A concrete, runnable harness scaffold for this subsystem (EVM gets a Foundry skeleton
-        that reaches past signature/approval gates; other classes get a generic 'build a real
-        harness' block). Generic to the target CLASS — never a per-target playbook."""
+    def _hunter_base_turns(self) -> int:
+        """Base per-round turn budget for a hunter (P1HUNT_HUNTER_TURNS). Adaptive budget scales
+        promising tracks UP from this and lets exhausted ones fall back to it (see hunt loop)."""
         try:
-            return scaffold_block(
-                self._target_class, subsystem, list(focus_files or []),
-                signals=None, fork_url=self._fork_url,
-                entrypoints=self._entrypoints_for(subsystem, focus_files or []),
-                repo_path=self.repo_path)
-        except Exception:
-            return ""
+            return max(8, int(os.environ.get("P1HUNT_HUNTER_TURNS", "28")))
+        except ValueError:
+            return 28
+
+    def _retune_budgets(self, hunters, per_hunter) -> None:
+        """ADAPTIVE BUDGET (§8): pour more turns into the tracks showing real leads and let cold
+        tracks fall back to base — so Parent A spends the swarm's effort where a P1 is likeliest.
+        A track that surfaced a critical/high candidate this round gets a larger next-round budget
+        (capped); a dry track returns to base. Promotion still requires a reproduced artifact, so
+        this only reallocates effort, never lowers the bar."""
+        base = self._hunter_base_turns()
+        cap = int(base * 1.7)
+        for h, finds in zip(hunters, per_hunter):
+            promising = any(getattr(f, "severity", "") in ("critical", "high") for f in (finds or []))
+            new_turns = cap if promising else base
+            if new_turns != h.max_turns:
+                self._emit(self.name, "lifecycle",
+                           {"event": "budget_retuned", "track": h.theme,
+                            "turns": new_turns, "reason": "promising lead" if promising else "base"})
+            h.max_turns = new_turns
+
+    def _scaffold_for(self, subsystem: str, focus_files: list[str]) -> str:
+        """Reproduction MECHANICS for the PoC — NOTHING PRESET. It deliberately carries NO bug
+        methodology, no attack recipe, no class-specific test skeleton (those would be preset
+        knowledge): the hunter DERIVES the harness shape and the property to check himself from his
+        own analysis. This note only states the mechanics that are derived from the actual target —
+        build the harness in the target's OWN framework against the REAL code, how the deterministic
+        runner judges it (expect=fail/pass), and the concrete resources that exist for THIS run (a
+        compiling build, a local fork, an authorized live endpoint + the shipped scope-safe client)."""
+        lines = [
+            f"PROVE IT (reproduction mechanics — derive the harness YOURSELF, no template): build a "
+            f"real, runnable PoC for the '{subsystem}' work into ./.p1hunt-poc/, in the TARGET'S OWN "
+            "test framework, exercising the REAL in-scope code (not a re-implementation). Decide the "
+            "property/attack to check from YOUR analysis. Run it; a deterministic runner re-runs it "
+            "and decides reproduction. Set ReproSpec.expect = 'fail' if a reproduced bug makes a "
+            "correctness/invariant assertion FAIL, or 'pass' if a reproduced exploit assertion HOLDS.",
+        ]
+        bs = self._build_status_line()
+        if bs:
+            lines.append(bs)
+        if self._fork_url:
+            lines.append(f"A local fork is available at {self._fork_url} (use it only if the PoC "
+                         "needs real forked state).")
+        if self._egress_hosts is not None and self._base_url:
+            lines.append(
+                f"LIVE TARGET ARMED (authorized): an authorized instance is reachable at "
+                f"{self._base_url} with credentials in the environment. A scope-enforced client is "
+                "shipped at ./.p1hunt-poc/p1hunt_dyn.py (from p1hunt_dyn import Client) — it confines "
+                "every request to the in-scope host(s); contacting anything else raises. Use real "
+                "requests to PROVE the bug; only contact the authorized host and loopback.")
+        return "\n\n".join(lines)
+
+    def _static_leads_for(self, focus_files: list[str]) -> list[str]:
+        """Derived static leads relevant to this hunter: those whose file matches one of the
+        hunter's focus files, else the strongest few overall. Formatted as one line each. Skips
+        out-of-scope (non-deployed) files so a hunter never chases a lead it cannot report."""
+        if not self._scan_hits:
+            return []
+        focus = {f.strip().lstrip("./") for f in (focus_files or []) if f and f.strip()}
+
+        def _matches(rel: str) -> bool:
+            if not focus:
+                return False
+            r = rel.lstrip("./")
+            return any(r == f or r.endswith("/" + f) or f.endswith("/" + r) or r.startswith(f) for f in focus)
+
+        scored = [h for h in self._scan_hits if not self._out_of_scope(h.file)]
+        chosen = [h for h in scored if _matches(h.file)] or scored[:8]
+        return [f"{h.signal.title} — {h.file}:{h.line} (lens: {h.signal.lens}; class: {h.signal.id})"
+                for h in chosen[:12]]
 
     async def hunt(self, max_rounds: int | None = None) -> HuntResult:
         """Never-stop: hunt round after round until a critical is confirmed or the operator
@@ -615,11 +907,33 @@ class ClaudeSwarm:
         self._emit(self.name, "message", {"phase": "derivation", "program": self.scope.program})
         plan = derive_plan(self.scope, self.repo_path)
         self._target_class = getattr(plan.target_class, "name", str(plan.target_class))
+        # Refine Parent A's permission posture now that the target CLASS is known (e.g. a crypto
+        # lib defaults to no-network); Parent A may tighten it further during recon below.
+        from ..safety.policies import derive_permission_policy
+        self._perms = derive_permission_policy(self.scope, plan.target_class).tightened_with(self._perms)
         self.bb.set_scope(self.scope)
         self.bb.set_plan(plan)
 
         policy = plan.scopeguard_policy
         policy.allowlist = list(dict.fromkeys([*policy.allowlist, self.repo_path, str(self.poc_dir)]))
+        # Propagate the operator's run mode into the ENFORCED policy and (only then) authorize any
+        # scoped live testing. Deny-by-default holds: with no authorized non-production dynamic
+        # target, authorize_dynamic is a no-op and the egress jail stays empty (no live contact).
+        from ..safety.policies import authorize_dynamic
+        policy.run_mode = self.config.run_mode if self.config.run_mode in ("dry_run", "active") else "dry_run"
+        auth = authorize_dynamic(policy, self.scope)
+        if auth.get("enabled"):
+            self._egress_hosts = list(policy.egress_allowlist)
+            self._base_url = next((t.base_url for t in self.scope.dynamic_targets
+                                   if t.base_url and t.environment.lower() != "production"), "")
+            self._emit(self.name, "lifecycle",
+                       {"event": "dynamic_authorized", "hosts": auth["hosts"],
+                        "environments": auth.get("environments", []), "methods": auth.get("methods", []),
+                        "rejected": auth.get("rejected", [])})
+        elif auth.get("rejected"):
+            self._emit(self.name, "lifecycle",
+                       {"event": "dynamic_rejected", "reason": auth.get("reason", ""),
+                        "rejected": auth["rejected"]})
         guard = ScopeGuard(policy, on_decision=None, unattended=self.config.unattended)
         self._active_guard = guard
         # Start the self-healing watchdog (cancelled in the finally below).
@@ -647,8 +961,23 @@ class ClaudeSwarm:
                 _orc = scope_plan.get("differential_oracle") or {}
                 if isinstance(_orc, dict) and _orc.get("exists"):
                     oracle_desc = str(_orc.get("description", "")).strip()
+                # PARENT A CONTROLS THE CLASS: he READ the target and decided what it is; his call
+                # is authoritative for which reproduction toolchain re-runs his PoC (the deterministic
+                # classifier is only the offline/no-LLM fallback). This is what lets the swarm hunt a
+                # crypto/MPC library, a parser, anything — because Parent A recognizes it himself, with
+                # NOTHING preset. Only override when he named a class we have a runner for.
+                _recon_class = str(scope_plan.get("target_class", "") or "").strip().upper()
+                if _recon_class in ("EVM_CONTRACT", "CRYPTO_LIB", "WEB_API", "MOBILE_APP",
+                                    "INFRA", "SUPPLY_CHAIN", "OTHER"):
+                    if _recon_class != self._target_class:
+                        self._emit(self.name, "lifecycle",
+                                   {"event": "class_reconciled", "from": self._target_class,
+                                    "to": _recon_class, "by": "parent_a recon"})
+                    self._target_class = _recon_class
                 # Protocol category, ONLY if Parent A named one from the code (not token-counted).
                 self._subclass = str(scope_plan.get("target_subclass", "") or "").strip()
+                # PARENT A CONTROLS PERMISSIONS: apply its recon-chosen posture (clamped tighter only).
+                self._apply_permission_policy(scope_plan.get("permissions"))
                 self._emit(self.name, "message",
                            {"phase": "scoped", "summary": str(scope_plan.get("summary", ""))[:400],
                             "critical_means": str(critical_means)[:300], "tracks": len(tracks),
@@ -665,35 +994,71 @@ class ClaudeSwarm:
             await self._arm_environment(tracks)
 
             # One Child B per DERIVED track (a real Claude hunter), plus the Falsifier.
+            # Scoped web (technique/spec only) is on with a hard per-session search budget so a
+            # stuck hunter can't rabbit-hole into "<product> known bugs" (P1HUNT_WEB_BUDGET, 0=off).
+            try:
+                _web_budget = max(0, int(os.environ.get("P1HUNT_WEB_BUDGET", "5")))
+            except ValueError:
+                _web_budget = 5
+            _base_turns = self._hunter_base_turns()
             hunters: list[ClaudeHunter] = []
             for i, tr in enumerate(tracks, start=1):
                 name = f"child_b{i}"
                 self.bus.register(name, "worker")
                 h = ClaudeHunter(name, theme=str(tr.get("theme", f"track {i}")),
                                  model=self.config.models.worker, on_event=self._emit,
-                                 guard_check=self._guard_check(guard, name))
+                                 guard_check=self._guard_check(guard, name),
+                                 max_turns=_base_turns, allow_web=(_web_budget > 0),
+                                 web_budget=_web_budget)
                 h.focus_files = list(tr.get("focus_files", []) or [])
                 h.investigate = list(tr.get("investigate", []) or [])
                 # Deep subsystem ownership (Pillar 2): the hunter OWNS this subsystem and its invariants.
                 h.subsystem = str(tr.get("subsystem", "") or tr.get("theme", "") or f"track {i}")
                 h.invariants = [str(x) for x in (tr.get("invariants") or []) if str(x).strip()]
                 h.fuzz_mode = str(tr.get("fuzz_mode", "") or "")
-                if resume:  # restore this track's ruled-out ledger + last directive so it doesn't backtrack
+                h.perms = self._perms  # Parent A's permission posture for this engagement
+                h.egress_hosts = self._egress_hosts  # live-testing host jail (None = static mode)
+                if resume:  # restore this track's memory so it resumes at depth, not from scratch
                     h._ruled_out = list(tr.get("ruled_out", []) or [])
                     h._directive = str(tr.get("directive", "") or "")
+                    h._model = str(tr.get("model", "") or "")  # restore the accumulated model (skips re-map)
                 hunters.append(h)
                 self._emit(self.name, "message",
                            {"to": name, "kind": "assign", "lens": h.theme, "mission": h.subsystem,
                             "investigate": h.investigate[:4], "focus": h.focus_files[:4],
                             "invariants": h.invariants[:4]})
+            # SECOND OPINION (opt-in, P1HUNT_SECOND_OPINION=1): a fully INDEPENDENT hunter on the
+            # top-ranked subsystem (its own blank model — it maps and reasons from scratch). Two
+            # minds on the crown-jewel mechanism catch what one misses; the dedup set + Falsifier
+            # are the comparator. Off by default because it costs an extra session per round.
+            if os.environ.get("P1HUNT_SECOND_OPINION") == "1" and tracks and not resume:
+                tr0 = tracks[0]
+                so = ClaudeHunter("child_b1_2nd", theme=str(tr0.get("theme", "track 1")),
+                                  model=self.config.models.worker, on_event=self._emit,
+                                  guard_check=self._guard_check(guard, "child_b1_2nd"),
+                                  max_turns=_base_turns, allow_web=(_web_budget > 0), web_budget=_web_budget)
+                self.bus.register("child_b1_2nd", "worker")
+                so.focus_files = list(tr0.get("focus_files", []) or [])
+                so.subsystem = str(tr0.get("subsystem", "") or tr0.get("theme", "") or "track 1")
+                so.invariants = [str(x) for x in (tr0.get("invariants") or []) if str(x).strip()]
+                so.perms = self._perms
+                so.egress_hosts = self._egress_hosts
+                hunters.append(so)
+                self._emit(self.name, "lifecycle",
+                           {"event": "second_opinion", "subsystem": so.subsystem,
+                            "detail": "independent hunter on the top subsystem (diversity)"})
             self.bus.register("falsifier", "falsifier")
             verifier = ClaudeVerifier("falsifier", model=self.config.models.falsifier, on_event=self._emit,
                                       guard_check=self._guard_check(guard, "falsifier"))
+            verifier.perms = self._perms
+            verifier.egress_hosts = self._egress_hosts
             # The PoC prover runs ONLY after the Falsifier believes a finding is real (so we never
             # build a PoC for an intended/non-bug), and can REFUTE it if it won't actually reproduce.
             self.bus.register("poc_prover", "prover")
             prover = ClaudePoCProver("poc_prover", model=self.config.models.falsifier, on_event=self._emit,
                                      guard_check=self._guard_check(guard, "poc_prover"))
+            prover.perms = self._perms
+            prover.egress_hosts = self._egress_hosts
 
             # FUZZING ENGINE (Pillar 1): one campaign per top subsystem. If a reference impl exists,
             # the first is a DIFFERENTIAL campaign (optimized vs reference) — the highest-yield search
@@ -720,8 +1085,11 @@ class ClaudeSwarm:
             for i, asn in enumerate(fuzz_assignments, start=1):
                 fname = f"fuzzer_{i}"
                 self.bus.register(fname, "fuzzer")
-                fuzzers.append(ClaudeFuzzer(fname, model=self.config.models.falsifier, on_event=self._emit,
-                                            guard_check=self._guard_check(guard, fname)))
+                _fz = ClaudeFuzzer(fname, model=self.config.models.falsifier, on_event=self._emit,
+                                   guard_check=self._guard_check(guard, fname))
+                _fz.perms = self._perms
+                _fz.egress_hosts = self._egress_hosts
+                fuzzers.append(_fz)
                 self._emit(self.name, "message",
                            {"to": fname, "kind": "assign",
                             "mode": "differential" if asn["differential"] else "invariant",
@@ -729,6 +1097,7 @@ class ClaudeSwarm:
 
             findings: list[Finding] = []
             all_candidates: list[ClaudeFinding] = []
+            needs_human: list[Finding] = []  # believed-real, high-confidence, but not auto-reproduced
             seen: set[str] = set()
             prior_titles: list[str] = []
             start_depth = 0
@@ -747,17 +1116,28 @@ class ClaudeSwarm:
                 depth += 1
                 if max_rounds is not None and depth > max_rounds:
                     self._emit(self.name, "lifecycle", {"event": "cap_reached", "round": depth - 1})
-                    self._write_findings_json(findings, all_candidates)
+                    self._write_findings_json(findings, all_candidates, needs_human)
                     watchdog.cancel()
                     self._stop_fork()
                     status = EngagementStatus.REPORT_READY if findings else EngagementStatus.RUNNING
                     return self._result(status, plan, guard, findings, all_candidates, depth - 1)
                 if self.bb.has_stop(self.name) or self._safety_event:
                     self._emit(self.name, "lifecycle", {"event": "stop", "reason": "operator/safety"})
-                    self._write_findings_json(findings, all_candidates)
+                    self._write_findings_json(findings, all_candidates, needs_human)
                     watchdog.cancel()
                     self._stop_fork()
                     return self._result(EngagementStatus.STOPPED, plan, guard, findings, all_candidates, depth)
+                # COST CEILING (opt-in): stop a never-quit run gracefully once the operator's budget
+                # is spent — no surprise unbounded bills. Spend is emitted every round regardless.
+                if self._cost_cap is not None and self._spend_usd >= self._cost_cap:
+                    self._emit(self.name, "lifecycle",
+                               {"event": "cost_cap_reached", "spent_usd": round(self._spend_usd, 2),
+                                "cap_usd": self._cost_cap, "round": depth - 1})
+                    self._write_findings_json(findings, all_candidates, needs_human)
+                    watchdog.cancel()
+                    self._stop_fork()
+                    status = EngagementStatus.REPORT_READY if findings else EngagementStatus.RUNNING
+                    return self._result(status, plan, guard, findings, all_candidates, depth - 1)
 
                 self._drain_control()  # pick up any `p1hunt notify` directives before this round
                 self._emit(self.name, "message", {"phase": "round", "round": depth, "lenses": len(hunters)})
@@ -779,7 +1159,8 @@ class ClaudeSwarm:
                                        notices=list(self._notices), invariants=h.invariants,
                                        known_patterns=self._known_patterns, subsystem=h.subsystem,
                                        scaffold=self._scaffold_for(h.subsystem, h.focus_files),
-                                       build_status=self._build_status_line()),
+                                       build_status=self._build_status_line(),
+                                       static_leads=self._static_leads_for(h.focus_files)),
                                 timeout=hunter_cap)
                         except asyncio.TimeoutError:
                             # Force the round to close: this track contributes nothing this round and
@@ -868,8 +1249,32 @@ class ClaudeSwarm:
                                     "reason": f"{cf.file} is out of scope (not deployed) — not promoted"})
                         continue
                     strong.append(cf)
+                # COST/TIME GUARD: the verify→materialize→repair→reproduce pipeline is serial and
+                # each candidate is expensive (multiple Opus sessions + up to 3×600s reproduce). Cap
+                # how many we verify per round to the STRONGEST few (critical before high; high before
+                # medium confidence) so a noisy round can't blow up into hours / unbounded spend. The
+                # rest stay visible as candidates and get another shot next round.
+                _sev_rank = {"critical": 0, "high": 1}
+                _conf_rank = {"high": 0, "medium": 1, "low": 2}
+                strong.sort(key=lambda c: (_sev_rank.get(c.severity, 2),
+                                           _conf_rank.get(str(c.confidence).lower(), 3)))
+                try:
+                    _max_verify = max(1, int(os.environ.get("P1HUNT_MAX_VERIFY", "6")))
+                except ValueError:
+                    _max_verify = 6
+                if len(strong) > _max_verify:
+                    self._emit(self.name, "lifecycle",
+                               {"event": "verify_capped", "verifying": _max_verify,
+                                "deferred": len(strong) - _max_verify,
+                                "reason": "top candidates verified this round; the rest carry to next round"})
+                    strong = strong[:_max_verify]
+                _verify_cap = float(os.environ.get("P1HUNT_VERIFY_TIMEOUT", "900"))
                 for cf in strong:
-                    status, _severity, reason = await verifier.verify(cf, self.repo_path)
+                  # GUARD: one malformed candidate must NEVER crash the never-quit hunt. Any error in
+                  # this candidate's verify/prove/promote is logged and skipped; the loop continues.
+                  try:
+                    status, _severity, reason = await asyncio.wait_for(
+                        verifier.verify(cf, self.repo_path), timeout=_verify_cap)
                     hyp = self._hyp_by_finding.get(id(cf))
                     if status == "refuted":
                         if hyp:
@@ -880,11 +1285,34 @@ class ClaudeSwarm:
                     # a DETERMINISTIC class runner then EXECUTES it and decides reproduction from the
                     # real toolchain output — never the model's say-so. NOTHING is promoted to a
                     # confirmed finding unless reproduced=True; otherwise it stays a candidate.
-                    spec_dict = await prover.materialize(
-                        cf, self.repo_path,
-                        scaffold=self._scaffold_for(cf.lens or "subsystem", [cf.file] if cf.file else []),
-                        fork_url=self._fork_url)
+                    _scaffold = self._scaffold_for(cf.lens or "subsystem", [cf.file] if cf.file else [])
+                    spec_dict = await asyncio.wait_for(
+                        prover.materialize(cf, self.repo_path, scaffold=_scaffold, fork_url=self._fork_url),
+                        timeout=_verify_cap)
                     repro = await self._reproduce(cf, spec_dict)
+                    # POC ITERATION LOOP: if the harness didn't reproduce, feed the REAL runner output
+                    # back to the prover to FIX it and rerun — up to P1HUNT_POC_ATTEMPTS times. This
+                    # converts reasoned-but-unproven P1s into confirmed ones (one-shot proof misses
+                    # the many bugs whose harness just needs a compile fix / better setup).
+                    try:
+                        _max_attempts = max(1, int(os.environ.get("P1HUNT_POC_ATTEMPTS", "3")))
+                    except ValueError:
+                        _max_attempts = 3
+                    _attempt = 1
+                    while spec_dict and not (repro and repro.reproduced) and _attempt < _max_attempts:
+                        feedback = (repro.detail or repro.stdout_excerpt) if repro else "no harness was produced"
+                        self._emit("poc_prover", "lifecycle",
+                                   {"event": "poc_retry", "title": cf.title, "attempt": _attempt + 1,
+                                    "of": _max_attempts})
+                        new_spec = await asyncio.wait_for(
+                            prover.repair(cf, spec_dict, str(feedback), self.repo_path,
+                                          scaffold=_scaffold, fork_url=self._fork_url),
+                            timeout=_verify_cap)
+                        if not new_spec:
+                            break
+                        spec_dict = new_spec
+                        repro = await self._reproduce(cf, spec_dict)
+                        _attempt += 1
                     reproduced = bool(repro and repro.reproduced)
                     # Ingest REAL coverage (parsed from the tool, not model-reported) into the corpus.
                     if repro is not None and repro.coverage and self._corpus is not None:
@@ -897,13 +1325,33 @@ class ClaudeSwarm:
                     impact = self._impact_of(cf, reproduced)
                     sev_label, sev_rationale = self._severity.map(impact)
                     if not reproduced:
-                        # Quarantine: believed-real but NOT deterministically reproduced -> CANDIDATE.
                         if hyp:
                             self.bb.set_state(hyp.id, HypState.CANDIDATE)
                         self._emit("poc_prover", "lifecycle",
                                    {"event": "candidate_not_reproduced", "title": cf.title,
                                     "ran": bool(repro and repro.ran), "severity": sev_label,
                                     "detail": (repro.detail[:200] if repro else "no harness/runner — stays a candidate")})
+                        # SURFACE FOR HUMAN REVIEW (don't bury it): the Falsifier believes it's real
+                        # and the finder claims a concrete, high-confidence loss — it just couldn't be
+                        # auto-reproduced (hard-to-harness class, missing toolchain, multi-step setup).
+                        # A reasoned P1 a human should look at is the MOST valuable output, not the
+                        # least. It is clearly marked verified=False — the reproduced=confirmed floor
+                        # is untouched; this is a separate, prominent "needs human" tier.
+                        # SURFACE WIDELY: the Falsifier already believes it's real and it's a
+                        # critical/high in scope — surface it for a human even if the finder didn't
+                        # phrase the loss as one of the exact literal words or hedged confidence.
+                        # Missing a real P1 because of a string mismatch is the worst outcome; a human
+                        # triages false positives cheaply. (status here is 'real' or 'unverified'.)
+                        if status == "real" and not self._out_of_scope(cf.file):
+                            f = self._surface_for_human(cf, reason, sev_label, guard,
+                                                        ran=bool(repro and repro.ran),
+                                                        detail=(repro.detail if repro else ""))
+                            needs_human.append(f)
+                            self._emit(self.name, "lifecycle",
+                                       {"event": "needs_human_review", "title": cf.title,
+                                        "severity": sev_label, "confidence": cf.confidence,
+                                        "concrete_loss": cf.concrete_loss,
+                                        "reason": "Falsifier-believed P1, not auto-reproduced — REVIEW"})
                         continue
                     # Reproduced by a real runner -> a CONFIRMED finding (tier from the mapper).
                     tier = self._norm_tier(sev_label, self._severity.is_p1(impact))
@@ -911,15 +1359,26 @@ class ClaudeSwarm:
                         self.bb.set_state(hyp.id, HypState.CONFIRMED)
                     findings.append(self._promote(cf, f"{sev_rationale} | falsifier: {reason}", guard,
                                                   repro=repro, severity_label=sev_label, tier=tier))
+                  except asyncio.TimeoutError:
+                    self._emit("poc_prover", "lifecycle",
+                               {"event": "verify_timeout", "title": cf.title,
+                                "detail": f"verify/prove exceeded {int(_verify_cap)}s — deferred to next round"})
+                  except Exception as exc:
+                    # One bad candidate must not kill the never-quit hunt (§8).
+                    self._emit("poc_prover", "lifecycle",
+                               {"event": "candidate_verify_error", "title": cf.title, "detail": str(exc)[:200]})
 
                 # Find ALL criticals — do NOT stop at the first. Keep hunting/reframing across
                 # rounds (every lens deepening its angle) until the round cap or an operator stop,
                 # so multiple independent P1s surface rather than just the first one found.
                 crit = sum(f.severity == "critical" for f in findings)
-                self._emit(self.name, "message", {"phase": "round_summary", "round": depth,
-                                                  "criticals_total": crit, "candidates_total": len(all_candidates)})
+                self._emit(self.name, "message",
+                           {"phase": "round_summary", "round": depth, "criticals_total": crit,
+                            "candidates_total": len(all_candidates), "needs_human": len(needs_human),
+                            "spent_usd": round(self._spend_usd, 2),
+                            "cost_cap_usd": self._cost_cap})
                 # Persist findings each round so a later stop/kill always leaves them on disk.
-                self._write_findings_json(findings, all_candidates)
+                self._write_findings_json(findings, all_candidates, needs_human)
                 # Persist a full RESUMABLE snapshot so a kill/rate-limit can be jump-started from here.
                 self._write_state(tracks, critical_means, hunters, findings, all_candidates, seen, depth,
                                   oracle_desc=reference_hint)
@@ -944,6 +1403,8 @@ class ClaudeSwarm:
                 # findings + its ruled-out ledger + the cross-track blackboard — and writes a
                 # personalized directive (and may re-scope focus files) for each hunter's next round.
                 per_hunter = [r if isinstance(r, list) else [] for r in results]
+                # ADAPTIVE BUDGET: give the promising tracks more turns next round, cold ones base.
+                self._retune_budgets(hunters, per_hunter[:len(hunters)])
                 await self._resteer(hunters, per_hunter, depth, critical_means, findings, guard)
 
                 # Deepen each track's analysis next round, never quit on a dry spell.
@@ -1044,40 +1505,72 @@ class ClaudeSwarm:
     # --- Parent A cold reconnaissance (§6, NOTHING PRESET) ----------------
     def _scope_prompt(self) -> str:
         return (
-            "You are Parent A, the LEAD of this security audit and the brain of the whole hunt. You "
-            "have NO prior knowledge of this target beyond the fact that it is the source code in the "
-            "current working directory — it could be a smart contract, a crypto library, a web/API "
-            "service, a parser, a kernel module, anything. Explore it READ-ONLY (Read, Grep, Glob, "
-            "read-only Bash, WebSearch, WebFetch) and DESIGN the entire hunt yourself. Derive "
-            "everything from what you OBSERVE — never assume a particular technology, language, or "
-            "bug list.\n\n"
-            "1) UNDERSTAND. What is this system, its language/stack, its trust/threat model (the "
-            "participants, what is trusted, exactly what an attacker controls), the crown-jewel "
-            "assets, and what 'critical' means for THIS specific system.\n\n"
-            "2) FIND A DIFFERENTIAL ORACLE (generic, high-yield). Determine whether a SECOND "
-            "implementation of the same logic exists anywhere you can drive the same inputs through "
-            "and compare: a reference/spec implementation, an older or alternative version, a "
-            "well-known library that implements the same primitive, or even the documented spec "
-            "itself. If one exists, say where and how the pieces pair up — any divergence between the "
-            "in-scope code and the oracle on the same input is a likely bug. If none exists, say so.\n\n"
-            "3) RESEARCH HISTORICAL PATTERNS (WebSearch/WebFetch). Identify what this project IS, then "
-            "research the known critical bug classes for its category and any past audit findings, "
-            "CVEs, or disclosed exploits for this project and its close peers. The old bugs are "
-            "patched — you want the PATTERNS so the team can hunt NEW VARIANTS. Return them as short, "
-            "concrete, checkable statements.\n\n"
-            "4) DECOMPOSE INTO SUBSYSTEMS + INVARIANTS (deep ownership, not breadth). Split the "
-            "in-scope code into up to 6 cohesive SUBSYSTEMS (each a distinct mechanism). One track "
-            "OWNS each subsystem end-to-end. For each, DERIVE the explicit INVARIANTS it MUST uphold "
-            "FROM THE CODE ITSELF — its require/assert/revert checks, its accounting/conservation "
-            "math, its `// invariant:`/NatSpec comments, its role/modifier guards, the properties "
-            "its own tests assert — and state each as a machine-checkable property a fuzzer can "
-            "assert, citing the file:line it came from. Do NOT emit generic textbook properties; "
-            "every invariant must be SPECIFIC to THIS code (dispatch a sub-agent to read a subsystem "
-            "if its invariants aren't obvious). Nothing is preset — these are your derivations. Decide, "
-            "per subsystem, the best SEARCH STRATEGY: 'differential' (if the oracle covers it) or "
-            "'invariant' (stateful fuzzing of its own invariants). Your hunters AND an automated "
-            "fuzzer will PROVE or disprove each by writing and RUNNING real tests/harnesses against "
-            "the actual target — not by reading alone. Point focus_files at the IN-SCOPE code."
+            "You are Parent A, the LEAD of this security audit and the BRAIN of the whole hunt. Your "
+            "recon decides everything downstream — which subsystems are owned, which invariants are "
+            "chased, which order they're worked, where the team's effort goes. A mediocre recon caps "
+            "the whole hunt; an elite one is how a P1 gets found. Do this like the best auditor alive.\n\n"
+            "You have NO prior knowledge of this target beyond the source in the current working "
+            "directory — it could be a smart contract, a crypto/MPC library, a web/API service, a "
+            "parser, a kernel module, anything. Explore it READ-ONLY (Read, Grep, Glob, read-only "
+            "Bash, WebSearch, WebFetch) and DESIGN the entire hunt yourself. Derive EVERYTHING from "
+            "what you OBSERVE — never assume a technology, a language, or a bug list.\n\n"
+            "MINDSET: reason like an ATTACKER pursuing a WIN, not a reviewer checking correctness. "
+            "CORRECT ≠ SAFE — a faithful implementation of a flawed rule, or a perfectly-correct "
+            "computation fed an input the attacker chose, still loses funds/control/data. You are "
+            "looking for OUTCOMES an attacker can force, not for code that looks wrong.\n\n"
+            "READ DEEPLY: this is the one phase where breadth AND depth both matter. DISPATCH SUB-"
+            "AGENTS (Agent/Task) to read whole subsystems and return rich, file-anchored summaries; "
+            "reason over those. Cite real file:line for every claim — never guess. Spend real effort "
+            "here; the rest of the hunt inherits the quality of this map.\n\n"
+            "1) UNDERSTAND the system: what it is, its language/stack, how it's built and tested, "
+            "what it's FOR, and what 'critical' means for THIS specific system (the maximum attacker "
+            "win — theft, takeover, key/secret extraction, permanent loss/freeze, integrity break).\n\n"
+            "2) MAP THE ATTACK SURFACE & ACTORS precisely. Enumerate every EXTERNALLY-REACHABLE "
+            "entrypoint (public/external functions, routes, message handlers, protocol rounds, "
+            "deserializers — name + file:line). Enumerate each ACTOR and EXACTLY what it controls and "
+            "may call (e.g. unauthenticated user / low-priv or other-tenant user / counterparty / a "
+            "single MALICIOUS participant among honest ones / a compromised dependency). Mark the "
+            "TRUST BOUNDARIES and, for each, what is ASSUMED to be true across it and who can violate "
+            "that assumption. This surface is the foundation everything else builds on.\n\n"
+            "3) CROWN JEWELS & FLOWS. Identify where value / authority / funds / secrets / privileged "
+            "state concentrate — the few places where a bug is catastrophic. Trace the critical "
+            "value, authorization, and data FLOWS end to end (across functions/files/contracts/"
+            "parties). The P1 is almost always on one of these flows.\n\n"
+            "4) WHERE THE BUGS HIDE (derive from THIS code, not a checklist). From what you actually "
+            "read, flag the highest-risk SEAMS: where two correct pieces COMPOSE unsafely; external "
+            "calls / callbacks / re-entrancy; arithmetic — rounding, precision, signedness, overflow, "
+            "unit/decimal confusion; access-control / ownership / tenancy checks that are missing on "
+            "one path or trust a client-supplied field; implicit assumptions a check RELIES ON that an "
+            "attacker can break; the most complex / optimized / assembly / hand-rolled-crypto code; "
+            "upgrade/migration/init paths; anything that looks recently changed or uniquely intricate. "
+            "These are WHERE to point the team.\n\n"
+            "5) FIND A DIFFERENTIAL ORACLE (high-yield). Is there a SECOND implementation of the same "
+            "logic to compare against — a reference/spec impl, an older/alternative version, a known "
+            "library implementing the same primitive, or the documented spec itself? If so, say where "
+            "and how the pieces pair up — any divergence on the same input is a likely bug. Else say "
+            "none exists.\n\n"
+            "6) RESEARCH HISTORICAL PATTERNS (WebSearch/WebFetch). Identify what this project IS, then "
+            "research the known critical bug CLASSES for its category and past audit findings/CVEs/"
+            "disclosed exploits for it and its close peers. The old bugs are patched — you want the "
+            "PATTERNS so the team hunts NEW VARIANTS. Short, concrete, checkable statements.\n\n"
+            "7) DECOMPOSE & RANK (deep ownership, not breadth). Split the in-scope code into up to 6 "
+            "cohesive SUBSYSTEMS (each a distinct mechanism); one track OWNS each end-to-end. ORDER "
+            "the tracks MOST-DANGEROUS-FIRST — by (attacker reachability × blast radius × how likely "
+            "a subtle bug hides here); the first track is worked first and deepest, so put the "
+            "crown-jewel mechanism there. For EACH subsystem: name the ATTACKER'S WIN conditions and "
+            "the PROTECTED QUANTITIES that must never move the wrong way; then DERIVE the INVARIANTS "
+            "as 'what an attacker must NEVER be able to cause' — phrased as the OUTCOME, not as 'the "
+            "code checks X'. CAUTION: an invariant copied from what the code already asserts MISSES "
+            "the bug where the code faithfully does the wrong thing. Ground each in the real code "
+            "(accounting/conservation math, require/assert/revert, role/modifier guards, the "
+            "properties its own tests assert), state it as a machine-checkable property a fuzzer can "
+            "assert, and cite file:line. No generic textbook properties — every one SPECIFIC to THIS "
+            "code. Point focus_files at the exact IN-SCOPE files. Choose each subsystem's SEARCH "
+            "STRATEGY: 'differential' (if the oracle covers it) or 'invariant' (stateful fuzzing).\n\n"
+            "8) PLACE YOUR BET. State the SINGLE most promising hypothesis — where YOU would bet the "
+            "P1 is, citing the code, and the first concrete attacker move to test it. Be decisive.\n\n"
+            "Your hunters AND an automated fuzzer will PROVE or disprove each lead by writing and "
+            "RUNNING real tests/harnesses against the actual target — never by reading alone."
             + self._scope_guidance() + "\n\n"
             "\n\nWORKSPACE GUARDRAIL: you operate under ONE hard rule — you may do ANYTHING you "
             "need (read, write, build, install, run, fuzz, network) but ONLY INSIDE the in-scope "
@@ -1085,18 +1578,39 @@ class ClaudeSwarm:
             "as a path relative to the current directory (use \".\" for the whole acquired folder, "
             "or a subfolder that contains all the in-scope code). It is clamped to the acquired "
             "tree and locked as the hard guardrail.\n\n"
+            "PERMISSIONS — you also SET the runtime permission posture for the team (it can only "
+            "RESTRICT, never expand, the rules-derived floor). Decide from the program rules + what "
+            "this target needs: does proving a bug here require NETWORK egress (web research / "
+            "fetching deps) or can it be fully local? Are dependency INSTALLS needed to build, or is "
+            "the repo self-contained / does the program forbid them? Are there commands that should "
+            "be blocked outright for this target? Default to allowing what the work genuinely needs "
+            "and turning OFF what it doesn't (e.g. an offline crypto-lib audit: network off).\n\n"
             "Return ONLY JSON:\n"
-            '{"summary":"...","target_class":"<what kind of system>","threat_model":"...",'
+            '{"summary":"...",'
+            # target_class is used ONLY to route which toolchain RE-RUNS your PoC (forge / go / '
+            # cargo / pytest / native-cc / web). Pick the one that fits how THIS target is built and
+            # tested — derived from what you observed, not from any list of bugs. Use OTHER if none fit.
+            '"target_class":"<one of: EVM_CONTRACT | CRYPTO_LIB | WEB_API | MOBILE_APP | INFRA | '
+            'SUPPLY_CHAIN | OTHER — whichever matches how this target builds/tests>",'
+            '"threat_model":"...",'
             '"target_subclass":"<one-word category you DERIVED from the code, or \"\">",'
             '"workspace_root":"<relative path to the in-scope folder, or \".\">",'
-            '"critical_means":"...",'
+            '"permissions":{"allow_network":true|false,"allow_install":true|false,'
+            '"deny_commands":["<substring of any command to block for this target>",...],'
+            '"note":"<one line: why this posture fits this engagement>"},'
+            '"critical_means":"<the maximum attacker win for THIS system>",'
+            '"crown_jewels":["<where value/authority/secrets concentrate — file:line>",...],'
+            '"attack_surface":["<externally-reachable entrypoint + which actor controls it — file:line>",...],'
             '"differential_oracle":{"exists":true|false,"description":"where the second '
             'implementation/spec is and how it pairs with the in-scope code, or why none exists"},'
             '"known_patterns":["<known bug pattern to hunt a NEW variant of in this code>",...],'
+            '"top_hypothesis":"<the single place you would bet the P1 is, citing code + the first move to test it>",'
+            # tracks MUST be ORDERED most-dangerous-first (track 0 is worked first/deepest).
             '"tracks":[{"theme":"...","subsystem":"...","fuzz_mode":"differential|invariant",'
+            '"expected_severity":"critical|high|medium","attacker_reachability":"high|medium|low",'
             '"focus_files":["relative/path",...],'
-            '"invariants":["<machine-checkable property this subsystem must uphold>",...],'
-            '"investigate":["concrete invariant-breaking check to attempt IN THIS CODE",...]}]}'
+            '"invariants":["<machine-checkable property an attacker must never be able to break>",...],'
+            '"investigate":["concrete attacker move to attempt IN THIS CODE",...]}]}'
         )
 
     async def _scope(self, guard: ScopeGuard) -> dict:
@@ -1106,9 +1620,14 @@ class ClaudeSwarm:
 
         self._emit(self.name, "message",
                    {"phase": "scoping", "detail": "cold reconnaissance — no prior knowledge of the target"})
+        try:
+            _recon_turns = max(20, int(os.environ.get("P1HUNT_RECON_TURNS", "45")))
+        except ValueError:
+            _recon_turns = 45
         session = ClaudeSession(
             agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
-            guard_check=self._guard_check(guard, self.name), max_turns=30,
+            guard_check=self._guard_check(guard, self.name), max_turns=_recon_turns,
+            perms=self._perms, egress_hosts=self._egress_hosts,
         )
         result = await session.run(self._scope_prompt(), self.repo_path)
         parsed = _parse_json_object(result.text)
@@ -1118,6 +1637,12 @@ class ClaudeSwarm:
             return {"tracks": self._fallback_tracks(),
                     "critical_means": (parsed or {}).get("critical_means"),
                     "summary": (parsed or {}).get("summary", "")}
+        # Surface Parent A's recon reasoning so the operator can see the map it drew (and judge it).
+        self._emit(self.name, "lifecycle",
+                   {"event": "recon", "crown_jewels": (parsed.get("crown_jewels") or [])[:5],
+                    "attack_surface": (parsed.get("attack_surface") or [])[:6],
+                    "top_hypothesis": str(parsed.get("top_hypothesis", ""))[:300],
+                    "tracks": [t.get("subsystem") or t.get("theme") for t in (parsed.get("tracks") or [])][:6]})
         return parsed
 
     def _apply_workspace_guardrail(self, workspace_root: str | None) -> None:
@@ -1151,6 +1676,22 @@ class ClaudeSwarm:
                    {"event": "workspace_guardrail", "set_by": "parent_a",
                     "workspace": self._workspace_root, "narrowed": narrowed,
                     "policy": "agents may do ANYTHING inside this folder; every file read/write/edit outside it is denied"})
+
+    def _apply_permission_policy(self, permissions: object | None) -> None:
+        """PARENT A CONTROLS PERMISSIONS. Apply the permission posture Parent A chose during recon,
+        CLAMPED so it can only become MORE restrictive than the rules-derived floor (it may turn
+        network/installs OFF or add denied commands; it can never re-enable them). The result is the
+        single posture every agent session enforces. Always emitted so the operator sees the boundary
+        Parent A set (analogous to the workspace guardrail)."""
+        self._perms = self._perms.tightened_with(permissions if isinstance(permissions, dict) else None)
+        self._emit(self.name, "lifecycle",
+                   {"event": "permission_policy", "set_by": "parent_a",
+                    "allow_network": self._perms.allow_network,
+                    "allow_install": self._perms.allow_install,
+                    "deny_commands": self._perms.deny_commands[:8],
+                    "note": self._perms.note,
+                    "policy": "agents may act freely inside the workspace EXCEPT as restricted here; "
+                              "this can only tighten the rules-derived floor, never loosen it"})
 
     def _fallback_tracks(self) -> list[dict]:
         """Only when no Claude brain is available (offline/tests): generic lens tracks with a
@@ -1264,7 +1805,51 @@ class ClaudeSwarm:
             verified=True,
         )
         self.bb.add_finding(finding)
+        # LEARN: persist this CONFIRMED finding (generalized) to cross-engagement memory so future
+        # engagements on similar targets start with it as a "hunt a new variant" prior.
+        if self._memory is not None:
+            try:
+                self._memory.record(
+                    target_class=self._target_class, subclass=self._subclass,
+                    finding={"program": self.scope.program, "title": cf.title, "lens": cf.lens,
+                             "severity": tier, "root_cause": cf.root_cause,
+                             "counterfactual": cf.counterfactual,
+                             "harness_kind": getattr(repro, "runner", "")})
+            except Exception:
+                pass
         return finding
+
+    def _surface_for_human(self, cf: ClaudeFinding, rationale: str, severity_label: str,
+                           guard: ScopeGuard, *, ran: bool, detail: str) -> Finding:
+        """Build a NEEDS-HUMAN-REVIEW finding: believed-real + high-confidence + concrete-loss, but
+        not auto-reproduced. Marked verified=False and given an UNreproduced artifact, so it never
+        counts as a confirmed critical (the reproduced=confirmed floor is intact) — it is surfaced
+        prominently for a human precisely because the reasoning is strong and only the mechanical
+        proof is missing. This is the opposite of burying it as a nondescript candidate."""
+        why = ("ran but did not deterministically demonstrate the bug" if ran
+               else "no runnable harness/toolchain to auto-reproduce")
+        artifact = ArtifactRef(
+            id=new_id("art"), kind="reasoned",
+            path=f"{cf.file}:{cf.line}",
+            description=f"NOT auto-reproduced ({why}); reasoned P1 for human verification — {str(detail)[:240]}",
+            reproduced=False,
+        )
+        return Finding(
+            id=new_id("FND"),
+            hypothesis_id=self._hyp_by_finding.get(id(cf), Hypothesis(
+                id="?", claim="", owner_agent="", lens=cf.lens, target_assets=[], assumptions=[],
+                safe_validation_plan=SafeValidationPlan("", "", ""), stop_conditions=[], evidence_required=[])).id,
+            title=cf.title,
+            root_cause=cf.root_cause,
+            poc=artifact,
+            severity=severity_label,
+            severity_rationale=f"[{severity_label}] NEEDS HUMAN REVIEW — believed real (high confidence, "
+                               f"concrete loss: {cf.concrete_loss}) but not auto-reproduced. {rationale}",
+            counterfactual=cf.counterfactual,
+            remediation=cf.remediation or "Verify manually, then fix the root cause and add a regression test.",
+            safe_harbor_attestation=guard.attestation(),
+            verified=False,
+        )
 
     def trigger_safety_event(self, reason: str) -> None:
         self._safety_event = True

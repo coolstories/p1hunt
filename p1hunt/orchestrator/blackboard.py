@@ -78,10 +78,18 @@ class Blackboard:
 
     def add_finding(self, finding: Finding) -> None:
         self.findings[finding.id] = finding
+        # Carry the fields the UI needs to render a full finding CARD (location, counterfactual,
+        # remediation, reproduced) — additive; readers that only use id/title/severity still work.
+        poc = getattr(finding, "poc", None)
         self._log.emit(
             "blackboard",
             "finding",
-            {"id": finding.id, "title": finding.title, "severity": finding.severity},
+            {"id": finding.id, "title": finding.title, "severity": finding.severity,
+             "location": getattr(poc, "path", "") or "", "lens": "",
+             "counterfactual": getattr(finding, "counterfactual", "") or "",
+             "remediation": getattr(finding, "remediation", "") or "",
+             "reproduced": bool(getattr(poc, "reproduced", False)),
+             "command": (getattr(poc, "description", "") or "")[:120]},
         )
 
     # --- control channel (§11) -------------------------------------------

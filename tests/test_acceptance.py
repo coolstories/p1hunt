@@ -51,6 +51,7 @@ def _run_demo(tmp: str, *, rounds: int = 8, scope: Scope | None = None, kind: st
     scope = scope or sample_web_scope()
     target = write_vulnerable_target(Path(tmp) / "target", kind=kind)
     cfg = Config.from_env()
+    cfg.use_claude = False  # hermetic: force the deterministic brain (no live Claude SDK) in tests
     cfg.engagements_root = str(Path(tmp) / "engagements")
     return asyncio.run(run_engagement(scope, target, config=cfg, rounds=rounds))
 
@@ -357,6 +358,7 @@ class HumanReviewAndGoal(unittest.TestCase):
                 rules=["no prod"], rate_limit="10/min",
             )
             cfg = Config.from_env()
+            cfg.use_claude = False  # hermetic: deterministic brain only
             cfg.engagements_root = str(t / "eng")
             result = asyncio.run(run_engagement(scope, str(t), config=cfg, rounds=10))[0]
             self.assertTrue(result.confirmed_critical)

@@ -15,6 +15,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TextIO
 
+from . import theme as T
 from ..models import ControlDirective, Event, HypState
 from ..orchestrator.blackboard import Blackboard
 from ..orchestrator.bus import MessageBus
@@ -25,32 +26,14 @@ try:
 except Exception:  # pragma: no cover
     _COLOR = False
 
-_AGENT_COLORS = ["36", "34", "32", "92", "94", "96"]  # cycled for child_b agents
-
 
 def _paint(text: str, code: str) -> str:
-    if not _COLOR or not code:
-        return text
-    return f"\033[{code}m{text}\033[0m"
+    return T.paint(text, code, color=_COLOR)
 
 
 def _agent_color(agent: str) -> str:
-    if agent == "parent_a":
-        return "35;1"
-    if agent.startswith("falsifier"):
-        return "33"
-    if agent == "scopeguard":
-        return "31"
-    if agent in ("blackboard", "orchestrator", "operator"):
-        return "90"
-    if agent.startswith("child_b"):
-        base = agent.split(".")[0]
-        try:
-            idx = int("".join(c for c in base if c.isdigit()) or "0")
-        except ValueError:
-            idx = 0
-        return _AGENT_COLORS[idx % len(_AGENT_COLORS)]
-    return "0"
+    """Semantic agent color — delegated to the shared design language (theme.py)."""
+    return T.agent_identity(agent)[1]
 
 
 def format_event(event: Event) -> str:
@@ -59,9 +42,11 @@ def format_event(event: Event) -> str:
     tag = _paint(f"{agent:>14}", color)
 
     if kind == "thinking":
-        return f"{tag} {_paint('▸', color)} {d.get('text','')}"
+        return f"{tag} {_paint(T.TURN, color)} {d.get('text','')}"
     if kind == "tool_call":
-        return f"{tag} {_paint('·tool', '90')} {d.get('tool','')} {str(d.get('target',''))[:90]}"
+        tool = str(d.get("tool", ""))
+        args = " ".join(str(d.get("target", "")).split())[:90]
+        return f"{tag} {_paint(T.ACTION + ' ' + tool, color)} {_paint('(' + args + ')', T.REF_ANSI)}"
     if kind == "guard_decision":
         ok = d.get("allow")
         verdict = _paint("ALLOW", "32") if ok else _paint("DENY", "31;1")
@@ -190,30 +175,69 @@ def render_blackboard(bb: Blackboard) -> str:
 
 
 def render_snapshot(event_log: EventLog, blackboard: Blackboard, bus: MessageBus) -> str:
-    lines: list[str] = ["", "=== P1Hunt snapshot ==="]
-    agents = bus.registry()
-    lines.append(f"Agents ({len(agents)}): " + ", ".join(a.name for a in agents))
-    if blackboard.plan is not None:
-        p = blackboard.plan
-        lines += [
-            f"Target class: {p.target_class.value}",
-            f"Toolset: {', '.join(p.toolset)}",
-            f"Surfaces ranked: {len(p.surface_ranking)}",
-            f"Impact definition: {p.impact_definition}",
-        ]
+    """A polished, scannable end-of-run summary: a report CARD (leads with the P1 count) followed
+    by a full CARD for every confirmed finding, then a one-line agents/guard footer. Metrics are
+    derived from the event log + blackboard so the call signature stays stable."""
+    evs = list(getattr(event_log, "events", []))
+    width = 78
+
+    # --- derive metrics from the stream ---
+    tok = {"total": 0, "input": 0, "output": 0, "cost": 0.0}
+    rounds = reframes = 0
+    for e in evs:
+        d = e.data if isinstance(e.data, dict) else {}
+        if e.kind == "usage":
+            tok["total"] += d.get("total", 0); tok["input"] += d.get("input", 0)
+            tok["output"] += d.get("output", 0); tok["cost"] += d.get("cost", 0) or 0
+        elif e.kind == "reframe":
+            reframes += 1
+        elif e.kind == "message" and d.get("phase") == "round":
+            rounds = max(rounds, int(d.get("round", 0) or 0))
+    ts = [getattr(e, "ts", 0.0) for e in evs if getattr(e, "ts", 0.0)]
+    elapsed = (max(ts) - min(ts)) if len(ts) >= 2 else 0.0
+
+    findings = list(blackboard.findings.values())
+    p1 = [f for f in findings if str(f.severity).lower() == "critical"]
     states = Counter(h.state for h in blackboard.hypotheses.values())
-    lines.append(
-        "Hypotheses: " + ", ".join(f"{s.value}={states.get(s,0)}" for s in HypState)
-        + f" (total {len(blackboard.hypotheses)})"
-    )
-    guard = [e for e in event_log.events if e.kind == "guard_decision"]
-    denied = sum(1 for e in guard if not e.data.get("allow"))
-    lines.append(f"Guard decisions: {len(guard)} ({denied} denied)")
-    lines.append(f"Findings: {len(blackboard.findings)}")
-    for f in blackboard.findings.values():
-        lines.append(f"  - [{f.severity}] {f.title} ({f.id})")
-    lines.append("=======================")
-    return "\n".join(lines)
+    candidate_count = sum(n for s, n in states.items() if getattr(s, "name", "") == "CANDIDATE")
+    plan = blackboard.plan
+    program = getattr(getattr(blackboard, "scope", None), "program", "") or "engagement"
+    status = ("REPORT_READY" if p1 else "RUNNING" if (rounds or reframes) else "—")
+    brain = "claude" if any(e.kind == "usage" for e in evs) else "deterministic"
+    nxt = ("review the confirmed finding(s) + human-review checklist" if p1
+           else f"{candidate_count} candidate(s) surfaced — none reproduced yet" if candidate_count
+           else "keep hunting — no candidate surfaced yet")
+
+    out = ["", T.report_card(
+        program=program, status=status, rounds=rounds, reframes=reframes, p1_count=len(p1),
+        candidate_count=candidate_count, tokens_total=tok["total"], tokens_in=tok["input"],
+        tokens_out=tok["output"], cost=tok["cost"], elapsed_s=elapsed, brain=brain,
+        target_class=(plan.target_class.value if plan is not None else ""), next_step=nxt,
+        width=width, color=_COLOR)]
+
+    # --- a full card per confirmed finding (worst first) ---
+    for f in sorted(findings, key=lambda f: T.sev_rank(f.severity)):
+        poc = getattr(f, "poc", None)
+        out.append(T.finding_card(
+            severity=f.severity, title=f.title,
+            location=getattr(poc, "path", "") or "",
+            counterfactual=(getattr(f, "counterfactual", "") or "")[:120],
+            reproduced_by=("yes" if getattr(poc, "reproduced", False) else ""),
+            remediation=(getattr(f, "remediation", "") or "")[:120],
+            confirmed=getattr(poc, "reproduced", False), width=width, color=_COLOR))
+    if not findings:
+        out.append(_paint("  no findings confirmed yet — the swarm did not promote without a reproduced artifact.", "90"))
+
+    # --- footer: agents + hypotheses + guard ---
+    guard = [e for e in evs if e.kind == "guard_decision"]
+    denied = sum(1 for e in guard if not (e.data or {}).get("allow"))
+    hyp = " ".join(f"{s.value}={states.get(s, 0)}" for s in HypState)
+    out += [
+        _paint(f"  agents {len(bus.registry())} · hypotheses {hyp} · "
+               f"guard {len(guard)} decisions ({denied} denied)", "90"),
+        "",
+    ]
+    return "\n".join(out)
 
 
 # --- control plane (§11) --------------------------------------------------

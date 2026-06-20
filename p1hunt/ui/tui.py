@@ -16,47 +16,26 @@ import time
 from pathlib import Path
 from typing import Iterator, TextIO
 
+from . import theme as T
+
 try:
     _COLOR = sys.stdout.isatty()
 except Exception:  # pragma: no cover
     _COLOR = False
 
-_PALETTE = ["36", "34", "32", "92", "94", "96"]
 _WIDTH = 98
 
 
 def _c(text: str, code: str) -> str:
-    return text if (not _COLOR or not code) else f"\033[{code}m{text}\033[0m"
+    return T.paint(text, code, color=_COLOR)
 
 
 def _color_for(agent: str) -> str:
-    base = agent.split(".")[0]
-    if base == "parent_a":
-        return "35;1"
-    if base.startswith("falsifier"):
-        return "33"
-    if base in ("scopeguard",):
-        return "31"
-    if base in ("blackboard", "orchestrator", "operator"):
-        return "90"
-    if base.startswith("child_b"):
-        idx = int("".join(ch for ch in base if ch.isdigit()) or "0")
-        return _PALETTE[idx % len(_PALETTE)]
-    return "0"
+    return T.agent_identity(agent)[1]
 
 
 def _tag(agent: str) -> str:
-    base = agent.split(".")[0]
-    if base == "parent_a":
-        label = "A"
-    elif base.startswith("falsifier"):
-        label = "F"
-    elif base.startswith("child_b"):
-        label = "B" + "".join(ch for ch in base if ch.isdigit())
-    else:
-        label = base[:3].upper()
-    depth = "  " if "." in agent else ""  # child C indents under its parent
-    return depth + _c(f"[{label}]", _color_for(agent))
+    return T.agent_tag(agent, color=_COLOR)
 
 
 def _wrap(text: str, indent: str) -> str:
@@ -75,6 +54,9 @@ class _Board:
         self.tools = ""
         self.hyp: dict[str, str] = {}
         self.findings: list[tuple[str, str]] = []
+        self._streaming = False           # a live token stream is mid-line
+        self._stream_type = "output"      # "thinking" | "output" of the current stream
+        self._streamed: set[str] = set()  # block types delivered live this turn (dedup the final)
 
     def apply(self, e: dict) -> None:
         d = e.get("data", {})
@@ -97,7 +79,8 @@ class _Board:
         rows = [line]
         if self.target:
             rows.append(_c(f"  │ target: {self.target}   tools: {self.tools}", "90"))
-        rows.append(_c("  │ hypotheses: " + "  ".join(f"{k}={v}" for k, v in counts.items()) or "  │ hypotheses: (none)", "90"))
+        hyp = "  ".join(f"{k}={v}" for k, v in counts.items()) or "(none)"
+        rows.append(_c(f"  │ hypotheses: {hyp}", "90"))
         if self.findings:
             rows.append(_c("  │ findings:", "90"))
             for sev, title in self.findings:
@@ -120,18 +103,28 @@ def _render(e: dict, board: _Board, out: TextIO, live: bool = False) -> None:
         board._streaming = False
     if kind == "stream_start":
         if live:
-            out.write(f"\n{_tag(agent)} {_c('▸', _color_for(agent))} ")
+            is_think = d.get("block") == "thinking"
+            board._stream_type = "thinking" if is_think else "output"
+            board._streamed.add(board._stream_type)
+            # Thinking gets a dim "⋯ thinking" gutter; the answer gets a bright ▸ — like Claude Code.
+            head = _c(f"{T.THINK} thinking", "90") if is_think else _c(T.ACTION, _color_for(agent))
+            out.write(f"\n{_tag(agent)} {head} ")
             out.flush()
             board._streaming = True
         return
     if kind == "stream":
         if live:
-            out.write(str(d.get("text", "")))
+            txt = str(d.get("text", ""))
+            out.write(_c(txt, "90") if board._stream_type == "thinking" else txt)  # thinking dimmed
             out.flush()
             board._streaming = True
         return
-    if kind == "thinking" and live:
-        return  # already shown live via the token stream
+    if kind in ("thinking", "output") and live:
+        # In live mode the streamed deltas already showed this block; drop the duplicate FINAL
+        # block — UNLESS this type never streamed (answer delivered whole), then render it below.
+        if kind in board._streamed:
+            board._streamed.discard(kind)
+            return
 
     if kind == "message":
         if d.get("phase") == "scoping":
@@ -167,20 +160,35 @@ def _render(e: dict, board: _Board, out: TextIO, live: bool = False) -> None:
             p(f"{_tag('falsifier')} {_c('⚖', '33')} {marks.get(v, v)}  {str(label)[:70]}")
             if d.get("reason"):
                 p(_wrap(str(d["reason"]), "        "))
-    elif kind == "thinking":
-        p(f"{_tag(agent)} {_c('▸', _color_for(agent))}")
-        p(_wrap(str(d.get("text", "")), "        "))
+    elif kind in ("thinking", "output"):
+        # thinking = dim reasoning (⋯); output = the model's ANSWER (▸), rendered with markdown.
+        is_think = kind == "thinking"
+        head = _c(f"{T.THINK} thinking", "90") if is_think else _c(T.ACTION, _color_for(agent))
+        p(f"{_tag(agent)} {head}")
+        for para in str(d.get("text", "")).splitlines() or [""]:
+            if is_think:  # plain + dim (no nested ANSI fighting the dim)
+                p(_c("        " + T.md_to_ansi(para, color=False), "90"))
+            else:         # the answer — full inline markdown (bold/italic/code)
+                p("        " + T.md_to_ansi(para, color=_COLOR))
     elif kind == "tool_call":
-        p(_c(f"        · {d.get('tool','')} {str(d.get('target',''))[:78]}", "90"))
+        tool = str(d.get("tool", ""))
+        args = " ".join(str(d.get("target", "")).split())[:74]
+        p("        " + _c(f"{T.ACTION} {tool}", _color_for(agent)) + _c(f" ({args})", T.REF_ANSI))
     elif kind == "guard_decision":
         if not d.get("allow"):
             p(_c(f"        ⛔ DENY {d.get('tool','')} → {str(d.get('target',''))[:50]} :: {d.get('reason','')}", "31;1"))
     elif kind == "finding":
         if d.get("event") == "critical_confirmed":
-            p("\n" + _c(f"  ★★★  CRITICAL CONFIRMED ×{d.get('count',1)}  ★★★", "32;1"))
-        else:
-            p("\n" + _c(f"  ★ FINDING [{d.get('severity','')}] {d.get('title','')}", "32;1"))
-            p(board.panel())
+            p("\n" + _c(f"  {T.FINDING*3}  CRITICAL CONFIRMED ×{d.get('count',1)}  {T.FINDING*3}", "32;1"))
+        elif d.get("id"):
+            # A full finding CARD — the product of the hunt, rendered to be read first.
+            p("\n" + T.finding_card(
+                severity=d.get("severity", "?"), title=d.get("title", ""),
+                location=d.get("location", ""), lens=d.get("lens", ""),
+                counterfactual=str(d.get("counterfactual", ""))[:120],
+                reproduced_by=("yes" if d.get("reproduced") else ""),
+                remediation=str(d.get("remediation", ""))[:120],
+                confirmed=bool(d.get("reproduced", True)), width=_WIDTH - 24, color=_COLOR))
     elif kind == "lifecycle":
         ev = d.get("event")
         if ev == "spawn":  # Child C subtask (deterministic path)
@@ -242,23 +250,32 @@ def watch(path: str | Path, *, follow: bool = False, out: TextIO | None = None) 
     if not path.exists():
         print(_c(f"(waiting for {path} …)", "90"), file=out)
 
-    seen = 0
-    while True:
-        if path.exists():
-            events = list(_read_events(path))
-            for e in events[seen:]:
-                _render(e, board, out)
-            seen = len(events)
-        if not follow:
-            break
-        # follow: poll for new lines until the run ends and no new events arrive
-        time.sleep(1.0)
-        if path.exists() and len(list(_read_events(path))) == seen and _run_done(seen, path):
-            # heuristic stop: a Result/finished marker or no growth handled by caller
-            pass
+    # Byte-offset tail: only read what was appended since the last poll (O(new bytes), not O(file)
+    # every second). A trailing partial line is held in ``buf`` until its newline arrives.
+    offset = 0
+    buf = ""
+    try:
+        while True:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as fh:
+                    fh.seek(offset)
+                    chunk = fh.read()
+                    offset = fh.tell()
+                if chunk:
+                    buf += chunk
+                    *lines, buf = buf.split("\n")
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            _render(json.loads(line), board, out)
+                        except json.JSONDecodeError:
+                            continue
+            if not follow:
+                break
+            time.sleep(0.5)  # follow ends on Ctrl-C; replay (no follow) exits after one pass
+    except KeyboardInterrupt:
+        pass
     print("", file=out)
     print(board.panel(), file=out)
-
-
-def _run_done(seen: int, path: Path) -> bool:
-    return False  # follow loop is interrupted by the user (Ctrl-C); replay mode exits naturally

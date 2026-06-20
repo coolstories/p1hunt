@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..classify.signals import SignalHit, scan_artifacts
+from ..classify.evm_signals import scan_combined
+from ..classify.signals import SignalHit
 from ..config import Config
 from ..models import (
     ArtifactRef,
@@ -40,6 +41,11 @@ _REMEDIATION: dict[str, str] = {
     "unsafe-deser": "Use safe parsers, disable arbitrary object construction, validate schemas before parsing.",
     "evm-tx-origin": "Use msg.sender with explicit role checks; test calls through intermediate contracts.",
     "evm-delegatecall": "Restrict privileged primitives to audited upgrade paths; validate targets; add invariant tests.",
+    "evm-unchecked-call": "Bind and require() every low-level call's success flag; account for partial/failed transfers; add an invariant test that asserts balance conservation.",
+    "evm-bare-ecrecover": "Reject address(0) from ecrecover, pin the expected signer, and enforce EIP-712 domain separation and nonce/replay protection.",
+    "evm-div-before-mul": "Reorder fill/share math to multiply before dividing (or use a mulDiv helper); add a property test asserting no attacker-favorable rounding.",
+    "evm-raw-delegatecall": "Restrict delegatecall to a constant/allowlisted implementation behind an audited upgrade path; add an invariant test guarding the storage layout.",
+    "evm-reentrancy-call": "Apply checks-effects-interactions, add a reentrancy guard, and write an invariant/handler test that re-enters through the callback (ERC777/1155).",
     "mass-assignment": "Use DTO/schema allowlists; separate privileged writes; add negative tests for protected fields.",
     "jwt-no-verify": "Verify issuer, audience, expiry, and signature with an allowlisted algorithm.",
     "ci-privileged-pr": "Separate untrusted PR validation from privileged workflows; pin least-privilege permissions.",
@@ -124,7 +130,7 @@ class ParentA:
     # --- §7 delegation ----------------------------------------------------
     def setup_tracks(self, max_tracks: int = 6) -> list[ChildB]:
         assert self.plan is not None and self.guard is not None, "call derive() first"
-        self._hits = scan_artifacts(self.artifact_dir)
+        self._hits = scan_combined(self.artifact_dir)
         self.falsifier = Falsifier(self.reasoner, self.bb, self.log)
         self.bus.register(self.falsifier.name, "falsifier")
 
@@ -299,6 +305,36 @@ class ParentA:
                 return hit
         return None
 
+    # --- "there IS a P1, find it" visibility (§8 optimistic prior, §11 observability) -----
+    _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+    def _candidate_view(self, findings: list[Finding]) -> list[dict]:
+        """Surface EVERY derived signal as a ranked P1 candidate — even the ones the offline
+        artifact floor could not deterministically reproduce. The optimistic prior is that a
+        P1 exists; the operator must always SEE the leads (strongest first) rather than a silent
+        "nothing found". A hit already promoted to a confirmed finding is annotated as such."""
+        promoted = {(f.poc.path if f.poc else "") for f in findings}
+        out: list[dict] = []
+        seen: set[str] = set()
+        for hit in self._hits:
+            key = f"{hit.file}:{hit.line}:{hit.signal.id}"
+            if key in seen:
+                continue
+            seen.add(key)
+            loc = f"{hit.file}:{hit.line}"
+            out.append({
+                "title": hit.signal.title,
+                "severity": self.reasoner.severity(hit),
+                "file": hit.file,
+                "line": hit.line,
+                "lens": hit.signal.lens,
+                "snippet": hit.snippet,
+                "root_cause": hit.signal.rationale,
+                "reproduced": loc in promoted,
+            })
+        out.sort(key=lambda c: (self._SEV_ORDER.get(str(c["severity"]).lower(), 9), c["file"]))
+        return out
+
     def _result(self, status, rounds, findings, demoted) -> HuntResult:
         assert self.plan is not None and self.guard is not None
         return HuntResult(
@@ -309,4 +345,5 @@ class ParentA:
             reframes=self._reframes,
             demoted_to_warm_pool=demoted,
             attestation=self.guard.attestation(),
+            candidates=self._candidate_view(findings),
         )

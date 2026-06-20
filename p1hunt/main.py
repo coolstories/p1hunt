@@ -83,7 +83,25 @@ async def run_engagement(
         runner.complete(Phase.HYPOTHESIS, gate_passed=True)
         result = await swarm.hunt(max_rounds=rounds)  # None = never stop until a critical
     else:
-        log.emit("operator", "lifecycle", {"event": "brain", "detail": "deterministic offline reasoner"})
+        # LOUD WARNING: the offline brain only pattern-matches regex signals — it does NOT read
+        # logic and CANNOT find a real logic/business-logic P1. A "0 criticals" result here means
+        # "the weak brain found nothing", NOT "the target is clean". This is the most dangerous
+        # false-confidence path, so make it unmissable (mirrors the missing-toolchain warning).
+        from .config import _has_agent_credentials
+        _why = "no ANTHROPIC creds / `claude` CLI" if not _has_agent_credentials() else "P1HUNT_USE_CLAUDE=0"
+        banner_msg = (
+            "\n" + "!" * 78 +
+            "\n!! DEGRADED MODE: deterministic OFFLINE brain (no Claude). It only matches regex"
+            "\n!! signals — it does NOT reason about logic and CANNOT find a real P1. A clean"
+            "\n!! result here means NOTHING about the target's safety."
+            f"\n!! Cause: {_why}. Fix: install/authenticate the `claude` CLI (or set "
+            "P1HUNT_USE_CLAUDE=1)."
+            "\n" + "!" * 78 + "\n")
+        print(banner_msg)
+        log.emit("operator", "lifecycle",
+                 {"event": "brain", "detail": "deterministic offline reasoner", "severity": "HIGH",
+                  "warning": "DEGRADED — regex-only; cannot find a real P1; clean result is meaningless",
+                  "cause": _why})
         parent = ParentA(scope, artifact_dir, config=config, bus=bus, blackboard=bb, event_log=log)
         parent.derive()
         parent.setup_tracks()
@@ -127,6 +145,21 @@ def _demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _identities_from_env() -> list:
+    """Discover authorized test principals from the environment WITHOUT capturing the secret: each
+    P1HUNT_TOKEN[_X] env var becomes a TestIdentity that references the var by NAME (token_env), so
+    nothing secret is ever placed in the Scope or persisted to scope.json."""
+    from .models import TestIdentity
+
+    out = []
+    for key in sorted(os.environ):
+        if key == "P1HUNT_TOKEN" and os.environ[key]:
+            out.append(TestIdentity(name="default", token_env=key))
+        elif key.startswith("P1HUNT_TOKEN_") and os.environ[key]:
+            out.append(TestIdentity(name=key[len("P1HUNT_TOKEN_"):].lower(), token_env=key))
+    return out
+
+
 def build_scope(
     program: str,
     target_value: str,
@@ -137,9 +170,17 @@ def build_scope(
     environment: str = "local",
     out_of_scope_globs: list[str] | None = None,
     scope_note: str = "",
+    dynamic_targets: list | None = None,
+    test_identities: list | None = None,
 ) -> Scope:
-    """Build a minimal authorized Scope for a single in-scope target (repo URL or path)."""
+    """Build a minimal authorized Scope for a single in-scope target (repo URL or path). When a
+    live dynamic target is supplied, its host is also added as an in-scope asset so the guard's
+    asset allowlist recognizes it."""
     kind = "repo" if (looks_like_repo(target_value) or Path(target_value).exists()) else "domain"
+    dyn = dynamic_targets or []
+    in_scope = [Asset("a1", target_value, kind, target_value, environment)]
+    for i, t in enumerate(dyn, start=1):
+        in_scope.append(Asset(f"live{i}", t.base_url, "domain", t.base_url, t.environment))
     return Scope(
         program=program,
         platform=platform,
@@ -148,13 +189,15 @@ def build_scope(
         or "Authorized local/fork/UAT/owned-account testing only. No production writes, DoS, "
         "credential use, or third-party data access.",
         severity_taxonomy=dict(_TAXONOMY),
-        in_scope=[Asset("a1", target_value, kind, target_value, environment)],
+        in_scope=in_scope,
         out_of_scope=[],
         rules=["Use only owned accounts or synthetic data.", "No production writes."],
         rate_limit=rate_limit,
         source_urls=[],
         out_of_scope_globs=out_of_scope_globs or [],
         scope_note=scope_note or "",
+        dynamic_targets=dyn,
+        test_identities=test_identities or [],
     )
 
 
@@ -162,6 +205,8 @@ def _hunt(args: argparse.Namespace) -> int:
     config = Config.from_env()
     if args.no_claude:
         config.use_claude = False
+    if getattr(args, "auto_install_toolchain", False):
+        config.auto_install_toolchain = True
     if getattr(args, "resume", False):
         # Continue from the saved snapshot (state.json) in the existing engagement folder —
         # skips cold reconnaissance, restores tracks/candidates/ruled-out/round. (Reuses the
@@ -170,8 +215,22 @@ def _hunt(args: argparse.Namespace) -> int:
         print("↻ RESUME mode: continuing from saved state (no cold re-scope).")
     program = args.program or f"Ad-hoc engagement ({args.target})"
     oos = [g.strip() for g in (args.out_of_scope or "").split(",") if g.strip()]
+    # Authorized LIVE dynamic target (web/API criticals): from --base-url or P1HUNT_BASE_URL/GQL.
+    if getattr(args, "base_url", None):
+        config.live_base_url = args.base_url
+    if getattr(args, "live_env", None):
+        config.live_environment = args.live_env
+    dyn_targets = config.dynamic_targets()
+    identities = _identities_from_env() if dyn_targets else []
+    if dyn_targets and config.run_mode != "active":
+        print("ℹ A live target was provided but run_mode is not 'active'; set P1HUNT_RUN_MODE=active "
+              "(with agent credentials) to enable authorized live testing. Continuing static-only.")
     scope = build_scope(program, args.target, platform=args.platform,
-                        out_of_scope_globs=oos, scope_note=getattr(args, "scope_note", "") or "")
+                        out_of_scope_globs=oos, scope_note=getattr(args, "scope_note", "") or "",
+                        dynamic_targets=dyn_targets, test_identities=identities)
+    if dyn_targets:
+        print(f"🌐 Live target(s): {', '.join(t.base_url for t in dyn_targets)} "
+              f"[{config.live_environment}] · identities: {', '.join(i.name for i in identities) or 'none'}")
     max_rounds = args.max_rounds  # None => never stop until a critical is confirmed
 
     # Acquisition (§2.1): clone a repo URL, or use a local path as-is.
@@ -466,6 +525,11 @@ def _status(_args: argparse.Namespace) -> int:
 
     print(f"detector brain: {'claude-agent-sdk swarm' if config.use_claude else 'deterministic offline'}")
     print(f"claude SDK available: {sdk_available()}")
+    from .tools.build_env import activate_foundry_path, toolchain_available
+    activate_foundry_path()  # discover a previously-installed Foundry in ~/.foundry/bin
+    forge_ok, anvil_ok = toolchain_available("forge"), toolchain_available("anvil")
+    print(f"reproduction toolchain: forge={'yes' if forge_ok else 'MISSING'} anvil={'yes' if anvil_ok else 'MISSING'}"
+          + ("" if forge_ok else f"  (auto-install: {'on' if config.auto_install_toolchain else 'off — set P1HUNT_AUTO_INSTALL_TOOLCHAIN=1'})"))
     print(f"run_mode: {config.run_mode}")
     print(f"permission_mode: {config.permission_mode} (never 'ask' unattended)")
     print(f"models: {config.models.orchestrator} / {config.models.worker} / {config.models.warm_pool}")
@@ -474,6 +538,10 @@ def _status(_args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Discover a previously-installed Foundry (~/.foundry/bin) so the reproduction gate can find
+    # `forge`/`anvil` even in a non-login shell where they're not on PATH yet.
+    from .tools.build_env import activate_foundry_path
+    activate_foundry_path()
     # No arguments -> the interactive launcher (the default experience).
     if not argv and len(sys.argv) <= 1:
         return interactive()
@@ -501,9 +569,20 @@ def main(argv: list[str] | None = None) -> int:
                       help="Comma-separated path globs that are present but NOT the in-scope deployed code "
                            "(e.g. 'reference/*,test/*,contracts/helpers/*'). Findings here are never promoted; "
                            "the code is used only as a differential oracle.")
+    hunt.add_argument("--base-url", dest="base_url",
+                      help="Authorized RUNNING instance to test live (UAT/owned/testnet/staging — "
+                           "never production). Enables request-driven hunting for web/API criticals "
+                           "(IDOR/SSRF/auth-bypass). Needs P1HUNT_RUN_MODE=active + agent creds; "
+                           "supply test creds via P1HUNT_TOKEN_A / P1HUNT_TOKEN_B env vars.")
+    hunt.add_argument("--live-env", dest="live_env", default=None,
+                      choices=["uat", "owned", "testnet", "staging", "local"],
+                      help="Environment class of --base-url (default uat). Production is never allowed.")
     hunt.add_argument("--scope-note", dest="scope_note",
                       help="Rules-of-engagement note surfaced to Parent A and the hunters.")
     hunt.add_argument("--no-claude", action="store_true", help="Force the deterministic offline brain.")
+    hunt.add_argument("--auto-install-toolchain", dest="auto_install_toolchain", action="store_true",
+                      help="Install Foundry (forge/anvil) if missing so the reproduction gate can actually "
+                           "fire — the biggest unblocker for confirmed criticals on EVM targets.")
     hunt.add_argument("--resume", action="store_true",
                       help="Continue a prior run from its saved state.json (skip cold re-scope; restore "
                            "tracks, candidates, ruled-out ledgers, and round). Use the SAME --program.")

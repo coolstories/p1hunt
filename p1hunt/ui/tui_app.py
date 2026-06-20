@@ -14,22 +14,29 @@ import threading
 import time
 from collections import defaultdict
 
+from . import theme as T
 from .tui import _Board
 
 
 def _set_mouse(curses, on: bool) -> None:
-    """Enable/disable mouse-wheel reporting. We emit the xterm DEC-private sequences directly
-    (1000=button tracking, 1006=SGR coords, 1007l=DISABLE alternate-scroll) because macOS
-    Terminal otherwise translates the wheel into ↑/↓ arrows — which would switch agents instead
-    of scrolling. With this on, the wheel delivers real mouse events that we map to scrolling."""
+    """Enable mouse-WHEEL reporting so trackpad/wheel up-down ALWAYS scrolls the agent stream.
+
+    We emit the xterm DEC-private sequences directly:
+      1000h = button tracking (wheel arrives as buttons 4/5), 1002h = button-event tracking
+      (some terminals only deliver the wheel under this), 1006h = SGR extended coords,
+      1007l = DISABLE alternate-scroll (else macOS Terminal turns the wheel into ↑/↓ arrows,
+      which would switch agents instead of scrolling).
+    The mask requests ALL events incl. position so wheel-down (BUTTON5) is never dropped.
+    ``on=False`` is used only on exit to restore the terminal's native wheel/selection."""
     try:
         if on:
-            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            mask = curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0)
+            curses.mousemask(mask)
             curses.mouseinterval(0)
-            sys.stdout.write("\033[?1000h\033[?1006h\033[?1007l")
+            sys.stdout.write("\033[?1000h\033[?1002h\033[?1006h\033[?1007l")
         else:
             curses.mousemask(0)
-            sys.stdout.write("\033[?1000l\033[?1006l\033[?1007h")  # restore native wheel/selection
+            sys.stdout.write("\033[?1000l\033[?1002l\033[?1006l\033[?1007h")
         sys.stdout.flush()
     except Exception:
         pass
@@ -55,7 +62,11 @@ class TuiState:
         self._pending: dict[str, tuple[str, str]] = {}  # agent -> (tag, partial text)
         self.board = _Board()
         self.tokens = {"total": 0, "input": 0, "output": 0, "cost": 0.0}
-        self._streaming: set[str] = set()  # agents that emit live token deltas
+        # Per-agent record of which block types (thinking|output) arrived as LIVE token deltas this
+        # turn, so the duplicate FINAL block of that type is dropped — but a final block of a type
+        # that did NOT stream (e.g. the answer delivered whole) is still shown. Cleared as each
+        # final block is consumed so the next turn starts fresh.
+        self._streamed: dict[str, set[str]] = defaultdict(set)
         self.selected = 0
         self.lock = threading.Lock()
         self.dirty = True
@@ -71,7 +82,10 @@ class TuiState:
         self.dark = True            # True = night mode (white font); False = normal (black font)
         self.show_thinking = False  # thinking is collapsed until the user presses Ctrl+O
         self.run_log_path = None    # raw process log (NOT AI) shown in its own tab if present
-        self.mouse_on = True        # ON: wheel scrolls (real mouse events); 'm' frees it for text selection
+        self.mouse_on = True        # wheel/trackpad scroll is ALWAYS on (kept for back-compat)
+        self._t0 = time.monotonic()  # wall-clock start, for the header's elapsed timer
+        self.round = 0               # latest round number seen (header headline)
+        self.findings_full: list[dict] = []  # enriched confirmed-finding events → finding cards
 
     # --- tabs -------------------------------------------------------------
     def tabs(self) -> list[str]:
@@ -140,6 +154,7 @@ class TuiState:
                 self.board.apply({"agent": agent, "kind": kind, "data": data})
             if kind == "finding" and data.get("id"):
                 self.confirmed.append((str(data.get("severity", "?")), str(data.get("title", ""))))
+                self.findings_full.append(dict(data))  # full payload → render a finding card
             if kind == "finding_reported":
                 # a hunter posted a finding live via the write-only blackboard tool (mid-session)
                 loc = f"{data.get('file','?')}:{data.get('line','?')}"
@@ -152,28 +167,30 @@ class TuiState:
                 self._add(agent, "finding", f"★ posted to blackboard: {data.get('title','')} [{data.get('severity','')}]")
                 return
 
+            base = agent.split(".")[0]
             if kind == "stream_start":
-                self._streaming.add(agent.split(".")[0])
                 self._flush(agent)
                 tag = "thinking" if data.get("block") == "thinking" else "output"
+                self._streamed[base].add(tag)
                 self._pending[agent] = (tag, "")
                 return
             if kind == "stream":
-                self._streaming.add(agent.split(".")[0])
                 cur = self._pending.get(agent, ("output", ""))
                 tag = "thinking" if data.get("thinking") else cur[0]
+                self._streamed[base].add(tag)
                 self._pending[agent] = (tag, cur[1] + str(data.get("text", "")))
                 return
-            if kind == "thinking":
-                # Streaming agents already show this text as live deltas — skip to avoid
-                # duplication. Agents that DON'T stream (the common case here) deliver all
-                # their reasoning only via these thinking events, so render them.
-                if agent.split(".")[0] in self._streaming:
+            if kind in ("thinking", "output"):
+                # The FINAL whole block. If this type already streamed live this turn, it's a
+                # duplicate — drop it and clear the flag (so the NEXT turn shows again). If it did
+                # NOT stream (answer/reasoning delivered whole), render it.
+                if kind in self._streamed.get(base, ()):
+                    self._streamed[base].discard(kind)
                     return
                 self._flush(agent)
                 txt = str(data.get("text", "")).strip()
                 if txt:
-                    self._add(agent, "thinking", txt)
+                    self._add(agent, kind, txt)   # tag "thinking" (collapsible) or "output" (answer)
                 return
 
             self._flush(agent)
@@ -233,6 +250,7 @@ class TuiState:
         elif d.get("phase") == "scoped":
             self._add(agent, "system", f"derived {d.get('tracks','?')} tracks · critical = {str(d.get('critical_means',''))[:80]}")
         elif d.get("phase") == "round":
+            self.round = int(d.get("round", self.round) or self.round)
             self._add(agent, "round", f"──── ROUND {d.get('round')} ({d.get('lenses', d.get('depth','?'))} tracks) ────")
         elif d.get("phase") == "hunt":
             self._add(agent, "system", f"🔎 hunting {d.get('lens','')} (pass {d.get('depth','')})")
@@ -275,7 +293,13 @@ class TuiState:
     # --- render data ------------------------------------------------------
     def header(self) -> str:
         t = self.tokens
-        return f"P1HUNT · {self.program or 'hunt'} · tokens {fmt_tokens(t['total'])} (in {fmt_tokens(t['input'])}/out {fmt_tokens(t['output'])}) · ${t['cost']:.2f}"
+        p1 = sum(1 for s, _ in self.confirmed if str(s).lower() == "critical")
+        elapsed = T.fmt_duration(time.monotonic() - self._t0)
+        rnd = f"r{self.round} · " if self.round else ""
+        # Lead with the headline metric — confirmed P1 count — then round, elapsed, tokens, cost.
+        p1str = f"{T.FINDING} {p1} P1" if p1 else "0 P1"
+        return (f"{self.program or 'hunt'}  ·  {p1str}  ·  {rnd}{elapsed}  ·  "
+                f"{fmt_tokens(t['total'])} tok · ${t['cost']:.2f}")
 
     def thread_entries(self, tab: str) -> list[tuple[str, str]]:
         with self.lock:
@@ -332,29 +356,32 @@ class TuiState:
                 ]
                 return head + [("system", ln) for ln in self.board.panel().splitlines()]
             if tab == "findings":
-                crits = [(s, t) for s, t in self.confirmed if s == "critical"]
-                others = [(s, t) for s, t in self.confirmed if s != "critical"]
+                cards_w = 86
+                crits = [f for f in self.findings_full if str(f.get("severity", "")).lower() == "critical"]
+                others = [f for f in self.findings_full if str(f.get("severity", "")).lower() != "critical"]
                 rows: list[tuple[str, str]] = [
-                    ("assign", "FINDINGS — hunters WRITE (post_finding) → Falsifier verifies → CONFIRMED"),
-                    ("system", ""),
-                    ("round", f"★ CONFIRMED CRITICALS / P1s (the focus) — {len(crits)}"),
+                    ("assign", "FINDINGS — hunters post_finding → Falsifier verifies → reproduced → CONFIRMED"),
+                    ("spacer", ""),
+                    ("round", f"{T.FINDING} CONFIRMED CRITICALS / P1s (the focus) — {len(crits)}"),
+                    ("spacer", ""),
                 ]
-                for _sev, title in crits:
-                    rows.append(("finding", f"★ {title}"))
+                for f in crits:
+                    rows.extend(_finding_card_lines(f, cards_w))
                 if not crits:
-                    rows.append(("system", "(no P1 confirmed yet — this is what we're hunting for)"))
-                rows.append(("system", ""))
-                rows.append(("round", f"✓ CONFIRMED FINDINGS (Falsifier-verified, non-critical) — {len(others)}"))
-                for sev, title in others:
-                    rows.append(("verdict", f"✓ [{sev}] {title}"))
+                    rows.append(("system", "  (no P1 confirmed yet — this is what we're hunting for)"))
+                    rows.append(("spacer", ""))
+                rows.append(("round", f"✓ OTHER CONFIRMED FINDINGS (Falsifier-verified) — {len(others)}"))
+                rows.append(("spacer", ""))
+                for f in others:
+                    rows.extend(_finding_card_lines(f, cards_w))
                 if not others:
-                    rows.append(("system", "(none)"))
-                rows.append(("system", ""))
+                    rows.append(("system", "  (none)"))
+                    rows.append(("spacer", ""))
                 rows.append(("round", f"… REPORTED by hunters (live, awaiting verification) — {len(self.reported)}"))
                 for sev, title, loc, ag, clock in self.reported:
-                    rows.append(("verdict", f"[{clock}] • [{sev}] {title} — {loc} ({ag})"))
+                    rows.append(("verdict", f"  [{clock}] {T.sev_badge(sev, color=False).strip()} {title} — {loc} ({ag})"))
                 if not self.reported:
-                    rows.append(("system", "(a hunter writes here the moment it posts via post_finding)"))
+                    rows.append(("system", "  (a hunter writes here the moment it posts via post_finding)"))
                 return rows
             base = tab.split(".")[0]
             entries = list(self.threads.get(base, []))
@@ -369,6 +396,33 @@ _GLYPH = {
     "thinking": "⋯ ", "output": "▸ ", "tool": "· ", "deny": "⛔ ", "finding": "★ ",
     "assign": "", "verdict": "⚖ ", "round": "", "system": "", "round_summary": "",
 }
+
+
+def _finding_card_lines(f: dict, width: int) -> list[tuple[str, str]]:
+    """Render one finding as a curses CARD — a list of (tag, text) rows whose ``card*`` tags are
+    drawn VERBATIM (no re-wrap, no glyph), so the box stays aligned. Same structure as the ANSI
+    card in theme.finding_card, so every surface shows an identical card."""
+    inner = max(24, min(width, 88) - 2)
+    sev = str(f.get("severity", "?")).lower()
+    reproduced = bool(f.get("reproduced", True))
+    rows = T.finding_rows(
+        title=str(f.get("title", "")), location=str(f.get("location", "")),
+        lens=str(f.get("lens", "")), counterfactual=str(f.get("counterfactual", "")),
+        reproduced_by=("yes" if reproduced else ""), remediation=str(f.get("remediation", "")))
+
+    def clip(s: str) -> str:
+        s = T.strip_ansi(s)
+        return s if len(s) <= inner - 2 else s[: inner - 3] + "…"
+
+    ttl = f" {T.finding_title(sev, confirmed=reproduced)} "
+    out: list[tuple[str, str]] = [("card_b", "╭" + ttl + "─" * max(0, inner - len(ttl)) + "╮")]
+    role_tag = {"title": "card_b", "loc": "card_dim", "cf": "card", "repro": "card_ok", "fix": "card_fix"}
+    for role, text in rows:
+        c = clip(text)
+        out.append((role_tag.get(role, "card"), "│ " + c + " " * (inner - 2 - len(c)) + " │"))
+    out.append(("card_b", "╰" + "─" * inner + "╯"))
+    out.append(("spacer", ""))
+    return out
 
 
 def _strip(text: str) -> str:
@@ -472,13 +526,15 @@ def run_tui(state: "TuiState", done) -> None:
                 # body text: crisp white (15) for night, TRUE black (16) for normal — plain 0/7
                 # render as grey in most palettes, so prefer the 256-color extremes when available.
                 "txt_w": 15 if hi else 7, "txt_b": 16 if hi else 0, "toolname": 6,
+                # file/target reference after a tool call — a darker blue (256: DeepSkyBlue4).
+                "ref": T.REF_CURSES_256 if hi else T.REF_CURSES_8,
             }
             for i, (_k, col) in enumerate(pairs.items(), start=1):
                 curses.init_pair(i, col, -1)
             cp = {k: curses.color_pair(i) for i, k in enumerate(pairs, start=1)}
         except Exception:
             cp = defaultdict(int)
-        _set_mouse(curses, state.mouse_on)  # wheel → real mouse events → scroll (not agent-switch)
+        _set_mouse(curses, True)  # ALWAYS on: trackpad/wheel up-down scrolls the agent stream
         stdscr.timeout(200)
 
         frame = 0
@@ -486,28 +542,33 @@ def run_tui(state: "TuiState", done) -> None:
             ch = stdscr.getch()
             h, _w = stdscr.getmaxyx()
             page = max(1, h - 6)
+            # Re-assert wheel capture periodically so scrolling keeps working AT ALL TIMES, even if a
+            # child process or a terminal quirk reset the mode mid-hunt (~every 5s; cheap).
+            if frame % 25 == 0:
+                _set_mouse(curses, True)
             if ch in (ord("q"), ord("Q")):
                 break
             elif ch in (ord("t"), ord("T")):
                 state.toggle_theme()                 # normal (black) ↔ night (white)
             elif ch in (ord("o"), ord("O"), 15):     # 'o' (Ctrl+O is swallowed by macOS Terminal)
                 state.toggle_thinking()              # show/hide the agents' thinking
-            elif ch in (ord("m"), ord("M")):         # toggle: wheel-scroll  ↔  free mouse to select text
-                state.mouse_on = not state.mouse_on
-                _set_mouse(curses, state.mouse_on)
+            elif ch in (ord("m"), ord("M")):         # 'm' = re-assert mouse capture (never disables scroll)
+                _set_mouse(curses, True)
                 state.dirty = True
             elif ch in (curses.KEY_UP, curses.KEY_LEFT, curses.KEY_BTAB):
                 state.move(-1)                       # previous agent
             elif ch in (curses.KEY_DOWN, curses.KEY_RIGHT, ord("\t")):
                 state.move(1)                        # next agent
-            elif ch == curses.KEY_MOUSE:             # mouse wheel scrolls (when capture is on via m)
+            elif ch == curses.KEY_MOUSE:             # trackpad / wheel → scroll the current pane
                 try:
                     _id, _mx, _my, _mz, bstate = curses.getmouse()
                 except curses.error:
                     bstate = 0
-                if bstate & curses.BUTTON4_PRESSED:                      # wheel up → older
+                up = curses.BUTTON4_PRESSED
+                down = getattr(curses, "BUTTON5_PRESSED", 0) or (1 << 21)  # BUTTON5 absent on some ncurses
+                if bstate & up:                         # wheel/trackpad up → older lines
                     state.scroll_lines(3)
-                elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):     # wheel down → newer
+                elif bstate & down:                     # wheel/trackpad down → newer lines
                     state.scroll_lines(-3)
             elif ch == curses.KEY_PPAGE:
                 state.scroll_lines(page)             # page up (keyboard fallback)
@@ -518,6 +579,7 @@ def run_tui(state: "TuiState", done) -> None:
             elif ch in (curses.KEY_END, ord("G")):
                 state.scroll_to_live()               # jump back to the live tail
             elif ch == curses.KEY_RESIZE:
+                _set_mouse(curses, True)  # a resize can drop mouse mode — re-assert so scroll survives
                 state.dirty = True
             frame += 1
             # Redraw on new data OR on a timer (~every 400ms) so the spinner animates and
@@ -631,9 +693,9 @@ _TOOL_GLYPH = {
 def _render_tool(stdscr, y, x, tool, target, maxw, curses, cp, neutral) -> None:
     """Render a tool call as `‹glyph› TOOL  target` — tool name accented, target dimmed."""
     if tool.startswith("mcp__"):
-        glyph, tool = "★", tool.split("__")[-1]
+        glyph, tool = T.FINDING, tool.split("__")[-1]
     else:
-        glyph = _TOOL_GLYPH.get(tool, "·")
+        glyph = T.ACTION  # uniform Claude-Code action marker (⏺)
     end = x + maxw
     label = f" {glyph} {tool} "
     try:
@@ -644,7 +706,7 @@ def _render_tool(stdscr, y, x, tool, target, maxw, curses, cp, neutral) -> None:
     target = " ".join(str(target).split())
     if target and x2 < end:
         try:
-            stdscr.addnstr(y, x2, target[: end - x2], end - x2, neutral | curses.A_DIM)
+            stdscr.addnstr(y, x2, target[: end - x2], end - x2, cp.get("ref", neutral))
         except curses.error:
             pass
 
@@ -657,7 +719,7 @@ def _draw(stdscr, state, cp, is_done, curses, textwrap, frame=0) -> None:
     # header — leading spinner (or ✓) is an always-animating "still running" signal
     head_glyph = "✓" if is_done else _SPINNER[frame % len(_SPINNER)]
     status = "RUNNING" if not is_done else "DONE"
-    stdscr.addnstr(0, 0, _strip(f"{head_glyph} {status} · {state.header()}").ljust(w - 1), w - 1, cp["head"] | curses.A_BOLD)
+    stdscr.addnstr(0, 0, _strip(f"P1HUNT {head_glyph} {status}  ·  {state.header()}").ljust(w - 1), w - 1, cp["head"] | curses.A_BOLD)
     tabs = state.tabs()
     sel = min(state.selected, len(tabs) - 1)
 
@@ -703,6 +765,9 @@ def _draw(stdscr, state, cp, is_done, curses, textwrap, frame=0) -> None:
                 continue
             if tag == "tool":
                 wl.append(("tool", text))  # kept as one line; rendered by _render_tool
+                continue
+            if tag.startswith("card") or tag == "spacer":
+                wl.append((tag, text))  # pre-aligned card box / blank — render verbatim, no glyph
                 continue
             if tag in ("thinking", "output"):
                 # full markdown rendering: headings/code/bullets/inline bold-italic-code
@@ -766,6 +831,18 @@ def _draw(stdscr, state, cp, is_done, curses, textwrap, frame=0) -> None:
             except curses.error:
                 pass
             continue
+        if tag.startswith("card"):  # finding-card rows — pre-aligned, colored by role
+            attr = {
+                "card_b": cp["finding"] | curses.A_BOLD,   # border + title
+                "card_dim": cp["system"],                  # location
+                "card_ok": cp["finding"],                  # reproduced line
+                "card_fix": cp["toolname"],                # remediation
+            }.get(tag, neutral)                            # "card" = neutral body
+            try:
+                stdscr.addnstr(y, side, ln, pane_w, attr)
+            except curses.error:
+                pass
+            continue
         if tag == "thinking_collapsed":
             attr = neutral | curses.A_DIM
         else:
@@ -795,7 +872,7 @@ def _draw(stdscr, state, cp, is_done, curses, textwrap, frame=0) -> None:
         live = f"{spin} live · {nev} ev · {who} {agetxt}"
     theme = "night" if state.dark else "normal"
     think = "o:hide-think" if state.show_thinking else "o:show-think"
-    mouse = "wheel-scroll (m:select)" if state.mouse_on else "select-text (m:wheel)"
-    foot = f"↑/↓ agent · {mouse} · PgUp/Dn · {think} · t:{theme} · End live · q quit   ·   " + live
+    foot = (f"↑/↓ agent · scroll: trackpad/wheel or PgUp/Dn · {think} · t:{theme} · End live · "
+            f"q quit · (shift+drag to select)   ·   " + live)
     stdscr.addnstr(h - 1, 0, _strip(foot).ljust(w - 1), w - 1, cp["head"])
     stdscr.refresh()

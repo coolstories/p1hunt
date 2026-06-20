@@ -19,27 +19,12 @@ from pathlib import Path
 from typing import Protocol
 
 from ..classify.signals import SignalHit
+from ..knowledge import SEVERITY_DEFAULT, SIGNAL_PROFILE as _SIGNAL_PROFILE
 from ..models import ArtifactRef, Hypothesis, new_id
 
-# Per-signal severity + base reproducibility. Critical signals can become P1 findings;
-# the float is how strongly the bare signal corroborates impact before any extra depth.
-_SIGNAL_PROFILE: dict[str, tuple[str, float]] = {
-    "secret-in-source": ("critical", 0.74),
-    "command-injection": ("critical", 0.58),
-    "unsafe-deser": ("critical", 0.56),
-    "evm-tx-origin": ("critical", 0.66),
-    "evm-delegatecall": ("critical", 0.52),
-    "mass-assignment": ("critical", 0.54),
-    "jwt-no-verify": ("critical", 0.58),
-    "ci-privileged-pr": ("critical", 0.52),
-    "cloud-wildcard-iam": ("critical", 0.56),
-    "authz-fail-open": ("critical", 0.52),
-    "idor-direct-object": ("critical", 0.42),
-    "ssrf": ("high", 0.46),
-    "sql-injection": ("high", 0.48),
-    "path-traversal": ("high", 0.46),
-    "invariant-comment": ("medium", 0.30),
-}
+# Per-signal severity + base reproducibility is the CANONICAL table in knowledge.py (imported as
+# _SIGNAL_PROFILE) so the scan view, the reasoner, and Parent A never drift. Critical signals can
+# become P1 findings; the float is how strongly the bare signal corroborates impact before depth.
 
 # Nearby tokens that indicate a compensating control — the Falsifier uses these to kill
 # overclaims, and they lower reproduction score.
@@ -50,6 +35,23 @@ _MITIGATIONS = re.compile(
 )
 
 _REPRO_THRESHOLD = 0.70
+
+# Hardened-aware detectors: high-value Solidity bug *classes* (classify/evm_signals.py) that
+# survive on heavily-audited, assembly-heavy code. The OPTIMISTIC prior ("a P1 exists, find it")
+# applies most here: on hardened EVM a nearby `require`/`onlyOwner`/`verifySignature` almost never
+# means THIS low-level primitive is mitigated, so a guard token must NOT auto-kill the lead. It
+# only lowers the score by a small, surmountable amount — persistence (deeper analysis over
+# rounds) can still corroborate it. Generic web/cloud signals keep the strict kill-on-mitigation
+# behaviour (those guards usually DO cover the sink), so false positives stay suppressed there.
+_HARDENED_AWARE = frozenset({
+    "evm-unchecked-call",
+    "evm-bare-ecrecover",
+    "evm-div-before-mul",
+    "evm-raw-delegatecall",
+    "evm-reentrancy-call",
+})
+# A guard token next to a hardened-EVM primitive is a soft signal, not a verdict.
+_HARDENED_MITIGATION_PENALTY = 0.15
 
 
 @dataclass
@@ -69,10 +71,10 @@ class DeterministicReasoner:
     """Default dry-run brain. No network, no LLM, fully reproducible."""
 
     def severity(self, hit: SignalHit) -> str:
-        return _SIGNAL_PROFILE.get(hit.signal.id, ("high", 0.4))[0]
+        return _SIGNAL_PROFILE.get(hit.signal.id, SEVERITY_DEFAULT)[0]
 
     def _score(self, hit: SignalHit, artifact_dir: str, depth: int) -> float:
-        base = _SIGNAL_PROFILE.get(hit.signal.id, ("high", 0.4))[1]
+        base = _SIGNAL_PROFILE.get(hit.signal.id, SEVERITY_DEFAULT)[1]
         corroboration = self._corroboration(hit, artifact_dir)
         # Persistence: each reframe/round adds analytical depth (capped), never aggression.
         depth_bonus = min(0.30, 0.12 * max(0, depth - 1))
@@ -100,8 +102,15 @@ class DeterministicReasoner:
         )
 
     def falsify(self, hit: SignalHit, artifact_dir: str, depth: int) -> Verdict:
-        """Adversarial pass with the opposite prior — try to kill the candidate (§10)."""
-        if self._mitigation_penalty(hit, artifact_dir) > 0:
+        """Adversarial pass with the opposite prior — try to kill the candidate (§10).
+
+        On generic signals a compensating control near the sink kills the candidate outright
+        (those guards usually cover the sink — keeps false positives down). On hardened-EVM
+        detectors a nearby guard is NOT a kill: a low-level primitive class is rarely neutered by
+        an adjacent check, so the lead persists and must be out-corroborated by depth instead of
+        discarded — this is the "there IS a P1, find it" stance applied where it belongs."""
+        hardened = hit.signal.id in _HARDENED_AWARE
+        if not hardened and self._mitigation_penalty(hit, artifact_dir) > 0:
             return Verdict(True, "a compensating control is present near the sink")
         score = self._score(hit, artifact_dir, depth)
         if score < _REPRO_THRESHOLD:
@@ -141,7 +150,12 @@ class DeterministicReasoner:
         lo = max(0, hit.line - 4)
         hi = min(len(lines), hit.line + 3)
         window = "\n".join(lines[lo:hi])
-        return 0.5 if _MITIGATIONS.search(window) else 0.0
+        if not _MITIGATIONS.search(window):
+            return 0.0
+        # Hardened-EVM primitives: a nearby guard is a soft hint, not a neutralizer — keep the
+        # lead alive (small penalty) so persistence can still confirm it. Generic sinks: the
+        # adjacent control usually covers them, so the full penalty stands.
+        return _HARDENED_MITIGATION_PENALTY if hit.signal.id in _HARDENED_AWARE else 0.5
 
     @staticmethod
     def _capability(lens: str) -> str:

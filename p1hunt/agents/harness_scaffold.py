@@ -841,6 +841,28 @@ ITERATE: for iOS apply the same checks to Info.plist (NSAppTransportSecurity exc
 arbitrary loads, URL schemes) and scan resource bundles. A single violation IS your PoC."""
 
 
+def _live_testing_note(target_url: str) -> str:
+    """Appended to a web scaffold when an AUTHORIZED live target is armed: tells the harness it can
+    interact for real and points it at the shipped, scope-enforced client + OOB listener."""
+    return f"""
+
+🌐 LIVE TARGET ARMED (authorized, scope-enforced). An authorized running instance is reachable at
+{target_url} and credentials are in the environment. Your harness can make REAL requests — that is
+how a web critical is PROVEN, not by reading alone. Use the shipped client (already copied into
+./.p1hunt-poc/ as `p1hunt_dyn.py`) which enforces scope and handles identities + OOB for you:
+
+    from p1hunt_dyn import Client
+    c = Client()                                  # reads base URL + egress allowlist from env
+    a = c.get('/me', identity='A')                # authenticate as principal A (env token)
+    c.assert_forbidden('GET', f'/objects/{{oid}}', identity='B')   # IDOR: B must be refused
+    url, tok = c.oob_url()                         # for blind SSRF: feed `url` to the sink, then
+    assert c.oob_received(tok)                     # assert the target called back (proof)
+
+The egress jail confines every request to the in-scope host(s); a request elsewhere raises. Set
+your ReproSpec expect so a reproduced bug makes the targeted test FAIL (an authz/forbidden
+assertion that does NOT hold = the bypass). Only contact {target_url} and loopback."""
+
+
 def scaffold_block(
     target_class: str,
     subsystem: str,
@@ -850,6 +872,7 @@ def scaffold_block(
     fork_url: str = "",
     entrypoints: list[str] | None = None,
     repo_path: str = "",
+    target_url: str = "",
 ) -> str:
     """Return a prompt fragment that scaffolds a real, runnable harness for the target class.
 
@@ -897,13 +920,14 @@ def scaffold_block(
         return _evm_skeleton(subsystem, focus_files, signals, fork_url, entrypoints)
     if tc == "WEB_API":
         sub = detect_web_subclass(root, signals) if root else "generic-web"
+        live = _live_testing_note(target_url) if target_url else ""
         if sub == "auth":
-            return _web_authz_skeleton(subsystem, focus_files, fork_url)
+            return _web_authz_skeleton(subsystem, focus_files, target_url) + live
         if sub == "payments":
-            return _web_payment_skeleton(subsystem, focus_files, fork_url)
+            return _web_payment_skeleton(subsystem, focus_files, target_url) + live
         if sub == "graphql":
-            return _graphql_skeleton(subsystem, focus_files, fork_url)
-        return _generic_skeleton(target_class or "unknown", subsystem, focus_files, fork_url)
+            return _graphql_skeleton(subsystem, focus_files, target_url) + live
+        return _generic_skeleton(target_class or "unknown", subsystem, focus_files, fork_url) + live
     if tc == "CRYPTO_LIB":
         sub = detect_crypto_subclass(root, signals) if root else "generic-crypto"
         return _crypto_skeleton(subsystem, sub, focus_files)

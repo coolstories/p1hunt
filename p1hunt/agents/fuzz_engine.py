@@ -130,6 +130,8 @@ METHOD (execution is the whole point):
 0. FIRST make the target BUILD. If the build status above says it does not compile, fix that
    before anything else (fetch git submodules, resolve remappings, pin solc) — a harness that
    can't deploy the real code proves nothing. Then build your harness against the REAL contracts.
+   If a tool you need is missing (forge/anvil, cmake, a compiler, a fuzzer), INSTALL it yourself —
+   sudo package manager, pip/cargo/npm/go, or an official installer are all permitted.
 1. Write a fuzzing/invariant harness in the target's OWN test framework into ./.p1hunt-poc/ —
    for Solidity a Foundry test (a `Handler` contract + `invariant_*` functions, or a `testFuzz_*`/
    differential test); for Go `go test -fuzz`; for Rust `cargo fuzz`/`proptest`; for Python
@@ -206,7 +208,8 @@ class ClaudeFuzzer:
         session = ClaudeSession(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns, finding_sink=_sink,
-            allow_web=False,
+            allow_web=False, perms=getattr(self, "perms", None),
+            egress_hosts=getattr(self, "egress_hosts", None),
         )
         self.on_event(self.agent_name, "message",
                       {"phase": "fuzz", "subsystem": subsystem,

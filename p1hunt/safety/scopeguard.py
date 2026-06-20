@@ -18,6 +18,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 
+from ..dynamic.egress import url_allowed
 from ..models import GuardDecision, ScopeGuardPolicy
 
 
@@ -58,6 +59,12 @@ _WRITE_VERBS = (
 )
 
 
+def _is_url(target: str) -> bool:
+    """A target that is itself an http(s) URL is a live network call regardless of which key it
+    arrived under — so it must go through the egress jail, never the substring asset allowlist."""
+    return target.lower().startswith(("http://", "https://"))
+
+
 class ScopeGuard:
     """The PreToolUse gate. Deny-by-default; the safe path is 'no such tool exists'."""
 
@@ -86,6 +93,26 @@ class ScopeGuard:
             self._on_decision(decision)
         return decision
 
+    def check_egress(self, agent: str, url: str, *, method: str = "GET") -> GuardDecision:
+        """Vet one outbound request against the egress jail (host allowlist + method + rate). A
+        thin wrapper over the gate for direct callers (the HTTP tool, the live client)."""
+        return self.pre_tool_use(agent, "http", {"url": url, "http_method": method, "live": True})
+
+    def record(self, agent: str, tool: str, target: str, *, allow: bool, reason: str) -> GuardDecision:
+        """Record a decision MADE ELSEWHERE into the audit trail, verbatim.
+
+        The workspace-jail (ClaudeSwarm._guard_check) is the authority for file-tool calls: a write
+        into the in-scope sandbox is allowed even in dry_run (dry_run forbids touching LIVE systems,
+        not writing local PoC files — §9 'sandbox/fork-only writes'). Re-deriving such a write through
+        ``pre_tool_use`` would wrongly stamp it a dry_run DENY and make ``attestation`` undercount the
+        in-scope actions actually performed. This logs the jail's REAL verdict so the safe-harbor
+        attestation matches what happened."""
+        decision = GuardDecision(allow=allow, reason=reason, tool=tool, target=target, agent=agent)
+        self.decisions.append(decision)
+        if self._on_decision is not None:
+            self._on_decision(decision)
+        return decision
+
     def _evaluate(
         self, agent: str, tool: str, action: str, target: str, tool_input: dict
     ) -> GuardDecision:
@@ -94,6 +121,32 @@ class ScopeGuard:
         environment = str(tool_input.get("environment", "")).lower()
         read_only = bool(tool_input.get("read_only", False))
         writes = any(v in a for v in _WRITE_VERBS) and not read_only
+
+        # 0. LIVE NETWORK CALL (a URL or an explicit HTTP method) — the egress jail is the
+        # authority for "in scope" here, not the substring allowlist. A request may reach ONLY an
+        # authorized host (or loopback); destructive verbs, the HTTP-method allowlist, and the
+        # rate limit still apply below. With an empty egress allowlist (no live target authorized)
+        # url_allowed denies everything, so the safe default is "no live contact".
+        # Accept either verb key (http_method / method) and any URL-bearing key so a live request
+        # can never sidestep this branch by naming its fields differently than the gate expects.
+        method = str(tool_input.get("http_method", tool_input.get("method", ""))).upper()
+        is_network = bool(method) or bool(tool_input.get("url")) or _is_url(target)
+        if is_network:
+            from ..dynamic.egress import is_loopback, normalize_host
+            # In dry-run, NO live contact except loopback (a local OOB listener / local app). Even a
+            # build/registry host requires active mode — so dry_run can never reach a remote host.
+            if self.policy.run_mode != "active" and not is_loopback(normalize_host(target)):
+                return self._deny(agent, tool, target, "live contact disabled (dry-run)")
+            ok, why = url_allowed(target, self.policy.egress_allowlist)
+            if not ok:
+                return self._deny(agent, tool, target, why)
+            if any(term in a or term in t for term in self.policy.destructive_denylist):
+                return self._deny(agent, tool, target, "destructive / prohibited by safe harbor")
+            if method and method not in self.policy.allowed_http_methods:
+                return self._deny(agent, tool, target, f"HTTP method {method} not permitted")
+            if not self._rate.allow(target):
+                return self._deny(agent, tool, target, "rate limit")
+            return self._allow(agent, tool, target)
 
         # 1. In-scope allowlist (substring match against derived allowlist).
         if not self.policy.allowlist or not any(

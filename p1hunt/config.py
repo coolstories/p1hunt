@@ -55,6 +55,19 @@ class Config:
     # state via `forge test --fork-url`. Empty = no fork (local-deploy harnesses only).
     fork_rpc_url: str = ""
     fork_block: int | None = None
+    # Auto-provision the reproduction TOOLCHAIN (Foundry: forge/anvil) when it is missing. The
+    # confirmed-critical gate cannot fire without it — on an EVM target with no forge, every
+    # candidate is quarantined forever. OFF by default because it executes the official remote
+    # installer; opt in with P1HUNT_AUTO_INSTALL_TOOLCHAIN=1 (needs provision_network). It only
+    # installs a well-known toolchain and never weakens the artifact floor.
+    auto_install_toolchain: bool = False
+    # Authorized LIVE dynamic target (web/API/auth — the bulk of bug bounty). When set together
+    # with run_mode=active, the CLI attaches a DynamicTarget so the swarm can interact with the
+    # RUNNING instance and prove web criticals (IDOR/SSRF/auth-bypass) instead of only reading
+    # source. Never a production URL — only a UAT/owned/testnet/staging instance. Empty = static.
+    live_base_url: str = ""        # P1HUNT_BASE_URL  (REST/HTTP)
+    live_gql_url: str = ""         # P1HUNT_GQL_URL   (GraphQL)
+    live_environment: str = "uat"  # P1HUNT_LIVE_ENV  (uat | owned | testnet | staging | local)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -71,13 +84,33 @@ class Config:
         cfg.use_claude = (env_flag == "1") if env_flag is not None else sdk_available()
         cfg.provision = os.environ.get("P1HUNT_PROVISION", "1") != "0"
         cfg.provision_network = os.environ.get("P1HUNT_PROVISION_NETWORK", "1") != "0"
+        cfg.auto_install_toolchain = os.environ.get("P1HUNT_AUTO_INSTALL_TOOLCHAIN", "0") == "1"
         cfg.fork_rpc_url = os.environ.get("P1HUNT_FORK_RPC_URL", cfg.fork_rpc_url)
         _blk = os.environ.get("P1HUNT_FORK_BLOCK", "")
         if _blk.strip().isdigit():
             cfg.fork_block = int(_blk.strip())
+        cfg.live_base_url = os.environ.get("P1HUNT_BASE_URL", cfg.live_base_url)
+        cfg.live_gql_url = os.environ.get("P1HUNT_GQL_URL", cfg.live_gql_url)
+        cfg.live_environment = os.environ.get("P1HUNT_LIVE_ENV", cfg.live_environment)
         if not _has_agent_credentials():
             cfg.run_mode = "dry_run"
         return cfg
+
+    def dynamic_targets(self) -> list:
+        """Build DynamicTarget(s) from the configured live URLs (CLI convenience for ad-hoc hunts).
+        Empty unless a live URL was provided. A ``production`` environment is REFUSED outright (not
+        relabeled) — production is never an authorized live target, so a misconfigured
+        P1HUNT_LIVE_ENV=production yields no dynamic target rather than a silently-downgraded one."""
+        from .models import DynamicTarget
+        env = (self.live_environment or "uat").strip().lower()
+        if env == "production":
+            return []  # never authorize production for live contact (safe-harbor floor)
+        out = []
+        if self.live_base_url:
+            out.append(DynamicTarget(base_url=self.live_base_url, environment=env, kind="rest"))
+        if self.live_gql_url:
+            out.append(DynamicTarget(base_url=self.live_gql_url, environment=env, kind="graphql"))
+        return out
 
     @property
     def active(self) -> bool:

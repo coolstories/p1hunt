@@ -42,7 +42,7 @@ from p1hunt.runners.base import (
     tool_available,
 )
 
-__all__ = ["CryptoRunner", "parse_go", "parse_cargo", "parse_pytest"]
+__all__ = ["CryptoRunner", "parse_go", "parse_cargo", "parse_pytest", "native_verdict"]
 
 # Toolchains, in detection order. Each entry: (build-file marker, primary tool).
 _GO_MOD = "go.mod"
@@ -244,6 +244,56 @@ def parse_pytest(output: str, exit_code: int, spec: ReproSpec) -> dict[str, Any]
     return {"reproduced": clean, "detail": detail, "coverage": coverage}
 
 
+# A recognized fault/assertion/sanitizer report — the ONLY thing that turns a non-zero native
+# run into a reproduction. A bare non-zero exit (e.g. a broken harness, a missing input file) is
+# NOT a reproduction: that would let a spurious crash promote a fake P1, defeating the artifact
+# floor (§10). Sanitizers (built in below) make real memory/UB bugs emit one of these markers.
+_NATIVE_BUG_MARKER = re.compile(
+    r"(?i)(?:Address|Undefined(?:Behavior)?|Leak|Thread|Memory)Sanitizer"
+    r"|SUMMARY:\s*\w*Sanitizer"
+    r"|runtime error:"
+    r"|heap-buffer-overflow|stack-buffer-overflow|global-buffer-overflow"
+    r"|use-after-(?:free|return|scope)|double-free|attempting free on address"
+    r"|Assertion\b.*\bfailed|assertion\b.*\bfailed"
+    r"|\bAborted\b|\(core dumped\)|Segmentation fault|Floating point exception"
+    r"|ERROR:\s*libFuzzer|libFuzzer:\s*(?:deadly signal|out-of-memory|timeout)"
+    r"|panicked at"
+)
+
+
+def native_verdict(output: str, exit_code: int, spec: ReproSpec) -> dict[str, Any]:
+    """PURE verdict for a compiled C/C++ harness run — deterministic, unit-tested.
+
+    ``expect="fail"`` (property/invariant/differential): reproduced ONLY when the run printed a
+    recognized fault/assertion/sanitizer report (``_NATIVE_BUG_MARKER``). A non-zero exit WITHOUT
+    such a marker stays a candidate — it is more likely a broken harness than a demonstrated bug,
+    and the artifact floor must not be bought with an ambiguous crash.
+
+    ``expect="pass"`` (exploit/forgery): reproduced when the binary exited 0 AND printed no fault
+    marker — i.e. the exploit assertion held cleanly.
+    """
+    text = output or ""
+    marker = bool(_NATIVE_BUG_MARKER.search(text))
+    if spec.expects_fail():
+        if marker:
+            return {"reproduced": True,
+                    "detail": "native harness reported a fault/assertion/sanitizer error "
+                              f"(exit={exit_code}) — bug demonstrated",
+                    "coverage": {}}
+        if exit_code != 0:
+            return {"reproduced": False,
+                    "detail": f"harness exited non-zero (exit={exit_code}) but printed NO recognized "
+                              "fault/assertion/sanitizer marker — stays candidate (harness may be broken)",
+                    "coverage": {}}
+        return {"reproduced": False,
+                "detail": "native harness ran clean — the property held", "coverage": {}}
+    # expect == "pass"
+    clean = exit_code == 0 and not marker
+    detail = ("exploit assertion held (clean exit, no fault)" if clean
+              else f"exploit did not hold cleanly (exit={exit_code}, fault_marker={marker})")
+    return {"reproduced": clean, "detail": detail, "coverage": {}}
+
+
 # ---------------------------------------------------------------------------
 # Concrete runner.
 # ---------------------------------------------------------------------------
@@ -264,6 +314,10 @@ class CryptoRunner:
                 spec, self.name, "harness path missing or outside workspace — stays candidate")
 
         root = Path(workdir).resolve()
+        # Native C/C++ harness: compile it, then run the binary. This is the path that lets a C++
+        # crypto/MPC finding actually REPRODUCE (Go/Rust/Python already have toolchains below).
+        if harness.suffix.lower() in (".c", ".cc", ".cpp", ".cxx"):
+            return self._run_native(root, harness, spec, timeout, on_event)
         toolchain = self._detect_toolchain(root, harness, spec)
         if toolchain is None:
             return missing_harness_result(
@@ -294,6 +348,67 @@ class CryptoRunner:
             detail=parsed.get("detail", ""),
             runner=self.name,
         )
+
+    # -- native C/C++ compile-and-run (class-level; NOTHING PRESET) ---------------------------
+    def _run_native(self, root: Path, harness: Path, spec: ReproSpec, timeout: float,
+                    on_event: EventEmit | None) -> ReproResult:
+        """Compile a C/C++ harness (preferring a sanitizer build) and run the binary; the verdict is
+        decided by :func:`native_verdict`, which is MARKER-GATED — a bare non-zero exit alone is NOT
+        a reproduction (it may just be a broken harness). For expect='fail' the bug is demonstrated
+        by a sanitizer/assert/abort marker (or a libFuzzer crash); for expect='pass' by a clean exit
+        of the exploit assertion. A standalone harness compiles as-is; one that must link the in-scope
+        library compiles only if its includes resolve — if it cannot compile, the finding stays a
+        candidate (offline-graceful), never a false reproduction."""
+        is_c = harness.suffix.lower() == ".c"
+        compiler = next((c for c in (("cc", "gcc", "clang") if is_c else ("c++", "g++", "clang++"))
+                         if tool_available(c)), None)
+        if compiler is None:
+            return missing_harness_result(
+                spec, self.name, "no C/C++ compiler (cc/c++) available — stays candidate")
+        binary = root / ".p1hunt-poc" / (harness.stem + ".p1bin")
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        std = [] if is_c else ["-std=c++17"]
+        # Derived include dirs so a harness that #includes the in-scope library's headers resolves
+        # them (generic, not per-target). The build tree (built by build_env) is where compiled
+        # objects/libs land for linking.
+        includes = [f"-I{root}", f"-I{root / 'include'}", f"-I{root / 'src'}", f"-I{root / 'build'}"]
+        # libFuzzer harness? (defines LLVMFuzzerTestOneInput) — drive it with the fuzzer runtime.
+        try:
+            is_fuzzer = "LLVMFuzzerTestOneInput" in harness.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            is_fuzzer = False
+        # Sanitizers make REAL memory/UB bugs emit a recognized marker (the only thing that promotes
+        # an expect="fail" run). Try a sanitized build first; fall back to a plain build for
+        # toolchains/harnesses that can't link the sanitizer/fuzzer runtime (then verdict relies on
+        # assertions/aborts only — still marker-gated, never a bare non-zero exit).
+        san = "fuzzer,address,undefined" if is_fuzzer else "address,undefined"
+        ctimeout = max(30.0, min(timeout, 300.0))
+        base = [compiler, *std, "-g", "-O1", "-fno-omit-frame-pointer", *includes]
+        cran, cexit, cout = run_command(
+            [*base, f"-fsanitize={san}", str(harness), "-o", str(binary)], str(root),
+            timeout=ctimeout, tools_required=(compiler,), on_event=on_event, runner=self.name)
+        sanitized = cran and cexit == 0 and binary.exists()
+        if not sanitized:
+            cran, cexit, cout = run_command(
+                [compiler, *std, "-O2", *includes, str(harness), "-o", str(binary)], str(root),
+                timeout=ctimeout, tools_required=(compiler,), on_event=on_event, runner=self.name)
+            if not cran or cexit != 0 or not binary.exists():
+                return missing_harness_result(
+                    spec, self.name, f"harness did not compile ({compiler}): {excerpt(cout, 600)}")
+        # Run the harness. A libFuzzer binary needs a bounded campaign; a plain harness just runs.
+        run_argv = [str(binary)] + (["-runs=200000", "-max_total_time=30"] if is_fuzzer and sanitized else [])
+        ran, exit_code, output = run_command(
+            run_argv, str(root), timeout=timeout, on_event=on_event, runner=self.name)
+        command = (f"{compiler} {'-fsanitize=' + san + ' ' if sanitized else ''}{harness.name} "
+                   f"-o {binary.name} && ./{binary.name}")
+        if not ran:
+            return missing_harness_result(spec, self.name, output or "binary did not run")
+        parsed = native_verdict(output, exit_code, spec)
+        return ReproResult(
+            ran=True, reproduced=bool(parsed["reproduced"]), command=command,
+            artifact_paths=[spec.harness_path] if spec.harness_path else [],
+            stdout_excerpt=excerpt(output), detail=parsed["detail"],
+            coverage=parsed.get("coverage", {}) or {}, runner=self.name)
 
     # -- toolchain derivation (NOTHING PRESET: chosen from files present in the workspace) ----
     def _detect_toolchain(self, root: Path, harness: Path, spec: ReproSpec):

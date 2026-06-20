@@ -58,6 +58,44 @@ class Asset:
 
 
 @dataclass
+class DynamicTarget:
+    """An authorized, RUNNING instance the swarm may interact with for live dynamic testing
+    (§2.3). Never production — only the safe-harbor sandbox environments. Captured at intake; it
+    is what turns the system from a static reviewer into a request-driven hunter for the bulk of
+    bug-bounty criticals (IDOR/BOLA, auth bypass, SSRF, injection, business logic)."""
+
+    base_url: str
+    environment: str = "uat"   # uat | owned | testnet | local — never production
+    kind: str = "rest"          # rest | graphql | generic
+    note: str = ""
+
+
+@dataclass
+class TestIdentity:
+    """A test principal the swarm authenticates as during live testing (§2.5). Two distinct
+    identities are the core of IDOR/BOLA testing (A owns a resource; B must be refused). The
+    secret itself is supplied at runtime via ``token`` or an env var named by ``token_env`` —
+    persisted scope records redact the literal token (see engagement.scope_to_dict)."""
+
+    name: str                 # "A" | "B" | "low" | "admin" | ... (the env suffix it maps to)
+    token: str = ""           # bearer/session token VALUE (kept out of persisted scope.json)
+    token_env: str = ""       # name of an env var holding the token (preferred for secrets)
+    role: str = ""            # optional role label (for least-privilege / field-authz tests)
+    note: str = ""
+
+    def resolve(self) -> str:
+        """The actual credential, from the literal value or the named env var. "" if neither. A
+        token reloaded from a persisted (redacted) scope is treated as absent — the real secret is
+        re-supplied via the environment at runtime, never read back from disk."""
+        import os
+        if self.token and self.token != "<redacted>":
+            return self.token
+        if self.token_env:
+            return os.environ.get(self.token_env, "")
+        return ""
+
+
+@dataclass
 class Scope:
     """Captured at intake (§2.3). `rules` are raw program text, parsed into policy by §6."""
 
@@ -77,7 +115,15 @@ class Scope:
     # code is used only as a readable oracle for differential analysis.
     out_of_scope_globs: list[str] = field(default_factory=list)
     scope_note: str = ""  # free-text rules-of-engagement note surfaced to Parent A + hunters
+    # Authorized RUNNING instances + test principals for live dynamic testing (§2.3, §2.5). Empty
+    # by default — the system stays a static reviewer until a live target is explicitly authorized.
+    dynamic_targets: list[DynamicTarget] = field(default_factory=list)
+    test_identities: list[TestIdentity] = field(default_factory=list)
     captured_at: float = field(default_factory=time.time)
+
+    def live_hosts(self) -> list[str]:
+        """The hostnames of every authorized dynamic target — the seed of the egress allowlist."""
+        return [t.base_url for t in self.dynamic_targets if t.base_url]
 
 
 @dataclass
@@ -90,6 +136,10 @@ class ScopeGuardPolicy:
     sandbox_environments: list[str] = field(default_factory=list)
     allowed_http_methods: list[str] = field(default_factory=list)
     allowed_chain_ids: list[int] = field(default_factory=list)
+    # Hostnames the swarm may contact for AUTHORIZED live testing (the egress jail, §9). Empty =
+    # no live host contact permitted at all (the safe default); populated only by
+    # ``authorize_dynamic`` when an operator authorizes a non-production dynamic target.
+    egress_allowlist: list[str] = field(default_factory=list)
     max_requests_per_minute: int = 0
     unattended_mode: bool = True
     run_mode: str = "dry_run"  # dry_run | active (active still fully gated, §13)
