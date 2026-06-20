@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "p1hunt"
+version = "0.1.0"
+description = "Authorized critical bug-bounty workflow — a never-quit, safe-harbor swarm (spec.md is the contract)."
+readme = "spec.md"
+requires-python = ">=3.11"
+# claude-agent-sdk is an OPTIONAL runtime dependency. The system defaults to dry-run
+# (§9, §13) and is fully runnable and testable without it; install it to enable the
+# live agentic "brain".
+dependencies = []
+
+[project.optional-dependencies]
+agent = ["claude-agent-sdk>=0.3"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+p1hunt = "p1hunt.main:main"
+
+[tool.setuptools]
+packages = [
+  "p1hunt",
+  "p1hunt.orchestrator",
+  "p1hunt.agents",
+  "p1hunt.safety",
+  "p1hunt.tools",
+  "p1hunt.classify",
+  "p1hunt.ui",
+]
+
+# Acceptance tests (§16) use the stdlib unittest runner — no third-party test deps:
+#   python3 -m unittest discover -s tests -v

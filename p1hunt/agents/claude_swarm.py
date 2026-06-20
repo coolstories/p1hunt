@@ -1,0 +1,1299 @@
+"""Claude swarm orchestrator — Parent A driving real Claude agents (spec §6-§10).
+
+The AI is the detector. Parent A derives the plan, assigns each ranked lens to a Child B
+(a real Claude hunting session), and runs the never-quit loop: every round each Child B
+hunts its lens with a fresh creative angle; the Falsifier (a real Claude session with the
+opposite prior) tries to refute each candidate; only a confirmed, reachable critical is
+promoted. On a dry round it reframes and digs deeper — it does not give up until a critical
+is confirmed or the operator stops.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from pathlib import Path
+
+from ..config import Config
+from ..models import (
+    ArtifactRef,
+    EngagementStatus,
+    Finding,
+    Hypothesis,
+    HypState,
+    SafeValidationPlan,
+    Scope,
+    new_id,
+)
+from ..orchestrator.blackboard import Blackboard
+from ..orchestrator.bus import MessageBus
+from ..orchestrator.event_log import EventLog
+from ..safety.scopeguard import ScopeGuard
+from .claude_hunter import ClaudeHunter, ClaudePoCProver, ClaudeVerifier
+from .claude_session import ClaudeFinding
+from .fuzz_engine import ClaudeFuzzer
+from .derive import derive_plan
+from .harness_scaffold import detect_evm_entrypoints, scaffold_block
+from .parent_a import HuntResult
+from ..corpus import CorpusStore
+from ..classify.evm_signals import evm_assembly_density
+from ..runners.base import ReproSpec, select_runner
+from ..severity import ImpactAssessment, SeverityMapper
+from ..tools.build_env import BuildReport, bootstrap_environment
+from ..tools.evm_fork import fork_available, start_anvil_fork, stop_anvil_fork
+
+_LENSES = [
+    "authorization-boundary",
+    "asset-custody",
+    "trusted-execution",
+    "confidentiality",
+    "business-logic",
+]
+
+
+class ClaudeSwarm:
+    def __init__(
+        self,
+        scope: Scope,
+        repo_path: str,
+        *,
+        config: Config,
+        bus: MessageBus,
+        blackboard: Blackboard,
+        event_log: EventLog,
+        max_concurrency: int = 3,
+    ) -> None:
+        self.scope = scope
+        self.repo_path = repo_path
+        self.config = config
+        self.bus = bus
+        self.bb = blackboard
+        self.log = event_log
+        self.sem = asyncio.Semaphore(max_concurrency)
+        self.name = "parent_a"
+        self._safety_event = False
+        self._reframes = 0
+        self._hyp_by_finding: dict[int, Hypothesis] = {}
+        self._focus_by_lens: dict[str, list[str]] = {}
+        # Live operator control channel (§11): notices pushed via `p1hunt notify` are read at
+        # each round boundary and injected into the next round's hunter prompts — e.g. "new code
+        # is now available, keep hunting" — so a running hunt absorbs updates without a restart.
+        self._notices: list[str] = []
+        self._known_patterns: list[str] = []  # historical bug patterns (Pillar 3) for fuzzers/hunters
+        self._control_offset = 0
+        # Self-healing watchdog: if the whole swarm goes silent (a hung session blocking the
+        # round, or an API rate-limit) for STALL_SECONDS, Parent A diagnoses and fixes it.
+        import time as _t
+        self._last_activity = _t.monotonic()
+        self._round_tasks: list = []
+        self._active_guard = None
+        self._healing = False
+        self._heals = 0
+        # PoC sandbox: the ONLY place agents may write (proof-of-concept files), never source.
+        self.poc_dir = Path(repo_path) / ".p1hunt-poc"
+        self.poc_dir.mkdir(parents=True, exist_ok=True)
+        self.bus.register(self.name, "parent")
+        # THE ONE HARD GUARDRAIL: the in-scope workspace folder. Agents may do anything INSIDE it
+        # (read/write/edit/run/install/network); every file read/write/edit OUTSIDE it is denied.
+        # Defaults to the acquired target folder; Parent A ratifies/sets it during recon (clamped
+        # to the acquired tree so the boundary can never escape what was authorized).
+        self._workspace_root: str = str(Path(repo_path).resolve())
+        # --- environment-arming state (set in hunt() via _arm_environment, all graceful) ---
+        self._target_class: str = ""          # e.g. "EVM_CONTRACT" — from derive_plan
+        self._build: BuildReport | None = None  # build-bootstrap outcome (compiles? diagnostics)
+        self._fork_handle = None               # running local anvil fork (EVM, when configured)
+        self._fork_url: str = ""               # http://127.0.0.1:PORT agents reach via --fork-url
+        self._corpus: CorpusStore | None = None  # cross-round fuzz corpus + coverage memory
+        self._subclass: str = ""                # protocol category, only if Parent A names one in recon
+        self._entrypoints_by_subsystem: dict[str, list[str]] = {}
+        # Deterministic severity mapper bound to THIS program's own taxonomy (no preset tiers).
+        self._severity = SeverityMapper(getattr(scope, "severity_taxonomy", {}) or {})
+
+    def _emit(self, agent: str, kind: str, data: dict) -> None:
+        import time as _t
+        self._last_activity = _t.monotonic()  # any event = the swarm is alive (watchdog signal)
+        self.log.emit(agent, kind, data)
+
+    # --- self-healing watchdog (§8 never-quit) ----------------------------
+    STALL_SECONDS = 300  # 5 min of TOTAL silence = a hung session or a rate-limit stall
+
+    async def _watchdog(self) -> None:
+        """Background task: if the swarm emits NOTHING for STALL_SECONDS, self-heal."""
+        import time as _t
+
+        while True:
+            await asyncio.sleep(20)
+            idle = _t.monotonic() - self._last_activity
+            if idle >= self.STALL_SECONDS and not self._healing and self._round_tasks:
+                self._healing = True
+                try:
+                    await self._self_heal(idle)
+                except Exception as exc:
+                    self._emit(self.name, "lifecycle", {"event": "heal_failed", "detail": str(exc)})
+                finally:
+                    self._last_activity = _t.monotonic()
+                    self._healing = False
+
+    async def _self_heal(self, idle: float) -> None:
+        """Parent A figures out what's wrong (hung session / rate-limit) and fixes it: cancel the
+        stuck round so it can't block forever, inject a corrective directive, back off if throttled."""
+        self._heals += 1
+        self._emit(self.name, "lifecycle",
+                   {"event": "stall_detected", "idle_s": int(idle), "heal": self._heals})
+        # 1) Cancel the stuck round so it cannot block the never-quit loop forever.
+        cancelled = 0
+        for t in list(self._round_tasks):
+            if not t.done():
+                t.cancel()
+                cancelled += 1
+        # 2) Parent A diagnoses the cause and writes a corrective directive for the next round.
+        diag = await self._diagnose(idle)
+        notice = diag.get("notice")
+        if notice:
+            self._notices.append(notice)
+            self._emit(self.name, "message", {"phase": "notice", "notice": "🩺 self-heal: " + notice})
+        self._emit(self.name, "lifecycle",
+                   {"event": "self_healed", "cancelled": cancelled,
+                    "rate_limited": bool(diag.get("rate_limited")), "diagnosis": str(diag.get("diagnosis", ""))[:160]})
+        # 3) If it looks like a rate-limit, back off before the next round.
+        if diag.get("rate_limited"):
+            self._emit(self.name, "lifecycle", {"event": "backoff", "reason": "rate limit — pausing 60s"})
+            await asyncio.sleep(60)
+
+    async def _diagnose(self, idle: float) -> dict:
+        """Heuristic-first (rate-limit signals in recent events) + a short, timeout-safe Parent A
+        reasoning pass. Never blocks: if the diagnosis call itself stalls, fall back to the heuristic."""
+        # Heuristic: repeated model downgrades / limit messages = rate-limited.
+        recent = list(getattr(self.log, "events", []))[-250:]
+        def _ev(e):
+            d = getattr(e, "data", None)
+            return getattr(e, "kind", ""), (d if isinstance(d, dict) else {})
+        rl_hits = sum(1 for e in recent
+                      for k, d in [_ev(e)]
+                      if k == "lifecycle" and (d.get("event") == "model_downgrade"
+                                               or "limit" in str(d.get("reason", "")).lower()))
+        rate_limited = rl_hits >= 2
+        notice = None
+        diagnosis = f"silent {int(idle)}s; downgrade/limit signals={rl_hits}"
+        if self.config.use_claude:
+            try:
+                from .claude_session import ClaudeSession
+                prompt = (
+                    f"You are Parent A, lead of an autonomous security hunt. The swarm produced NO "
+                    f"activity for {int(idle)} seconds — it stalled (a hunter session hung, or the "
+                    f"model API is rate-limited). I have cancelled the stuck round. In one or two "
+                    f"sentences write a CORRECTIVE directive for the hunters' next round to avoid the "
+                    f"stall — e.g. be decisive, write a small PoC and RUN it instead of reading "
+                    f"endlessly, delegate big reads to sub-agents, don't spiral. Return ONLY JSON: "
+                    f'{{"rate_limited": true|false, "diagnosis": "...", "notice": "<the directive>"}}')
+                sess = ClaudeSession(agent_name=self.name, model=self.config.models.orchestrator,
+                                     on_event=self._emit, guard_check=None, max_turns=3, allow_web=False)
+                res = await asyncio.wait_for(sess.run(prompt, self.repo_path), timeout=90)
+                parsed = _parse_json_object(res.text)
+                if parsed.get("notice"):
+                    notice = str(parsed["notice"])
+                if parsed.get("diagnosis"):
+                    diagnosis = str(parsed["diagnosis"])
+                rate_limited = rate_limited or bool(parsed.get("rate_limited"))
+            except Exception:
+                pass  # diagnosis itself stalled/failed → heuristic fallback below
+        if not notice:
+            notice = ("Last round STALLED. Next round be DECISIVE: form one attack hypothesis fast, "
+                      "write a SMALL PoC and RUN it instead of reading endlessly, delegate big reads "
+                      "to sub-agents, and never re-read whole files.")
+        return {"rate_limited": rate_limited, "diagnosis": diagnosis, "notice": notice}
+
+    def _scope_guidance(self) -> str:
+        """Rules-of-engagement + differential guidance injected into recon and hunter prompts."""
+        globs = list(getattr(self.scope, "out_of_scope_globs", None) or [])
+        note = str(getattr(self.scope, "scope_note", "") or "").strip()
+        if not globs and not note:
+            return ""
+        parts = []
+        if note:
+            parts.append(note)
+        if globs:
+            parts.append(
+                "IN-SCOPE = the deployed/production code ONLY. OUT-OF-SCOPE (do NOT report findings "
+                "here; these are not deployed): " + ", ".join(globs) + ". If one of those paths is a "
+                "readable MIRROR of the optimized in-scope code (e.g. a 'reference' implementation), "
+                "use it ONLY to understand the optimized code and to DIFF them — any behavioral "
+                "divergence between the two is a likely real bug — but every reported finding MUST "
+                "cite an IN-SCOPE deployed file and line."
+            )
+        return "\n\nSCOPE / RULES OF ENGAGEMENT: " + " ".join(parts)
+
+    def _out_of_scope(self, rel_path: str) -> bool:
+        import fnmatch
+
+        p = str(rel_path or "").lstrip("./")
+        for g in getattr(self.scope, "out_of_scope_globs", None) or []:
+            g = g.strip()
+            if not g:
+                continue
+            if fnmatch.fnmatch(p, g) or p.startswith(g.rstrip("*").rstrip("/") + "/") or p.startswith(g.rstrip("*")):
+                return True
+        return False
+
+    def _write_findings_json(self, findings, candidates) -> None:
+        """Persist the current findings to ``findings.json`` in the engagement folder. Called at
+        every round boundary (so it's always fresh) and on stop/cap — when the scan is stopped,
+        the latest findings are already on disk."""
+        import json as _json
+        import time as _time
+        from pathlib import Path
+
+        path = getattr(self.log, "path", None)
+        if path is None:
+            return
+        out = Path(path).with_name("findings.json")
+        crits = [f for f in findings if f.severity == "critical"]
+        doc = {
+            "program": self.scope.program,
+            "updated": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            "counts": {"confirmed_critical": len(crits), "candidates": len(candidates)},
+            "confirmed_criticals": [
+                {"title": f.title, "severity": f.severity, "verified": getattr(f, "verified", True),
+                 "location": getattr(f.poc, "path", ""), "root_cause": f.root_cause,
+                 "counterfactual": f.counterfactual, "remediation": f.remediation}
+                for f in crits
+            ],
+            "candidates": [c.__dict__ for c in candidates],
+        }
+        try:
+            out.write_text(_json.dumps(doc, indent=2), encoding="utf-8")
+            self._emit(self.name, "lifecycle",
+                       {"event": "findings_written", "path": str(out),
+                        "criticals": len(crits), "candidates": len(candidates)})
+        except OSError:
+            pass
+
+    def _write_state(self, tracks, critical_means, hunters, findings, all_candidates, seen, depth,
+                     oracle_desc: str = "") -> None:
+        """Persist a full RESUMABLE snapshot to ``state.json`` every round: the DERIVED tracks
+        (so a resume skips cold reconnaissance), each track's ruled-out ledger + directive (so it
+        never re-walks dead ends), the candidate set + dedup keys, and the round number. A killed
+        or rate-limited run can be jump-started from exactly here — no progress lost, no re-scope."""
+        import json as _json
+        import time as _time
+        from pathlib import Path
+
+        path = getattr(self.log, "path", None)
+        if path is None:
+            return
+        out = Path(path).with_name("state.json")
+        doc = {
+            "program": self.scope.program,
+            "updated": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            "depth": depth,
+            "critical_means": str(critical_means),
+            "seen": list(seen),
+            "known_patterns": list(self._known_patterns),
+            "oracle_desc": str(oracle_desc),
+            "tracks": [
+                {"theme": h.theme, "subsystem": getattr(h, "subsystem", h.theme),
+                 "fuzz_mode": getattr(h, "fuzz_mode", ""),
+                 "focus_files": list(h.focus_files), "investigate": list(h.investigate),
+                 "invariants": list(getattr(h, "invariants", [])),
+                 "directive": getattr(h, "_directive", ""), "ruled_out": list(getattr(h, "_ruled_out", []))}
+                for h in hunters
+            ],
+            "candidates": [c.__dict__ for c in all_candidates],
+            "confirmed": [{"title": f.title, "severity": f.severity} for f in findings],
+        }
+        try:
+            out.write_text(_json.dumps(doc, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _load_resume_state(self) -> dict | None:
+        """If P1HUNT_RESUME is set and a state.json sits in this engagement folder, load it so the
+        hunt continues from the saved round/tracks/candidates instead of starting cold."""
+        import json as _json
+        from pathlib import Path
+
+        if not os.environ.get("P1HUNT_RESUME"):
+            return None
+        path = getattr(self.log, "path", None)
+        if path is None:
+            return None
+        state = Path(path).with_name("state.json")
+        if not state.exists():
+            return None
+        try:
+            doc = _json.loads(state.read_text(encoding="utf-8"))
+            self._emit(self.name, "lifecycle",
+                       {"event": "resumed", "from_round": doc.get("depth", 0),
+                        "tracks": len(doc.get("tracks", [])), "candidates": len(doc.get("candidates", []))})
+            return doc
+        except (OSError, ValueError):
+            return None
+
+    def _resteer_prompt(self, digest: list[dict], depth: int, critical_means: str, crit_count: int) -> str:
+        import json as _json
+
+        return (
+            f"You are Parent A, the lead of this security audit, reviewing the team between rounds. "
+            f"Round {depth} just finished. 'Critical' for this target = {critical_means}\n\n"
+            f"Confirmed criticals so far: {crit_count}. Here is where each track stands (its findings "
+            f"this round and what it has investigated-and-ruled-out):\n\n"
+            f"{_json.dumps(digest, indent=2)}\n\n"
+            "Your job: for EACH track, write a short, SPECIFIC directive for its next round that gets "
+            "it somewhere — acknowledge what it did, then steer it: go deeper on a promising thread, "
+            "ABANDON an exhausted angle, cross-pollinate with another track's lead, or pivot it to "
+            "specific files (e.g. the in-scope deployed code). If a track is exhausted, repurpose it "
+            "to a fresh angle no one is covering. You may read the code to ground your steer.\n\n"
+            "Return ONLY JSON:\n"
+            '{"directives": [{"track": <1-based index>, "directive": "<your steer, 1-3 sentences>", '
+            '"focus_files": ["optional","new","relative/paths","to","redirect","this","track"]}]}'
+        )
+
+    async def _resteer(self, hunters, per_hunter_findings, depth, critical_means, findings, guard) -> None:
+        """Parent A synthesizes the round and personalizes each hunter's next-round prompt."""
+        if not self.config.use_claude or not hunters:
+            return
+        from .claude_session import ClaudeSession
+
+        digest = []
+        for i, (h, finds) in enumerate(zip(hunters, per_hunter_findings), start=1):
+            entry = {
+                "track": i,
+                "theme": h.theme,
+                "findings_this_round": [f"[{f.severity}] {f.title}" for f in finds][:6],
+                "ruled_out": list(h._ruled_out)[-10:],
+            }
+            # Surface fuzz coverage so the steer can push each track at the code still in the dark.
+            if self._corpus is not None:
+                cov = self._corpus.coverage_for(h.subsystem)
+                eps = self._entrypoints_for(h.subsystem, h.focus_files)
+                uncovered = self._corpus.uncovered_hint(h.subsystem, eps)
+                entry["fuzz_rounds"] = cov.rounds
+                if cov.covered_symbols:
+                    entry["covered_symbols"] = cov.covered_symbols[:8]
+                if uncovered:
+                    entry["uncovered"] = uncovered
+            digest.append(entry)
+        crit_count = sum(f.severity == "critical" for f in findings)
+        self._emit(self.name, "message", {"phase": "resteer", "round": depth, "detail": "reviewing the team"})
+        session = ClaudeSession(
+            agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
+            guard_check=self._guard_check(guard, self.name), max_turns=12,
+        )
+        try:
+            res = await session.run(self._resteer_prompt(digest, depth, critical_means, crit_count), self.repo_path)
+        except Exception as exc:
+            self._emit(self.name, "lifecycle", {"event": "resteer_failed", "detail": str(exc)})
+            return
+        parsed = _parse_json_object(res.text)
+        directives = parsed.get("directives") if isinstance(parsed, dict) else None
+        if not isinstance(directives, list):
+            return
+        applied = 0
+        for d in directives:
+            if not isinstance(d, dict):
+                continue
+            idx = d.get("track")
+            if not isinstance(idx, int) or not (1 <= idx <= len(hunters)):
+                continue
+            h = hunters[idx - 1]
+            steer = str(d.get("directive", "")).strip()
+            if steer:
+                h._directive = steer
+                applied += 1
+            new_focus = [str(p).strip() for p in (d.get("focus_files") or []) if str(p).strip()]
+            if new_focus:
+                h.focus_files = new_focus
+            self._emit(self.name, "message",
+                       {"to": h.agent_name, "kind": "assign", "lens": f"re-steer → {h.theme}",
+                        "investigate": [steer[:160]] if steer else [], "focus": h.focus_files[:4]})
+        self._emit(self.name, "message", {"phase": "resteered", "round": depth, "count": applied})
+
+    def _drain_control(self) -> None:
+        """Read any new directives from the engagement's ``control.jsonl`` (written by
+        ``p1hunt notify``) and turn them into operator notices for the next round, or a stop."""
+        import json as _json
+        from pathlib import Path
+
+        path = getattr(self.log, "path", None)
+        if path is None:
+            return
+        ctrl = Path(path).with_name("control.jsonl")
+        if not ctrl.exists():
+            return
+        try:
+            with ctrl.open("r", encoding="utf-8") as fh:
+                fh.seek(self._control_offset)
+                new = fh.read()
+                self._control_offset = fh.tell()
+        except OSError:
+            return
+        for line in new.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = _json.loads(line)
+            except Exception:
+                continue
+            if d.get("kind") == "stop":
+                self._safety_event = True
+                self._emit(self.name, "lifecycle", {"event": "stop", "reason": "operator notify: stop"})
+                continue
+            msg = str(d.get("message", "")).strip()
+            paths = [str(p).strip() for p in (d.get("paths") or []) if str(p).strip()]
+            notice = msg + (f"  [new code now available at: {', '.join(paths)}]" if paths else "")
+            if notice:
+                self._notices.append(notice)
+                self._emit(self.name, "message", {"phase": "notice", "notice": notice})
+
+    def _guard_check(self, guard: ScopeGuard, agent: str):
+        """The ONE hard guardrail, enforced on every file tool (Read/Grep/Glob/Write/Edit/…):
+        the target must stay INSIDE the workspace folder Parent A set. Inside it the agent is
+        unconstrained — it may read, write, or edit anything (incl. the target's own source and
+        secrets, which are the audit). Any path OUTSIDE the workspace — read OR write — is out of
+        scope and denied. Reads ``self._workspace_root`` dynamically so Parent A's choice applies
+        even to closures built earlier."""
+        from pathlib import Path
+
+        write_tools = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+        def _within(p: Path, root: Path) -> bool:
+            try:
+                p.resolve().relative_to(root)
+                return True
+            except ValueError:
+                return False
+
+        def check(tool: str, tinput: dict) -> tuple[bool, str]:
+            workspace = Path(self._workspace_root).resolve()
+            is_write = tool in write_tools
+            raw = tinput.get("file_path") or tinput.get("path")
+            if not raw:  # Grep/Glob by pattern operate within the workspace CWD
+                guard.pre_tool_use(agent, tool, {"target": str(workspace), "read_only": not is_write})
+                return True, "in-workspace pattern op"
+            p = Path(raw)
+            if not p.is_absolute():
+                p = workspace / p
+            inside = _within(p, workspace)
+            guard.pre_tool_use(agent, tool, {
+                "target": str(p), "read_only": not is_write,
+                "environment": "local" if inside else "out-of-scope",
+                "action": ("write" if is_write else "read") + ("" if inside else " OUT OF SCOPE"),
+            })
+            if inside:
+                return True, ("in-workspace write" if is_write else "in-workspace read")
+            verb = "write" if is_write else "read"
+            return False, f"OUT OF SCOPE: {verb} target is outside the workspace ({workspace}) — denied"
+
+        return check
+
+    # --- environment arming (the P1 unblocker: build + fork + packs + corpus) ----
+    async def _arm_environment(self, tracks: list[dict]) -> None:
+        """Before the first round: select class-level packs, surface EVM static leads, BUILD the
+        target so harnesses can deploy it, start a local mainnet fork (EVM, if configured), and
+        open the persistent corpus. All steps are graceful — a missing toolchain/fork/pack never
+        stops the hunt; it just narrows what the team can do this run."""
+        repo = self.repo_path
+        tc = self._target_class
+
+        # 1) NOTHING PRESET: invariants and known bug-patterns come ONLY from Parent A's recon
+        # (derived from the ACTUAL code + web research on THIS specific target — see _scope()).
+        # No class/subclass invariant or bug-pattern packs are injected. A track Parent A left
+        # without invariants is hunted with the in-session "derive the invariants from the code
+        # yourself" path the hunter/fuzzer prompts already instruct — never a generic floor.
+        # `self._known_patterns` and each track's `invariants` are populated by recon, not here.
+
+        # 2) Optional DERIVED observation (a property of the actual code, not a preset): how
+        # assembly-heavy the EVM source is, so the team leans on invariant/differential search
+        # over shallow reading on hardened targets. No static vulnerability-signal leads injected.
+        if tc == "EVM_CONTRACT":
+            try:
+                density = evm_assembly_density(repo)
+            except Exception:
+                density = 0.0
+            self._emit(self.name, "lifecycle",
+                       {"event": "code_shape", "assembly_density": round(density, 2),
+                        "hint": ("assembly-heavy — prefer invariant/differential search over keyword reading"
+                                 if density >= 0.5 else "lean on derived invariants + differential testing")})
+
+        # 3) Build bootstrap — the unblocker. Compile the target (fetch submodules, install deps)
+        # so the fuzz/PoC stages can deploy and run the REAL code. Off the event loop (subprocess).
+        if self.config.provision:
+            try:
+                self._build = await asyncio.to_thread(
+                    bootstrap_environment, repo, on_event=self._emit,
+                    allow_network=self.config.provision_network)
+            except Exception as exc:
+                self._build = None
+                self._emit("build_env", "lifecycle", {"event": "bootstrap_error", "detail": str(exc)})
+            if self._build is not None:
+                self._emit("build_env", "lifecycle",
+                           {"event": "build_status", "toolchain": self._build.toolchain,
+                            "compiles": self._build.compiles, "attempted": self._build.attempted,
+                            "diagnostics": (self._build.diagnostics or "")[:300],
+                            "remediation": (self._build.remediation or "")[:200]})
+
+        # 4) Local mainnet fork (EVM + an rpc configured + anvil present): PoCs/fuzzers reach real
+        # on-chain token/proxy state at http://127.0.0.1:PORT. Localhost only; never a mainnet write.
+        if tc == "EVM_CONTRACT" and self.config.fork_rpc_url and fork_available():
+            handle = await asyncio.to_thread(
+                start_anvil_fork, self.config.fork_rpc_url,
+                block=self.config.fork_block, on_event=self._emit)
+            if handle is not None:
+                self._fork_handle = handle
+                self._fork_url = handle.endpoint
+                os.environ["P1HUNT_FORK_URL"] = handle.endpoint  # child `forge` inherits this
+                self._emit(self.name, "lifecycle", {"event": "fork_ready", "endpoint": handle.endpoint})
+        elif tc == "EVM_CONTRACT" and self.config.fork_rpc_url and not fork_available():
+            self._emit(self.name, "lifecycle",
+                       {"event": "fork_unavailable", "reason": "anvil not installed; PoCs run on local-deploy harnesses only"})
+
+        # 5) Persistent corpus + coverage ledger, keyed to the engagement folder.
+        path = getattr(self.log, "path", None)
+        if path is not None:
+            try:
+                self._corpus = CorpusStore(Path(path).parent)
+            except Exception:
+                self._corpus = None
+
+    def _stop_fork(self) -> None:
+        """Tear down the local fork (no-op when none was started). Called at every hunt exit.
+        Also clears the inherited fork-URL env var so a torn-down (dead) endpoint can't leak into
+        a later child process or a subsequent in-process hunt."""
+        if self._fork_handle is not None:
+            try:
+                stop_anvil_fork(self._fork_handle)
+            finally:
+                self._fork_handle = None
+        self._fork_url = ""
+        os.environ.pop("P1HUNT_FORK_URL", None)
+
+    def _build_status_line(self) -> str:
+        """One line telling hunters/fuzzers whether the target compiles — gated FIRST so they
+        fix the build before fuzzing (a harness that can't deploy the real code proves nothing)."""
+        b = self._build
+        if b is None:
+            return ""
+        if b.compiles:
+            return (f"BUILD: the target COMPILES ✓ (toolchain={b.toolchain}). Deploy the REAL contracts "
+                    "and run forge/test harnesses against them directly.")
+        if not b.attempted:
+            return (f"BUILD: not auto-provisioned (toolchain={b.toolchain}). {b.remediation} "
+                    "Provision + compile the target YOURSELF first (fetch submodules / install deps).")
+        return (f"BUILD: the target does NOT yet compile (toolchain={b.toolchain}). {b.diagnostics} "
+                f"FIX THE BUILD FIRST: {b.remediation} — only then can a PoC/fuzz harness deploy it.")
+
+    def _entrypoints_for(self, subsystem: str, focus_files: list[str]) -> list[str]:
+        """Cached external/public entrypoints for an EVM subsystem (the real attack surface);
+        empty for non-EVM targets. Drives both the harness scaffold and coverage steering."""
+        if self._target_class != "EVM_CONTRACT":
+            return []
+        if subsystem not in self._entrypoints_by_subsystem:
+            try:
+                self._entrypoints_by_subsystem[subsystem] = detect_evm_entrypoints(self.repo_path, focus_files)
+            except Exception:
+                self._entrypoints_by_subsystem[subsystem] = []
+        return self._entrypoints_by_subsystem[subsystem]
+
+    def _scaffold_for(self, subsystem: str, focus_files: list[str]) -> str:
+        """A concrete, runnable harness scaffold for this subsystem (EVM gets a Foundry skeleton
+        that reaches past signature/approval gates; other classes get a generic 'build a real
+        harness' block). Generic to the target CLASS — never a per-target playbook."""
+        try:
+            return scaffold_block(
+                self._target_class, subsystem, list(focus_files or []),
+                signals=None, fork_url=self._fork_url,
+                entrypoints=self._entrypoints_for(subsystem, focus_files or []),
+                repo_path=self.repo_path)
+        except Exception:
+            return ""
+
+    async def hunt(self, max_rounds: int | None = None) -> HuntResult:
+        """Never-stop: hunt round after round until a critical is confirmed or the operator
+        stops. ``max_rounds`` is an optional safety cap (None = truly unbounded, §8)."""
+        # §6 derivation: classify, derive policy/surfaces (the lenses to assign).
+        self._emit(self.name, "message", {"phase": "derivation", "program": self.scope.program})
+        plan = derive_plan(self.scope, self.repo_path)
+        self._target_class = getattr(plan.target_class, "name", str(plan.target_class))
+        self.bb.set_scope(self.scope)
+        self.bb.set_plan(plan)
+
+        policy = plan.scopeguard_policy
+        policy.allowlist = list(dict.fromkeys([*policy.allowlist, self.repo_path, str(self.poc_dir)]))
+        guard = ScopeGuard(policy, on_decision=None, unattended=self.config.unattended)
+        self._active_guard = guard
+        # Start the self-healing watchdog (cancelled in the finally below).
+        watchdog = asyncio.ensure_future(self._watchdog())
+        try:
+
+            # RESUME / JUMPSTART: if a saved snapshot exists, continue from the derived tracks +
+            # candidates + round instead of re-running cold reconnaissance (no progress lost).
+            resume = self._load_resume_state()
+            oracle_desc = ""  # Parent A's own characterization of the differential oracle (generic)
+            if resume:
+                critical_means = resume.get("critical_means") or plan.impact_definition
+                tracks = (resume.get("tracks") or self._fallback_tracks())[:6]
+                self._known_patterns = list(resume.get("known_patterns", []) or [])
+                oracle_desc = str(resume.get("oracle_desc", "") or "")
+            else:
+                # NOTHING PRESET (§1): Parent A performs COLD reconnaissance of the target and
+                # DERIVES the subsystems/invariants/tracks itself (Pillar 2) plus the historical bug
+                # patterns to hunt new variants of (Pillar 3) — no playbook, no checklist.
+                scope_plan = await self._scope(guard)
+                critical_means = scope_plan.get("critical_means") or plan.impact_definition
+                tracks = (scope_plan.get("tracks") or self._fallback_tracks())[:6]
+                self._known_patterns = [str(p).strip() for p in (scope_plan.get("known_patterns") or [])
+                                        if str(p).strip()][:12]
+                _orc = scope_plan.get("differential_oracle") or {}
+                if isinstance(_orc, dict) and _orc.get("exists"):
+                    oracle_desc = str(_orc.get("description", "")).strip()
+                # Protocol category, ONLY if Parent A named one from the code (not token-counted).
+                self._subclass = str(scope_plan.get("target_subclass", "") or "").strip()
+                self._emit(self.name, "message",
+                           {"phase": "scoped", "summary": str(scope_plan.get("summary", ""))[:400],
+                            "critical_means": str(critical_means)[:300], "tracks": len(tracks),
+                            "known_patterns": len(self._known_patterns)})
+                if self._known_patterns:
+                    self._emit(self.name, "lifecycle",
+                               {"event": "patterns_loaded", "count": len(self._known_patterns),
+                                "sample": self._known_patterns[:3]})
+
+            # Arm the environment ONCE before any round: BUILD the target (submodules + compile) so
+            # harnesses can deploy it, start a local mainnet fork when configured, and open the
+            # persistent corpus. Invariants/patterns are NOT injected here — they come from Parent A's
+            # recon (derived from the actual code + web research), so nothing preset reaches the hunt.
+            await self._arm_environment(tracks)
+
+            # One Child B per DERIVED track (a real Claude hunter), plus the Falsifier.
+            hunters: list[ClaudeHunter] = []
+            for i, tr in enumerate(tracks, start=1):
+                name = f"child_b{i}"
+                self.bus.register(name, "worker")
+                h = ClaudeHunter(name, theme=str(tr.get("theme", f"track {i}")),
+                                 model=self.config.models.worker, on_event=self._emit,
+                                 guard_check=self._guard_check(guard, name))
+                h.focus_files = list(tr.get("focus_files", []) or [])
+                h.investigate = list(tr.get("investigate", []) or [])
+                # Deep subsystem ownership (Pillar 2): the hunter OWNS this subsystem and its invariants.
+                h.subsystem = str(tr.get("subsystem", "") or tr.get("theme", "") or f"track {i}")
+                h.invariants = [str(x) for x in (tr.get("invariants") or []) if str(x).strip()]
+                h.fuzz_mode = str(tr.get("fuzz_mode", "") or "")
+                if resume:  # restore this track's ruled-out ledger + last directive so it doesn't backtrack
+                    h._ruled_out = list(tr.get("ruled_out", []) or [])
+                    h._directive = str(tr.get("directive", "") or "")
+                hunters.append(h)
+                self._emit(self.name, "message",
+                           {"to": name, "kind": "assign", "lens": h.theme, "mission": h.subsystem,
+                            "investigate": h.investigate[:4], "focus": h.focus_files[:4],
+                            "invariants": h.invariants[:4]})
+            self.bus.register("falsifier", "falsifier")
+            verifier = ClaudeVerifier("falsifier", model=self.config.models.falsifier, on_event=self._emit,
+                                      guard_check=self._guard_check(guard, "falsifier"))
+            # The PoC prover runs ONLY after the Falsifier believes a finding is real (so we never
+            # build a PoC for an intended/non-bug), and can REFUTE it if it won't actually reproduce.
+            self.bus.register("poc_prover", "prover")
+            prover = ClaudePoCProver("poc_prover", model=self.config.models.falsifier, on_event=self._emit,
+                                     guard_check=self._guard_check(guard, "poc_prover"))
+
+            # FUZZING ENGINE (Pillar 1): one campaign per top subsystem. If a reference impl exists,
+            # the first is a DIFFERENTIAL campaign (optimized vs reference) — the highest-yield search
+            # on heavily-audited code. Fuzzers use the strong model (harness-writing + forge iteration
+            # is demanding) and run concurrently with the hunters each round.
+            # Prefer Parent A's OWN determination of the differential oracle (generic, from its recon);
+            # fall back to a cheap structural guess only if Parent A didn't characterize one.
+            reference_hint = oracle_desc or self._detect_reference()
+            if reference_hint:
+                self._emit(self.name, "lifecycle",
+                           {"event": "reference_detected",
+                            "detail": reference_hint[:160],
+                            "source": "parent_a" if oracle_desc else "structural-fallback"})
+            # FUZZING IS THE SIDE DISH: the bulk of the round is the reasoning hunters (one per
+            # track); only a small number of fuzz campaigns run alongside them. Default 1
+            # (the single highest-value subsystem, differential if an oracle exists); override
+            # with P1HUNT_FUZZ_CAMPAIGNS. This keeps most of the compute on reasoning-to-a-bug.
+            try:
+                _n_fuzz = max(0, int(os.environ.get("P1HUNT_FUZZ_CAMPAIGNS", "1")))
+            except ValueError:
+                _n_fuzz = 1
+            fuzz_assignments = self._fuzz_assignments(tracks, reference_hint, max_n=_n_fuzz)
+            fuzzers: list[ClaudeFuzzer] = []
+            for i, asn in enumerate(fuzz_assignments, start=1):
+                fname = f"fuzzer_{i}"
+                self.bus.register(fname, "fuzzer")
+                fuzzers.append(ClaudeFuzzer(fname, model=self.config.models.falsifier, on_event=self._emit,
+                                            guard_check=self._guard_check(guard, fname)))
+                self._emit(self.name, "message",
+                           {"to": fname, "kind": "assign",
+                            "mode": "differential" if asn["differential"] else "invariant",
+                            "subsystem": asn["subsystem"], "invariants": asn["invariants"][:4]})
+
+            findings: list[Finding] = []
+            all_candidates: list[ClaudeFinding] = []
+            seen: set[str] = set()
+            prior_titles: list[str] = []
+            start_depth = 0
+            if resume:  # restore the candidate set + dedup keys + round counter
+                for cd in resume.get("candidates", []):
+                    try:
+                        all_candidates.append(ClaudeFinding(**cd))
+                    except (TypeError, ValueError):
+                        pass
+                seen |= set(resume.get("seen", []))
+                prior_titles = [c.title for c in all_candidates]
+                start_depth = int(resume.get("depth", 0) or 0)
+
+            depth = start_depth
+            while True:
+                depth += 1
+                if max_rounds is not None and depth > max_rounds:
+                    self._emit(self.name, "lifecycle", {"event": "cap_reached", "round": depth - 1})
+                    self._write_findings_json(findings, all_candidates)
+                    watchdog.cancel()
+                    self._stop_fork()
+                    status = EngagementStatus.REPORT_READY if findings else EngagementStatus.RUNNING
+                    return self._result(status, plan, guard, findings, all_candidates, depth - 1)
+                if self.bb.has_stop(self.name) or self._safety_event:
+                    self._emit(self.name, "lifecycle", {"event": "stop", "reason": "operator/safety"})
+                    self._write_findings_json(findings, all_candidates)
+                    watchdog.cancel()
+                    self._stop_fork()
+                    return self._result(EngagementStatus.STOPPED, plan, guard, findings, all_candidates, depth)
+
+                self._drain_control()  # pick up any `p1hunt notify` directives before this round
+                self._emit(self.name, "message", {"phase": "round", "round": depth, "lenses": len(hunters)})
+                import time as _t
+                round_start = _t.monotonic()
+                round_errors: list[str] = []
+
+                # Fan out: every Child B hunts its derived track this round (bounded concurrency).
+                # Each hunter has a WALL-CLOCK cap so one that keeps emitting can't grind forever and
+                # block the round (the inactivity timeout only catches SILENCE, not endless grinding).
+                hunter_cap = float(os.environ.get("P1HUNT_HUNTER_TIMEOUT", "1200"))  # 20 min/round/hunter
+
+                async def _run(h: ClaudeHunter) -> list[ClaudeFinding]:
+                    async with self.sem:
+                        try:
+                            res = await asyncio.wait_for(
+                                h.hunt(critical_means + self._scope_guidance(), self.repo_path, depth,
+                                       prior_titles, focus_files=h.focus_files, investigate=h.investigate,
+                                       notices=list(self._notices), invariants=h.invariants,
+                                       known_patterns=self._known_patterns, subsystem=h.subsystem,
+                                       scaffold=self._scaffold_for(h.subsystem, h.focus_files),
+                                       build_status=self._build_status_line()),
+                                timeout=hunter_cap)
+                        except asyncio.TimeoutError:
+                            # Force the round to close: this track contributes nothing this round and
+                            # gets a fresh session next round (so it can't stall the whole swarm).
+                            self._emit(h.agent_name, "lifecycle",
+                                       {"event": "hunter_timeout",
+                                        "detail": f"exceeded {int(hunter_cap)}s wall-clock — cut so the round can complete"})
+                            return []
+                        if res.error:
+                            round_errors.append(res.error)
+                            self._emit(h.agent_name, "lifecycle", {"event": "error", "detail": res.error})
+                        return res.findings
+
+                # FUZZING PHASE (Pillar 1): alongside the hunters, run invariant + differential fuzzing
+                # campaigns that SEARCH for invariant violations instead of guessing. A campaign's
+                # findings arrive with a forge counterexample (a reproducing sequence) — high-signal,
+                # and they feed the same Falsifier→PoC pipeline so harness artifacts still get rejected.
+                async def _run_fuzz(fz: ClaudeFuzzer, asn: dict) -> list[ClaudeFinding]:
+                    async with self.sem:
+                        subsystem = asn["subsystem"]
+                        focus = asn["focus_files"]
+                        eps = self._entrypoints_for(subsystem, focus)
+                        # Cross-round memory: reuse prior counterexamples as seeds and steer at the
+                        # entrypoints not yet covered, so rounds COMPOUND instead of re-exploring.
+                        seeds = self._corpus.seeds_for(subsystem) if self._corpus else []
+                        cov_hint = self._corpus.uncovered_hint(subsystem, eps) if self._corpus else ""
+                        try:
+                            fnds, cov, covered = await asyncio.wait_for(
+                                fz.campaign(subsystem, asn["invariants"], focus,
+                                            self.repo_path, differential=asn["differential"],
+                                            reference_hint=reference_hint, known_patterns=self._known_patterns,
+                                            scaffold=self._scaffold_for(subsystem, focus),
+                                            fork_url=self._fork_url, build_status=self._build_status_line(),
+                                            coverage_hint=cov_hint, entrypoints=eps, seeds=seeds),
+                                timeout=hunter_cap)
+                        except asyncio.TimeoutError:
+                            self._emit(fz.agent_name, "lifecycle",
+                                       {"event": "hunter_timeout", "detail": f"fuzz campaign exceeded {int(hunter_cap)}s — cut"})
+                            return []
+                        except Exception as exc:  # a harness/parse failure must not kill the round
+                            round_errors.append(str(exc))
+                            return []
+                        if self._corpus is not None:
+                            try:
+                                self._corpus.record(
+                                    subsystem,
+                                    counterexamples=[f.reproduction for f in fnds if f.reproduction],
+                                    coverage_notes=cov, covered_symbols=covered)
+                            except Exception:
+                                pass
+                        return fnds
+
+                # Expose this round's tasks so the watchdog can cancel them if they stall.
+                self._round_tasks = [asyncio.ensure_future(_run(h)) for h in hunters]
+                self._round_tasks += [asyncio.ensure_future(_run_fuzz(fz, asn))
+                                      for fz, asn in zip(fuzzers, fuzz_assignments)]
+                results = await asyncio.gather(*self._round_tasks, return_exceptions=True)
+                self._round_tasks = []
+                round_findings: list[ClaudeFinding] = []
+                for r in results:
+                    if isinstance(r, list):
+                        round_findings.extend(r)
+
+                # Dedupe, record as hypotheses/candidates for full visibility.
+                fresh: list[ClaudeFinding] = []
+                for cf in round_findings:
+                    key = f"{cf.file}:{cf.line}:{cf.title.lower()[:40]}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fresh.append(cf)
+                    all_candidates.append(cf)
+                    prior_titles.append(cf.title)
+                    self._record_hypothesis(cf)
+
+                # Verify the strong candidates (believe-but-verify, §10). Out-of-scope findings (e.g.
+                # in a non-deployed reference impl) stay visible as candidates but are NEVER verified
+                # or promoted to P1s — they don't burn Falsifier/PoC budget and can't become a payout.
+                strong = []
+                for cf in fresh:
+                    if cf.severity not in ("critical", "high"):
+                        continue
+                    if self._out_of_scope(cf.file):
+                        self._emit("falsifier", "message",
+                                   {"verdict": "out-of-scope", "title": cf.title,
+                                    "reason": f"{cf.file} is out of scope (not deployed) — not promoted"})
+                        continue
+                    strong.append(cf)
+                for cf in strong:
+                    status, _severity, reason = await verifier.verify(cf, self.repo_path)
+                    hyp = self._hyp_by_finding.get(id(cf))
+                    if status == "refuted":
+                        if hyp:
+                            self.bb.set_state(hyp.id, HypState.FALSIFIED)
+                        continue
+                    # STRICT REPRODUCED-CRITICAL GATE (§10): the Falsifier only earns the candidate a
+                    # chance to be PROVEN. The prover MATERIALIZES a runnable harness into the sandbox;
+                    # a DETERMINISTIC class runner then EXECUTES it and decides reproduction from the
+                    # real toolchain output — never the model's say-so. NOTHING is promoted to a
+                    # confirmed finding unless reproduced=True; otherwise it stays a candidate.
+                    spec_dict = await prover.materialize(
+                        cf, self.repo_path,
+                        scaffold=self._scaffold_for(cf.lens or "subsystem", [cf.file] if cf.file else []),
+                        fork_url=self._fork_url)
+                    repro = await self._reproduce(cf, spec_dict)
+                    reproduced = bool(repro and repro.reproduced)
+                    # Ingest REAL coverage (parsed from the tool, not model-reported) into the corpus.
+                    if repro is not None and repro.coverage and self._corpus is not None:
+                        try:
+                            self._corpus.record(cf.lens or "subsystem",
+                                                covered_symbols=list(repro.coverage.get("covered_symbols", [])))
+                        except Exception:
+                            pass
+                    # Deterministic severity — map REAL impact facts to THIS program's taxonomy.
+                    impact = self._impact_of(cf, reproduced)
+                    sev_label, sev_rationale = self._severity.map(impact)
+                    if not reproduced:
+                        # Quarantine: believed-real but NOT deterministically reproduced -> CANDIDATE.
+                        if hyp:
+                            self.bb.set_state(hyp.id, HypState.CANDIDATE)
+                        self._emit("poc_prover", "lifecycle",
+                                   {"event": "candidate_not_reproduced", "title": cf.title,
+                                    "ran": bool(repro and repro.ran), "severity": sev_label,
+                                    "detail": (repro.detail[:200] if repro else "no harness/runner — stays a candidate")})
+                        continue
+                    # Reproduced by a real runner -> a CONFIRMED finding (tier from the mapper).
+                    tier = self._norm_tier(sev_label, self._severity.is_p1(impact))
+                    if hyp:
+                        self.bb.set_state(hyp.id, HypState.CONFIRMED)
+                    findings.append(self._promote(cf, f"{sev_rationale} | falsifier: {reason}", guard,
+                                                  repro=repro, severity_label=sev_label, tier=tier))
+
+                # Find ALL criticals — do NOT stop at the first. Keep hunting/reframing across
+                # rounds (every lens deepening its angle) until the round cap or an operator stop,
+                # so multiple independent P1s surface rather than just the first one found.
+                crit = sum(f.severity == "critical" for f in findings)
+                self._emit(self.name, "message", {"phase": "round_summary", "round": depth,
+                                                  "criticals_total": crit, "candidates_total": len(all_candidates)})
+                # Persist findings each round so a later stop/kill always leaves them on disk.
+                self._write_findings_json(findings, all_candidates)
+                # Persist a full RESUMABLE snapshot so a kill/rate-limit can be jump-started from here.
+                self._write_state(tracks, critical_means, hunters, findings, all_candidates, seen, depth,
+                                  oracle_desc=reference_hint)
+
+                # Rate-limit / dead-round BACKOFF (§8): a round that finished FAST and produced nothing
+                # (or whose sessions errored as rate-limited) means we're throttled — do NOT spin empty
+                # rounds hammering the API. Sleep with exponential backoff so the limit can recover.
+                round_dur = _t.monotonic() - round_start
+                throttled = any(("rate" in str(e).lower() or "limit" in str(e).lower() or "usage" in str(e).lower())
+                                for e in round_errors)
+                if throttled or (round_dur < 45 and not fresh and round_errors):
+                    self._rl_strikes = getattr(self, "_rl_strikes", 0) + 1
+                    backoff = min(900, 30 * (2 ** min(self._rl_strikes - 1, 5)))  # 30s→…→15min cap
+                    self._emit(self.name, "lifecycle",
+                               {"event": "backoff", "strikes": self._rl_strikes,
+                                "reason": f"empty/fast round, likely rate-limited ({len(round_errors)} errored) — pausing {backoff}s"})
+                    await asyncio.sleep(backoff)
+                    continue  # skip re-steer while throttled (it would just fail too) — retry the round
+                self._rl_strikes = 0
+
+                # Strategic re-steer (§6): Parent A reviews where every track stands — each track's
+                # findings + its ruled-out ledger + the cross-track blackboard — and writes a
+                # personalized directive (and may re-scope focus files) for each hunter's next round.
+                per_hunter = [r if isinstance(r, list) else [] for r in results]
+                await self._resteer(hunters, per_hunter, depth, critical_means, findings, guard)
+
+                # Deepen each track's analysis next round, never quit on a dry spell.
+                self._reframes += len(hunters)
+                self._emit(self.name, "reframe", {"reason": f"round {depth} done; every track deepens its "
+                                                  "analysis next pass, without escalating aggressiveness"})
+                # loop continues — the session does not stop until a critical is confirmed or
+                # the operator issues a stop directive (§8, never-quit).
+        finally:
+            # Always tear down the watchdog task and any local anvil fork, even on an
+            # exception path (the two in-loop returns also do this; both are idempotent).
+            watchdog.cancel()
+            self._stop_fork()
+
+    # --- helpers ----------------------------------------------------------
+    _SEC_KEYWORDS = (
+        "verify", "proof", "zero_knowledge", "zk", "sign", "mta", "keygen", "key", "commit",
+        "paillier", "ring_pedersen", "range", "ecdsa", "eddsa", "schnorr", "cosigner", "crypto",
+        "auth", "token", "session", "permission", "nonce", "refresh", "share",
+    )
+    _SRC_EXTS = {".cpp", ".cc", ".c", ".h", ".hpp", ".go", ".rs", ".py", ".ts", ".js", ".tsx",
+                 ".sol", ".java", ".kt", ".rb", ".php"}
+
+    # --- fuzzing-engine support (Pillar 1) --------------------------------
+    _REF_MARKERS = ("reference/", "/reference/", "_reference", "reference_impl", "/spec/", "/specs/")
+
+    def _detect_reference(self) -> str:
+        """FALLBACK ONLY: a cheap structural guess at a second implementation, used only if Parent A
+        did not characterize the differential oracle itself. Parent A's own determination (from its
+        recon) is always preferred — this is a safety net, not the source of truth."""
+        repo = Path(self.repo_path)
+        ref_files = []
+        try:
+            for p in repo.rglob("*"):
+                if not p.is_file():
+                    continue
+                low = str(p.relative_to(repo)).lower()
+                if any(m in low for m in self._REF_MARKERS) or p.name.startswith("Reference"):
+                    ref_files.append(str(p.relative_to(repo)))
+                    if len(ref_files) >= 6:
+                        break
+        except OSError:
+            pass
+        if not ref_files:
+            return ""
+        return (f"A second implementation may exist in this repo (e.g. {', '.join(ref_files[:4])}). "
+                "If it mirrors the in-scope code, use it as the differential ORACLE — drive identical "
+                "inputs through both and assert equality.")
+
+    def _fuzz_assignments(self, tracks: list[dict], reference_hint: str, max_n: int = 1) -> list[dict]:
+        """Thin executor of PARENT A's plan: one fuzzing campaign per top subsystem, in the MODE
+        Parent A chose for it (its `fuzz_mode`). No target-specific heuristics — if Parent A said a
+        subsystem is best attacked differentially (and an oracle exists), that campaign is
+        differential; otherwise it's a stateful-invariant campaign."""
+        have_oracle = bool(reference_hint)
+        out: list[dict] = []
+        for i, tr in enumerate(tracks[:max_n]):
+            subsystem = str(tr.get("subsystem") or tr.get("theme") or f"subsystem {i+1}")
+            invariants = [str(x) for x in (tr.get("invariants") or tr.get("investigate") or []) if str(x).strip()]
+            focus = [str(x) for x in (tr.get("focus_files") or []) if str(x).strip()]
+            mode = str(tr.get("fuzz_mode", "")).lower()
+            # Parent A's call. Differential is the single highest-yield technique on hardened,
+            # heavily-audited code, so when an oracle exists make it the DEFAULT for EVERY subsystem
+            # Parent A didn't explicitly mark 'invariant' (not just the first) — more concurrent
+            # differential campaigns = more chances to surface a behavioral divergence (a P1).
+            differential = (mode == "differential") if mode in ("differential", "invariant") else have_oracle
+            out.append({
+                "subsystem": subsystem, "invariants": invariants[:8], "focus_files": focus[:8],
+                "differential": differential and have_oracle,
+            })
+        return out
+
+    def _enumerate_targets(self, limit: int = 30) -> list[str]:
+        """Parent A reads the repo structure and ranks source files by security relevance
+        (impl over headers, security keywords in path, larger files weighted) so coverage
+        can be partitioned across agents. Tests/benchmarks deprioritized."""
+        repo = Path(self.repo_path)
+        scored: list[tuple[int, str]] = []
+        for p in repo.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in self._SRC_EXTS:
+                continue
+            rel = str(p.relative_to(repo))
+            low = rel.lower()
+            if any(seg in low for seg in ("/test/", "/tests/", "test/", "benchmark", "/.", "example")):
+                continue
+            score = sum(2 for k in self._SEC_KEYWORDS if k in low)
+            if p.suffix.lower() in (".cpp", ".cc", ".c", ".go", ".rs"):
+                score += 1  # implementation over headers
+            try:
+                if p.stat().st_size > 8000:
+                    score += 1  # bigger files hide more
+            except OSError:
+                pass
+            scored.append((score, rel))
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        return [rel for _, rel in scored[:limit]]
+
+    # --- Parent A cold reconnaissance (§6, NOTHING PRESET) ----------------
+    def _scope_prompt(self) -> str:
+        return (
+            "You are Parent A, the LEAD of this security audit and the brain of the whole hunt. You "
+            "have NO prior knowledge of this target beyond the fact that it is the source code in the "
+            "current working directory — it could be a smart contract, a crypto library, a web/API "
+            "service, a parser, a kernel module, anything. Explore it READ-ONLY (Read, Grep, Glob, "
+            "read-only Bash, WebSearch, WebFetch) and DESIGN the entire hunt yourself. Derive "
+            "everything from what you OBSERVE — never assume a particular technology, language, or "
+            "bug list.\n\n"
+            "1) UNDERSTAND. What is this system, its language/stack, its trust/threat model (the "
+            "participants, what is trusted, exactly what an attacker controls), the crown-jewel "
+            "assets, and what 'critical' means for THIS specific system.\n\n"
+            "2) FIND A DIFFERENTIAL ORACLE (generic, high-yield). Determine whether a SECOND "
+            "implementation of the same logic exists anywhere you can drive the same inputs through "
+            "and compare: a reference/spec implementation, an older or alternative version, a "
+            "well-known library that implements the same primitive, or even the documented spec "
+            "itself. If one exists, say where and how the pieces pair up — any divergence between the "
+            "in-scope code and the oracle on the same input is a likely bug. If none exists, say so.\n\n"
+            "3) RESEARCH HISTORICAL PATTERNS (WebSearch/WebFetch). Identify what this project IS, then "
+            "research the known critical bug classes for its category and any past audit findings, "
+            "CVEs, or disclosed exploits for this project and its close peers. The old bugs are "
+            "patched — you want the PATTERNS so the team can hunt NEW VARIANTS. Return them as short, "
+            "concrete, checkable statements.\n\n"
+            "4) DECOMPOSE INTO SUBSYSTEMS + INVARIANTS (deep ownership, not breadth). Split the "
+            "in-scope code into up to 6 cohesive SUBSYSTEMS (each a distinct mechanism). One track "
+            "OWNS each subsystem end-to-end. For each, DERIVE the explicit INVARIANTS it MUST uphold "
+            "FROM THE CODE ITSELF — its require/assert/revert checks, its accounting/conservation "
+            "math, its `// invariant:`/NatSpec comments, its role/modifier guards, the properties "
+            "its own tests assert — and state each as a machine-checkable property a fuzzer can "
+            "assert, citing the file:line it came from. Do NOT emit generic textbook properties; "
+            "every invariant must be SPECIFIC to THIS code (dispatch a sub-agent to read a subsystem "
+            "if its invariants aren't obvious). Nothing is preset — these are your derivations. Decide, "
+            "per subsystem, the best SEARCH STRATEGY: 'differential' (if the oracle covers it) or "
+            "'invariant' (stateful fuzzing of its own invariants). Your hunters AND an automated "
+            "fuzzer will PROVE or disprove each by writing and RUNNING real tests/harnesses against "
+            "the actual target — not by reading alone. Point focus_files at the IN-SCOPE code."
+            + self._scope_guidance() + "\n\n"
+            "\n\nWORKSPACE GUARDRAIL: you operate under ONE hard rule — you may do ANYTHING you "
+            "need (read, write, build, install, run, fuzz, network) but ONLY INSIDE the in-scope "
+            "workspace folder; nothing outside it may be read or written. State the workspace root "
+            "as a path relative to the current directory (use \".\" for the whole acquired folder, "
+            "or a subfolder that contains all the in-scope code). It is clamped to the acquired "
+            "tree and locked as the hard guardrail.\n\n"
+            "Return ONLY JSON:\n"
+            '{"summary":"...","target_class":"<what kind of system>","threat_model":"...",'
+            '"target_subclass":"<one-word category you DERIVED from the code, or \"\">",'
+            '"workspace_root":"<relative path to the in-scope folder, or \".\">",'
+            '"critical_means":"...",'
+            '"differential_oracle":{"exists":true|false,"description":"where the second '
+            'implementation/spec is and how it pairs with the in-scope code, or why none exists"},'
+            '"known_patterns":["<known bug pattern to hunt a NEW variant of in this code>",...],'
+            '"tracks":[{"theme":"...","subsystem":"...","fuzz_mode":"differential|invariant",'
+            '"focus_files":["relative/path",...],'
+            '"invariants":["<machine-checkable property this subsystem must uphold>",...],'
+            '"investigate":["concrete invariant-breaking check to attempt IN THIS CODE",...]}]}'
+        )
+
+    async def _scope(self, guard: ScopeGuard) -> dict:
+        if not self.config.use_claude:
+            return {"tracks": self._fallback_tracks()}
+        from .claude_session import ClaudeSession
+
+        self._emit(self.name, "message",
+                   {"phase": "scoping", "detail": "cold reconnaissance — no prior knowledge of the target"})
+        session = ClaudeSession(
+            agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
+            guard_check=self._guard_check(guard, self.name), max_turns=30,
+        )
+        result = await session.run(self._scope_prompt(), self.repo_path)
+        parsed = _parse_json_object(result.text)
+        self._apply_workspace_guardrail((parsed or {}).get("workspace_root"))
+        if not parsed or not parsed.get("tracks"):
+            self._emit(self.name, "lifecycle", {"event": "scope_fallback", "reason": "no tracks derived"})
+            return {"tracks": self._fallback_tracks(),
+                    "critical_means": (parsed or {}).get("critical_means"),
+                    "summary": (parsed or {}).get("summary", "")}
+        return parsed
+
+    def _apply_workspace_guardrail(self, workspace_root: str | None) -> None:
+        """Parent A decides the workspace folder; we LOCK it as the one hard guardrail. The choice
+        is CLAMPED to the acquired target tree — Parent A may narrow the boundary to an in-scope
+        subfolder but can never widen it past what was authorized/acquired. Defaults to the whole
+        acquired folder. Always emitted so the operator can see the enforced boundary."""
+        acquired = Path(self.repo_path).resolve()
+        chosen = acquired
+        narrowed = False
+        if workspace_root and str(workspace_root).strip() not in ("", "."):
+            cand = Path(str(workspace_root).strip())
+            if not cand.is_absolute():
+                cand = acquired / cand
+            try:
+                cand = cand.resolve()
+                cand.relative_to(acquired)  # must stay within the acquired tree (no escape)
+                if cand.is_dir():
+                    chosen, narrowed = cand, (cand != acquired)
+            except (ValueError, OSError):
+                chosen = acquired  # outside the acquired tree -> ignore, keep the safe default
+        self._workspace_root = str(chosen)
+        # If Parent A narrowed the boundary, keep the PoC sandbox inside it so writes stay in scope.
+        if narrowed:
+            self.poc_dir = Path(self._workspace_root) / ".p1hunt-poc"
+            try:
+                self.poc_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+        self._emit(self.name, "lifecycle",
+                   {"event": "workspace_guardrail", "set_by": "parent_a",
+                    "workspace": self._workspace_root, "narrowed": narrowed,
+                    "policy": "agents may do ANYTHING inside this folder; every file read/write/edit outside it is denied"})
+
+    def _fallback_tracks(self) -> list[dict]:
+        """Only when no Claude brain is available (offline/tests): generic lens tracks with a
+        mechanical file partition. No bug-class hints."""
+        files = self._enumerate_targets()
+        return [
+            {"theme": lens, "focus_files": files[i :: len(_LENSES)], "investigate": []}
+            for i, lens in enumerate(_LENSES)
+        ]
+
+    def _record_hypothesis(self, cf: ClaudeFinding) -> None:
+        hyp = Hypothesis(
+            id=new_id("HYP"),
+            claim=f"{cf.title} at {cf.file}:{cf.line}",
+            owner_agent="child_b",
+            lens=cf.lens,
+            target_assets=[self.repo_path],
+            assumptions=[cf.root_cause] if cf.root_cause else [],
+            safe_validation_plan=SafeValidationPlan("local", "read-only", "synthetic/owned"),
+            stop_conditions=["out of scope", "third-party data", "destructive action"],
+            evidence_required=["Claude-cited code evidence", "adversarial verification"],
+            state=HypState.CANDIDATE,
+            counterfactual=cf.counterfactual or None,
+        )
+        self.bb.add_hypothesis(hyp)
+        self._hyp_by_finding[id(cf)] = hyp
+
+    # --- deterministic reproduction + severity gate (§10, §1 NOTHING PRESET) ----------
+    async def _reproduce(self, cf: ClaudeFinding, spec_dict: dict | None):
+        """Run the materialized harness through the DETERMINISTIC class runner. Returns a
+        ReproResult (or None when there is no harness/runner). Never raises; offloaded to a thread
+        so a long toolchain run doesn't block the event loop."""
+        if not spec_dict:
+            return None
+        runner = select_runner(self._target_class, self._subclass)
+        if runner is None:
+            self._emit("poc_prover", "lifecycle",
+                       {"event": "no_runner", "class": self._target_class,
+                        "detail": "no deterministic runner for this class — stays a candidate"})
+            return None
+        try:
+            spec = ReproSpec.from_dict(spec_dict)
+            timeout = float(os.environ.get("P1HUNT_REPRO_TIMEOUT", "600"))
+            repro = await asyncio.to_thread(runner.run, self._workspace_root, spec,
+                                            timeout=timeout, on_event=self._emit)
+        except Exception as exc:
+            self._emit("poc_prover", "lifecycle", {"event": "runner_error", "detail": str(exc)})
+            return None
+        self._emit("poc_prover", "lifecycle",
+                   {"event": "reproduction", "runner": repro.runner, "ran": repro.ran,
+                    "reproduced": repro.reproduced, "command": repro.command[:200],
+                    "detail": (repro.detail or "")[:200]})
+        return repro
+
+    _LOSS_TYPES = ("funds", "data", "control", "availability")
+
+    def _impact_of(self, cf: ClaudeFinding, reproduced: bool) -> "ImpactAssessment":
+        """Build an ImpactAssessment from DERIVED facts — NOTHING PRESET. ``reproduced`` and
+        ``in_scope`` are deterministic (runner + ScopeGuard). The concrete loss is whatever the
+        agent itself STATED it demonstrated (cf.concrete_loss), not a keyword guess — if the agent
+        could not articulate a concrete loss, it is 'none' and the finding is not auto-promoted to
+        P1 (it stays a candidate for human review, which is the correct conservative behavior)."""
+        loss = (cf.concrete_loss or "").strip().lower()
+        loss = loss if loss in self._LOSS_TYPES else "none"
+        capability = bool((cf.counterfactual or "").strip())
+        return ImpactAssessment(
+            reproduced=reproduced, protected_asset=(loss != "none"),
+            attacker_capability=capability, concrete_loss=loss,
+            in_scope=not self._out_of_scope(cf.file), note=(cf.counterfactual or "")[:200],
+        )
+
+    def _norm_tier(self, sev_label: str, is_p1: bool) -> str:
+        """Map the program's taxonomy label back to a normalized tier for Finding.severity."""
+        if is_p1:
+            return "critical"
+        for tier in ("critical", "high", "medium", "low"):
+            if sev_label == self._severity.label_for_tier(tier):
+                return tier
+        return "high"
+
+    def _promote(self, cf: ClaudeFinding, rationale: str, guard: ScopeGuard, *,
+                 repro, severity_label: str, tier: str) -> Finding:
+        """Build a CONFIRMED finding. Only ever called for a DETERMINISTICALLY reproduced candidate,
+        so the artifact is reproduced=True and carries the real runner command + output excerpt."""
+        cmd = getattr(repro, "command", "") or ""
+        arts = list(getattr(repro, "artifact_paths", []) or [])
+        proof = getattr(repro, "detail", "") or getattr(repro, "stdout_excerpt", "")
+        artifact = ArtifactRef(
+            id=new_id("art"), kind="repro",
+            path=(arts[0] if arts else f"{cf.file}:{cf.line}"),
+            description=f"REPRODUCED by {getattr(repro, 'runner', 'runner')} runner via `{cmd}` — {proof[:280]}",
+            reproduced=True,
+        )
+        self.bb.add_artifact(artifact)
+        # Remediation is DERIVED by the finder for THIS root cause (NOTHING PRESET — no bug-id
+        # remediation table). Fall back to a single generic instruction only if it didn't state one.
+        remediation = cf.remediation or "Fix the root cause and add a regression test that fails before the fix and passes after."
+        finding = Finding(
+            id=new_id("FND"),
+            hypothesis_id=self._hyp_by_finding.get(id(cf), Hypothesis(
+                id="?", claim="", owner_agent="", lens=cf.lens, target_assets=[], assumptions=[],
+                safe_validation_plan=SafeValidationPlan("", "", ""), stop_conditions=[], evidence_required=[])).id,
+            title=cf.title,
+            root_cause=cf.root_cause,
+            poc=artifact,
+            severity=tier,
+            severity_rationale=f"[{severity_label}] PoC-REPRODUCED (deterministic runner). {rationale}",
+            counterfactual=cf.counterfactual,
+            remediation=remediation,
+            safe_harbor_attestation=guard.attestation(),
+            verified=True,
+        )
+        self.bb.add_finding(finding)
+        return finding
+
+    def trigger_safety_event(self, reason: str) -> None:
+        self._safety_event = True
+        self._emit(self.name, "lifecycle", {"event": "safety_event", "reason": reason})
+
+    def _result(self, status, plan, guard, findings, candidates, rounds) -> HuntResult:
+        return HuntResult(
+            status=status, plan=plan, rounds_run=rounds, findings=findings,
+            reframes=self._reframes, demoted_to_warm_pool=False, attestation=guard.attestation(),
+            candidates=[c.__dict__ for c in candidates], brain="claude",
+        )
+
+
+def _parse_json_object(text: str) -> dict:
+    """Extract the first JSON object from a Claude reply (fenced block or inline)."""
+    import json
+    import re
+
+    if not text:
+        return {}
+    cands = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        cands.append(m.group(0))
+    for raw in cands:
+        try:
+            d = json.loads(raw)
+            if isinstance(d, dict):
+                return d
+        except json.JSONDecodeError:
+            continue
+    return {}

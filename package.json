@@ -1,0 +1,35 @@
+{
+  "name": "cyber",
+  "version": "1.0.0",
+  "description": "Authorized bug bounty workflow dashboard for safe critical vulnerability research.",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "p1scan": "tsx cli/p1scan.ts",
+    "p1scan:hunt": "tsx cli/p1scan.ts hunt",
+    "p1scan:scan": "tsx cli/p1scan.ts scan"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.177",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.18.0",
+    "next": "^16.2.9",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "eslint": "^9.39.4",
+    "eslint-config-next": "^16.2.9",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
