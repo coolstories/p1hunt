@@ -674,3 +674,148 @@ def _parse_verdict(text: str) -> dict:
         return json.loads(m.group(0))
     except json.JSONDecodeError:
         return {}
+
+
+# ===========================================================================
+# Deduplicator — at the confirmation gate, decides whether a newly-confirmed
+# finding is the SAME underlying bug (same root cause / same fix) as one already
+# confirmed, even if title/file/line differ. One cheap call; only invoked when
+# there is at least one prior confirmed finding to compare against.
+# ===========================================================================
+def dedup_prompt(f: ClaudeFinding, existing: list) -> str:
+    lst = "\n".join(
+        f"  {i + 1}. [{e.severity}] {e.title} @ {getattr(e.poc,'path','')} — {e.root_cause[:160]}"
+        for i, e in enumerate(existing))
+    return f"""You are a finding-triage deduplicator. A new finding was just CONFIRMED. Decide if it is
+the SAME underlying vulnerability as one ALREADY confirmed — same ROOT CAUSE and same FIX — even if
+the title, file, or line number differs. Two different symptoms of one root cause = DUPLICATE. A
+genuinely distinct bug (different root cause, needs a separate fix) = NOT a duplicate.
+
+NEW finding:
+- title: {f.title}
+- location: {f.file}:{f.line}
+- root cause: {f.root_cause}
+- counterfactual: {f.counterfactual}
+
+ALREADY CONFIRMED (compare against each):
+{lst}
+
+Reply ONLY JSON: {{"duplicate": true|false, "of": <1-based index of the match, or 0>,
+  "reason": "one line — why it is or isn't the same root cause"}}"""
+
+
+class ClaudeDeduplicator:
+    """Semantic dedup at the confirmation gate (cheap model). Returns (is_dup, of_index, reason)."""
+
+    def __init__(self, agent_name: str, *, model: str | None, on_event: EventEmit, guard_check,
+                 max_turns: int = 6) -> None:
+        self.agent_name = agent_name
+        self.model = model
+        self.on_event = on_event
+        self.guard_check = guard_check
+        self.max_turns = max_turns
+
+    async def is_duplicate(self, finding: ClaudeFinding, existing: list, repo_path: str) -> tuple[bool, int, str]:
+        if not existing:
+            return False, 0, "nothing to compare against"
+        session = ClaudeSession(
+            agent_name=self.agent_name, model=self.model, on_event=self.on_event,
+            guard_check=self.guard_check, max_turns=self.max_turns,
+            perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))
+        res = await session.run(dedup_prompt(finding, existing), repo_path, lens=finding.lens)
+        if not res.ok:
+            return False, 0, f"dedup session failed: {res.error}"  # fail-open: keep the finding
+        d = _parse_verdict(res.text)
+        dup = bool(d.get("duplicate"))
+        self.on_event(self.agent_name, "message",
+                      {"verdict": "duplicate" if dup else "distinct", "title": finding.title,
+                       "reason": str(d.get("reason", ""))[:160]})
+        return dup, int(d.get("of", 0) or 0), str(d.get("reason", ""))
+
+
+# ===========================================================================
+# Debate panel — runs at round end on confirmed CRITICAL findings only. A
+# prosecutor argues to invalidate/downgrade, a defender argues it is a genuine
+# critical, and a judge reads BOTH (plus the code) and rules: uphold | downgrade
+# | reject. This is the final adversarial gate on the highest-stakes findings.
+# ===========================================================================
+def debate_prompt(f: ClaudeFinding, role: str) -> str:
+    if role == "prosecutor":
+        stance = ("You are the PROSECUTOR. Make the strongest possible case that this CONFIRMED "
+                  "critical is WRONG, overstated, unreachable, intended behavior, or only a lower "
+                  "severity. Read the code; cite specifics; attack the reachability, the assumptions, "
+                  "the impact, and the severity. Be ruthless but truthful.")
+    else:
+        stance = ("You are the DEFENDER. Make the strongest possible case that this is a GENUINE "
+                  "critical: show the attacker is real and in-model, the impact is real (key/funds/"
+                  "control), and the severity is justified. Read the code; cite specifics; pre-empt "
+                  "the obvious objections.")
+    return f"""{stance}
+
+CONFIRMED critical under debate:
+- title: {f.title}
+- location: {f.file}:{f.line}
+- root cause: {f.root_cause}
+- counterfactual: {f.counterfactual}
+- evidence/repro: {f.reproduction}
+
+Investigate the code in the working directory (Read/Grep/Glob/Bash) to ground your argument.
+Reply ONLY JSON: {{"argument": "your strongest case, citing file:line", "severity": "critical|high|medium|low"}}"""
+
+
+def debate_judge_prompt(f: ClaudeFinding, prosecution: str, defense: str) -> str:
+    return f"""You are the JUDGE. Two researchers debated a CONFIRMED critical. Weigh BOTH arguments
+against the actual code and rule impartially. Prefer truth over either side; do not rubber-stamp.
+
+Finding: {f.title}  ({f.file}:{f.line})
+Root cause: {f.root_cause}
+
+PROSECUTION (argues invalidate/downgrade):
+{prosecution[:1500]}
+
+DEFENSE (argues genuine critical):
+{defense[:1500]}
+
+Rule: 'uphold' (stays a confirmed critical), 'downgrade' (real but lower severity — give it), or
+'reject' (not a valid finding / false positive). Reply ONLY JSON:
+{{"verdict": "uphold|downgrade|reject", "severity": "critical|high|medium|low",
+  "reason": "the deciding evidence from the code"}}"""
+
+
+class ClaudeDebate:
+    """Prosecutor + defender + judge over one confirmed critical. Returns (verdict, severity, reason)."""
+
+    def __init__(self, agent_name: str, *, model: str | None, on_event: EventEmit, guard_check,
+                 max_turns: int = 12) -> None:
+        self.agent_name = agent_name
+        self.model = model
+        self.on_event = on_event
+        self.guard_check = guard_check
+        self.max_turns = max_turns
+
+    async def _argue(self, finding: ClaudeFinding, role: str, repo_path: str) -> str:
+        session = ClaudeSession(
+            agent_name=f"{self.agent_name}:{role}", model=self.model, on_event=self.on_event,
+            guard_check=self.guard_check, max_turns=self.max_turns,
+            perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))
+        res = await session.run(debate_prompt(finding, role), repo_path, lens=finding.lens)
+        return str(_parse_verdict(res.text).get("argument", res.text))[:1800] if res.ok else ""
+
+    async def adjudicate(self, finding: ClaudeFinding, repo_path: str) -> tuple[str, str, str]:
+        self.on_event(self.agent_name, "message", {"phase": "debate", "title": finding.title})
+        prosecution = await self._argue(finding, "prosecutor", repo_path)
+        defense = await self._argue(finding, "defender", repo_path)
+        judge = ClaudeSession(
+            agent_name=f"{self.agent_name}:judge", model=self.model, on_event=self.on_event,
+            guard_check=self.guard_check, max_turns=self.max_turns,
+            perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))
+        res = await judge.run(debate_judge_prompt(finding, prosecution, defense), repo_path, lens=finding.lens)
+        d = _parse_verdict(res.text) if res.ok else {}
+        verdict = str(d.get("verdict", "uphold")).lower().strip()
+        if verdict not in ("uphold", "downgrade", "reject"):
+            verdict = "uphold"  # a failed/unparseable judge never silently drops a confirmed critical
+        severity = str(d.get("severity", finding.severity)).lower().strip()
+        reason = str(d.get("reason", ""))
+        self.on_event(self.agent_name, "message",
+                      {"verdict": f"debate:{verdict}", "title": finding.title, "reason": reason[:160]})
+        return verdict, severity, reason

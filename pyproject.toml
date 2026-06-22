@@ -29,7 +29,11 @@ packages = [
   "p1hunt.tools",
   "p1hunt.classify",
   "p1hunt.ui",
+  "p1hunt.web",
 ]
+
+[tool.setuptools.package-data]
+"p1hunt.web" = ["static/*"]
 
 # Acceptance tests (§16) use the stdlib unittest runner — no third-party test deps:
 #   python3 -m unittest discover -s tests -v

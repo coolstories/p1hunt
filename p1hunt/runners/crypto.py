@@ -297,6 +297,46 @@ def native_verdict(output: str, exit_code: int, spec: ReproSpec) -> dict[str, An
 # ---------------------------------------------------------------------------
 # Concrete runner.
 # ---------------------------------------------------------------------------
+_LIB_RE = re.compile(r"^lib(.+?)\.(so|a)$")
+
+
+def _discover_link_flags(root: Path, *, max_libs: int = 8) -> list[str]:
+    """Discover libraries the build actually produced under ``root`` and return link flags
+    (``-L``/``-l``/``-Wl,-rpath``) so a native harness can link the REAL in-scope library. Pure
+    discovery of what's on disk — no per-target names. Shared libs (preferred) carry their own
+    NEEDED deps, so linking ``libcosigner.so`` transitively pulls crypto/zstd/etc. Empty when the
+    build produced nothing to link (then a harness must be self-contained, exactly as before)."""
+    names: list[str] = []
+    libdirs: list[str] = []
+    try:
+        found = sorted(root.rglob("lib*.so")) + sorted(root.rglob("lib*.a"))
+    except OSError:
+        return []
+    for p in found:
+        if not p.is_file():
+            continue
+        m = _LIB_RE.match(p.name)
+        if not m:
+            continue
+        nm = m.group(1)
+        if nm in names:
+            continue
+        names.append(nm)
+        d = str(p.parent)
+        if d not in libdirs:
+            libdirs.append(d)
+        if len(names) >= max_libs:
+            break
+    if not names:
+        return []
+    flags: list[str] = []
+    for d in libdirs:
+        flags += [f"-L{d}", f"-Wl,-rpath,{d}"]
+    flags += [f"-l{nm}" for nm in names]
+    flags.append("-lpthread")
+    return flags
+
+
 class CryptoRunner:
     """Deterministic executor for CRYPTO_LIB and native-code targets (registry name ``crypto``)."""
 
@@ -318,6 +358,14 @@ class CryptoRunner:
         # crypto/MPC finding actually REPRODUCE (Go/Rust/Python already have toolchains below).
         if harness.suffix.lower() in (".c", ".cc", ".cpp", ".cxx"):
             return self._run_native(root, harness, spec, timeout, on_event)
+        # Shell-script harness: an MPC PoC often needs a build+drive script (configure, compile a
+        # multi-party harness against the real lib, run it). Execute it and judge by the SAME
+        # marker/exit-code logic as native (a sanitizer/assert/abort marker or a clean exit).
+        if harness.suffix.lower() == ".sh":
+            return self._run_script(root, harness, spec, timeout, on_event)
+        # CMake harness: the lib's own test framework. Configure → build → ctest; verdict from ctest.
+        if harness.name == "CMakeLists.txt" or harness.suffix.lower() == ".cmake":
+            return self._run_cmake(root, harness, spec, timeout, on_event)
         toolchain = self._detect_toolchain(root, harness, spec)
         if toolchain is None:
             return missing_harness_result(
@@ -372,6 +420,11 @@ class CryptoRunner:
         # them (generic, not per-target). The build tree (built by build_env) is where compiled
         # objects/libs land for linking.
         includes = [f"-I{root}", f"-I{root / 'include'}", f"-I{root / 'src'}", f"-I{root / 'build'}"]
+        # Link any library the build actually produced (generic discovery — NOTHING preset), with
+        # rpath, so a harness that exercises the in-scope library (e.g. libcosigner) links + runs.
+        # Shared libs carry their own NEEDED deps (crypto/zstd/...); this is what lets a real
+        # lib-dependent PoC deterministically CONFIRM instead of only compiling toy reimplementations.
+        link = _discover_link_flags(root)
         # libFuzzer harness? (defines LLVMFuzzerTestOneInput) — drive it with the fuzzer runtime.
         try:
             is_fuzzer = "LLVMFuzzerTestOneInput" in harness.read_text(encoding="utf-8", errors="ignore")
@@ -385,12 +438,12 @@ class CryptoRunner:
         ctimeout = max(30.0, min(timeout, 300.0))
         base = [compiler, *std, "-g", "-O1", "-fno-omit-frame-pointer", *includes]
         cran, cexit, cout = run_command(
-            [*base, f"-fsanitize={san}", str(harness), "-o", str(binary)], str(root),
+            [*base, f"-fsanitize={san}", str(harness), "-o", str(binary), *link], str(root),
             timeout=ctimeout, tools_required=(compiler,), on_event=on_event, runner=self.name)
         sanitized = cran and cexit == 0 and binary.exists()
         if not sanitized:
             cran, cexit, cout = run_command(
-                [compiler, *std, "-O2", *includes, str(harness), "-o", str(binary)], str(root),
+                [compiler, *std, "-O2", *includes, str(harness), "-o", str(binary), *link], str(root),
                 timeout=ctimeout, tools_required=(compiler,), on_event=on_event, runner=self.name)
             if not cran or cexit != 0 or not binary.exists():
                 return missing_harness_result(
@@ -409,6 +462,63 @@ class CryptoRunner:
             artifact_paths=[spec.harness_path] if spec.harness_path else [],
             stdout_excerpt=excerpt(output), detail=parsed["detail"],
             coverage=parsed.get("coverage", {}) or {}, runner=self.name)
+
+    def _run_script(self, root: Path, harness: Path, spec: ReproSpec, timeout: float,
+                    on_event: EventEmit | None) -> ReproResult:
+        """Execute a PoC shell script (the agent's build+drive script) and judge it with the SAME
+        marker/exit-code logic as a native run. The script is in the sandbox (.p1hunt-poc) and runs
+        in the workspace; bounded by timeout, never raises. NOTHING PRESET — we run the script the
+        agent materialized, we do not synthesize commands."""
+        ran, exit_code, output = run_command(
+            ["bash", str(harness)], str(root), timeout=timeout,
+            tools_required=("bash",), on_event=on_event, runner=self.name)
+        if not ran:
+            return missing_harness_result(spec, self.name, output or "script did not run")
+        parsed = native_verdict(output, exit_code, spec)
+        return ReproResult(
+            ran=True, reproduced=bool(parsed["reproduced"]),
+            command=f"bash {harness.name}", artifact_paths=[spec.harness_path],
+            stdout_excerpt=excerpt(output), detail=parsed["detail"],
+            coverage=parsed.get("coverage", {}) or {}, runner=self.name)
+
+    def _run_cmake(self, root: Path, harness: Path, spec: ReproSpec, timeout: float,
+                   on_event: EventEmit | None) -> ReproResult:
+        """Configure → build → ctest a CMake harness (the lib's own test framework). Verdict from
+        ctest: expect='fail' reproduces when a test FAILS; expect='pass' reproduces when ALL pass.
+        A configure/build failure leaves the finding a candidate (offline-graceful)."""
+        if not tool_available("cmake"):
+            return missing_harness_result(spec, self.name, "cmake not available — stays candidate")
+        src = harness.parent
+        build = src / "build"
+        budget = max(60.0, timeout)
+        cfg_ran, cfg_exit, cfg_out = run_command(
+            ["cmake", "-S", str(src), "-B", str(build)], str(root),
+            timeout=min(budget, 300.0), tools_required=("cmake",), on_event=on_event, runner=self.name)
+        if not cfg_ran or cfg_exit != 0:
+            return missing_harness_result(spec, self.name, f"cmake configure failed: {excerpt(cfg_out, 500)}")
+        b_ran, b_exit, b_out = run_command(
+            ["cmake", "--build", str(build)], str(root),
+            timeout=min(budget, 600.0), tools_required=("cmake",), on_event=on_event, runner=self.name)
+        if not b_ran or b_exit != 0:
+            return missing_harness_result(spec, self.name, f"cmake build failed: {excerpt(b_out, 500)}")
+        t_ran, t_exit, t_out = run_command(
+            ["ctest", "--test-dir", str(build), "--output-on-failure"], str(root),
+            timeout=budget, tools_required=("ctest",), on_event=on_event, runner=self.name)
+        if not t_ran:
+            return missing_harness_result(spec, self.name, "ctest did not run — stays candidate")
+        all_passed = t_exit == 0
+        if spec.expects_fail():
+            reproduced = not all_passed   # a failing test demonstrates the broken invariant
+            detail = ("ctest reported a FAILING test (bug demonstrated, expect=fail)" if reproduced
+                      else "all ctest tests passed; expected a failure to demonstrate the bug")
+        else:
+            reproduced = all_passed       # the exploit assertion held
+            detail = ("ctest: all tests passed (exploit assertion held, expect=pass)" if reproduced
+                      else "ctest reported failures; exploit not demonstrated")
+        return ReproResult(
+            ran=True, reproduced=reproduced, command="cmake build && ctest",
+            artifact_paths=[spec.harness_path], stdout_excerpt=excerpt(t_out),
+            detail=detail, coverage={}, runner=self.name)
 
     # -- toolchain derivation (NOTHING PRESET: chosen from files present in the workspace) ----
     def _detect_toolchain(self, root: Path, harness: Path, spec: ReproSpec):

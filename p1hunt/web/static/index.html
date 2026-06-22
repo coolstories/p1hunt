@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P1HUNT // THREAT OPERATIONS CENTER</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="scanlines"></div>
+<div class="vignette"></div>
+
+<!-- classification banner (top) -->
+<div class="classbar top">AUTHORIZED ACCESS&nbsp;//&nbsp;SAFE-HARBOR ENGAGEMENT&nbsp;//&nbsp;EYES ONLY&nbsp;//&nbsp;P1HUNT THREAT OPS</div>
+
+<!-- command bar -->
+<header class="cmdbar">
+  <div class="brand">
+    <div class="seal">◈</div>
+    <div class="brandtext">
+      <div class="t1">P1HUNT</div>
+      <div class="t2">THREAT&nbsp;OPERATIONS&nbsp;CENTER</div>
+    </div>
+  </div>
+  <div class="cmdmid">
+    <label class="engsel">
+      <span>ENGAGEMENT</span>
+      <select id="engSelect"></select>
+    </label>
+  </div>
+  <div class="cmdright">
+    <div class="clock" id="clock">--:--:--</div>
+    <div class="conn" id="conn"><span class="dot"></span><span id="connText">LINK</span></div>
+  </div>
+</header>
+
+<!-- status / metrics strip -->
+<section class="metrics" id="metrics">
+  <div class="metric crit"><div class="mlabel">CONFIRMED P1</div><div class="mval" id="mCrit">0</div></div>
+  <div class="metric warn"><div class="mlabel">NEEDS HUMAN</div><div class="mval" id="mNH">0</div></div>
+  <div class="metric"><div class="mlabel">CANDIDATES</div><div class="mval" id="mCand">0</div></div>
+  <div class="metric"><div class="mlabel">ROUND</div><div class="mval" id="mRound">0</div></div>
+  <div class="metric"><div class="mlabel">UPTIME</div><div class="mval" id="mUptime">--</div></div>
+  <div class="metric"><div class="mlabel">CPU</div><div class="mval" id="mCpu">--</div></div>
+  <div class="metric"><div class="mlabel">TOKENS</div><div class="mval" id="mTok">0</div></div>
+  <div class="metric"><div class="mlabel">COST</div><div class="mval" id="mCost">$0.00</div></div>
+  <div class="metric threat" id="threatBox">
+    <div class="mlabel">THREAT LEVEL</div>
+    <div class="mval" id="mThreat">—</div>
+    <div class="threatgauge"><span id="threatFill"></span></div>
+  </div>
+</section>
+
+<!-- main grid -->
+<main class="grid">
+
+  <!-- LEFT: roster + settings -->
+  <div class="col col-left">
+    <section class="panel">
+      <div class="phead"><span class="ptitle">▸ AGENT ROSTER</span><span class="pmeta" id="agentCount">0</span></div>
+      <div class="pbody" id="roster"></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><span class="ptitle">▸ ENGAGEMENT SETTINGS</span></div>
+      <div class="pbody settings" id="settings"><div class="muted">awaiting telemetry…</div></div>
+    </section>
+  </div>
+
+  <!-- CENTER: live feed -->
+  <div class="col col-center">
+    <section class="panel feedpanel">
+      <div class="phead">
+        <span class="ptitle"><span class="rec" id="rec"></span> <span id="feedTitle">LIVE INTERCEPT FEED</span></span>
+        <span class="pmeta">
+          <span class="viewmodes" id="viewModes"></span>
+          <label class="chk"><input type="checkbox" id="autoscroll" checked> autoscroll</label>
+          <input id="feedFilter" class="filter" placeholder="filter…">
+        </span>
+      </div>
+      <div class="pbody stage" id="centerStage">
+        <div class="feed" id="feed"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- RIGHT: findings + debate + dedup -->
+  <div class="col col-right">
+    <section class="panel">
+      <div class="phead"><span class="ptitle">▸ CONFIRMED CRITICALS</span><span class="pmeta crit" id="critCount">0</span></div>
+      <div class="pbody findings" id="confirmed"><div class="muted">none confirmed</div></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><span class="ptitle">▸ NEEDS HUMAN REVIEW</span><span class="pmeta warn" id="nhCount">0</span></div>
+      <div class="pbody findings" id="needshuman"><div class="muted">none</div></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><span class="ptitle">▸ DEBATE PANEL</span></div>
+      <div class="pbody mini" id="debate"><div class="muted">no debates yet</div></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><span class="ptitle">▸ DEDUP LOG</span></div>
+      <div class="pbody mini" id="dedup"><div class="muted">no duplicates dropped</div></div>
+    </section>
+  </div>
+</main>
+
+<!-- finding detail modal -->
+<div class="modal" id="modal"><div class="modalbox"><button class="modalclose" id="modalClose">✕</button><div id="modalBody"></div></div></div>
+
+<!-- classification banner (bottom) -->
+<div class="classbar bottom"><span id="footstat">SYSTEM NOMINAL</span>&nbsp;//&nbsp;READ-ONLY&nbsp;//&nbsp;AUTHORIZED&nbsp;//&nbsp;SAFE-HARBOR</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -29,7 +29,7 @@ from ..orchestrator.blackboard import Blackboard
 from ..orchestrator.bus import MessageBus
 from ..orchestrator.event_log import EventLog
 from ..safety.scopeguard import ScopeGuard
-from .claude_hunter import ClaudeHunter, ClaudePoCProver, ClaudeVerifier
+from .claude_hunter import ClaudeDebate, ClaudeDeduplicator, ClaudeHunter, ClaudePoCProver, ClaudeVerifier
 from .claude_session import ClaudeFinding
 from .fuzz_engine import ClaudeFuzzer
 from .derive import derive_plan
@@ -127,6 +127,21 @@ class ClaudeSwarm:
         except ValueError:
             _cap = 0.0
         self._cost_cap: float | None = _cap if _cap > 0 else None
+        # STOP-AFTER-N-CRITICALS: once this many criticals are CONFIRMED, stop gracefully. Blank/
+        # unset/0 = never-quit (the default). No LLM cost — a simple round-boundary check.
+        try:
+            _mc = int(os.environ.get("P1HUNT_MAX_CRITICALS", "0") or 0)
+        except ValueError:
+            _mc = 0
+        self._max_criticals: int | None = _mc if _mc > 0 else None
+        # Confirmation-time dedup (on by default; cheap, only fires when prior confirmed exist) and
+        # the round-end debate panel on confirmed criticals (capped for token cost; 0 disables).
+        self._dedup_on = os.environ.get("P1HUNT_DEDUP", "1") != "0"
+        try:
+            self._debate_max = max(0, int(os.environ.get("P1HUNT_DEBATE_MAX", "3")))
+        except ValueError:
+            self._debate_max = 3
+        self._debated: set[str] = set()  # finding ids already through the debate panel
         # CROSS-ENGAGEMENT MEMORY: learn from our OWN confirmed findings across engagements. Records
         # on promote; recalled at arm time as fallible "hunt a new variant" priors (NOTHING PRESET —
         # derived from past wins, not a baked-in catalog). Disable with P1HUNT_MEMORY=0.
@@ -144,6 +159,25 @@ class ClaudeSwarm:
         self._perms = derive_permission_policy(scope)
         # Deterministic severity mapper bound to THIS program's own taxonomy (no preset tiers).
         self._severity = SeverityMapper(getattr(scope, "severity_taxonomy", {}) or {})
+
+    def _cpu_pct(self) -> float:
+        """Process+children CPU% since the last call (covers the swarm AND its claude subprocesses).
+        Best-effort: 0.0 if unavailable. Used for the UI status panel."""
+        import os as _os
+        import time as _t
+        try:
+            ti = _os.times()
+            cpu = ti.user + ti.system + ti.children_user + ti.children_system
+            now = _t.monotonic()
+            prev_cpu = getattr(self, "_prev_cpu", None)
+            prev_t = getattr(self, "_prev_cpu_t", None)
+            self._prev_cpu, self._prev_cpu_t = cpu, now
+            if prev_cpu is None or prev_t is None:
+                return 0.0
+            dt = now - prev_t
+            return round(100.0 * (cpu - prev_cpu) / dt, 1) if dt > 0 else 0.0
+        except Exception:
+            return 0.0
 
     def _emit(self, agent: str, kind: str, data: dict) -> None:
         import time as _t
@@ -914,6 +948,21 @@ class ClaudeSwarm:
         self.bb.set_scope(self.scope)
         self.bb.set_plan(plan)
 
+        import time as _t0mod
+        self._hunt_t0 = _t0mod.monotonic()  # hunt start, for the UI status panel's true uptime
+        # SETTINGS SNAPSHOT for the UI: the operative knobs in one event the cockpit can render.
+        m = self.config.models
+        self._emit(self.name, "lifecycle", {
+            "event": "settings", "program": self.scope.program, "target_class": self._target_class,
+            "max_criticals": self._max_criticals, "max_rounds": max_rounds,
+            "dedup": self._dedup_on, "debate_max": self._debate_max,
+            "run_mode": self.config.run_mode, "cost_cap_usd": self._cost_cap,
+            "models": {"orchestrator": m.orchestrator, "worker": m.worker, "falsifier": m.falsifier,
+                       "warm_pool": m.warm_pool, "debate": m.falsifier, "dedup": m.warm_pool},
+            "fuzz_campaigns": int(os.environ.get("P1HUNT_FUZZ_CAMPAIGNS", "1") or 1),
+            "second_opinion": os.environ.get("P1HUNT_SECOND_OPINION") == "1",
+            "recon_turns": int(os.environ.get("P1HUNT_RECON_TURNS", "45") or 45)})
+
         policy = plan.scopeguard_policy
         policy.allowlist = list(dict.fromkeys([*policy.allowlist, self.repo_path, str(self.poc_dir)]))
         # Propagate the operator's run mode into the ENFORCED policy and (only then) authorize any
@@ -1059,6 +1108,18 @@ class ClaudeSwarm:
                                      guard_check=self._guard_check(guard, "poc_prover"))
             prover.perms = self._perms
             prover.egress_hosts = self._egress_hosts
+            # Dedup agent (cheap model — confirmation-gate de-duplication) and the debate panel
+            # (strong model — round-end adversarial re-test of confirmed criticals).
+            self.bus.register("dedup", "verifier")
+            deduper = ClaudeDeduplicator("dedup", model=self.config.models.warm_pool, on_event=self._emit,
+                                         guard_check=self._guard_check(guard, "dedup"))
+            deduper.perms = self._perms
+            deduper.egress_hosts = self._egress_hosts
+            self.bus.register("debate", "verifier")
+            debate = ClaudeDebate("debate", model=self.config.models.falsifier, on_event=self._emit,
+                                  guard_check=self._guard_check(guard, "debate"))
+            debate.perms = self._perms
+            debate.egress_hosts = self._egress_hosts
 
             # FUZZING ENGINE (Pillar 1): one campaign per top subsystem. If a reference impl exists,
             # the first is a DIFFERENTIAL campaign (optimized vs reference) — the highest-yield search
@@ -1355,6 +1416,22 @@ class ClaudeSwarm:
                         continue
                     # Reproduced by a real runner -> a CONFIRMED finding (tier from the mapper).
                     tier = self._norm_tier(sev_label, self._severity.is_p1(impact))
+                    # DEDUP GATE: before publishing, check it isn't the SAME root cause as one already
+                    # confirmed (the swarm re-finds one bug many ways across rounds/hunters). Duplicate
+                    # -> drop quietly; distinct -> publish. Only runs when prior confirmed exist.
+                    if self._dedup_on and findings:
+                        try:
+                            is_dup, of_idx, why = await asyncio.wait_for(
+                                deduper.is_duplicate(cf, findings, self.repo_path), timeout=_verify_cap)
+                        except Exception:
+                            is_dup, of_idx, why = False, 0, "dedup error (kept)"
+                        if is_dup:
+                            if hyp:
+                                self.bb.set_state(hyp.id, HypState.CONFIRMED)
+                            self._emit(self.name, "lifecycle",
+                                       {"event": "duplicate_dropped", "title": cf.title,
+                                        "of": of_idx, "reason": why[:160]})
+                            continue
                     if hyp:
                         self.bb.set_state(hyp.id, HypState.CONFIRMED)
                     findings.append(self._promote(cf, f"{sev_rationale} | falsifier: {reason}", guard,
@@ -1368,6 +1445,37 @@ class ClaudeSwarm:
                     self._emit("poc_prover", "lifecycle",
                                {"event": "candidate_verify_error", "title": cf.title, "detail": str(exc)[:200]})
 
+                # DEBATE PANEL (round end, CRITICALS ONLY): adversarially re-test each newly-confirmed
+                # critical — a prosecutor argues to invalidate/downgrade, a defender argues it's a real
+                # critical, a judge rules. reject -> remove; downgrade -> lower severity (no longer a
+                # critical); uphold -> keep. Bounded by P1HUNT_DEBATE_MAX (0 disables) and deduped, so
+                # only a few distinct criticals are ever debated — keeps the token cost in check.
+                if self._debate_max and self.config.use_claude:
+                    _vt = float(os.environ.get("P1HUNT_VERIFY_TIMEOUT", "900"))
+                    pending = [f for f in findings
+                               if f.severity == "critical" and f.id not in self._debated][:self._debate_max]
+                    for f in pending:
+                        self._debated.add(f.id)
+                        try:
+                            verdict, sev, why = await asyncio.wait_for(
+                                debate.adjudicate(f, self.repo_path), timeout=_vt)
+                        except Exception as exc:
+                            self._emit(self.name, "lifecycle",
+                                       {"event": "debate_error", "title": f.title, "detail": str(exc)[:160]})
+                            continue
+                        if verdict == "reject":
+                            findings[:] = [x for x in findings if x.id != f.id]
+                            self._emit(self.name, "lifecycle",
+                                       {"event": "debate_rejected", "title": f.title, "reason": why[:200]})
+                        elif verdict == "downgrade":
+                            f.severity = sev if sev in ("high", "medium", "low") else "high"
+                            f.severity_rationale = f"[DEBATE-DOWNGRADED to {f.severity}] {why} | {f.severity_rationale}"
+                            self._emit(self.name, "lifecycle",
+                                       {"event": "debate_downgraded", "title": f.title,
+                                        "to": f.severity, "reason": why[:200]})
+                        else:
+                            self._emit(self.name, "lifecycle", {"event": "debate_upheld", "title": f.title})
+
                 # Find ALL criticals — do NOT stop at the first. Keep hunting/reframing across
                 # rounds (every lens deepening its angle) until the round cap or an operator stop,
                 # so multiple independent P1s surface rather than just the first one found.
@@ -1376,12 +1484,24 @@ class ClaudeSwarm:
                            {"phase": "round_summary", "round": depth, "criticals_total": crit,
                             "candidates_total": len(all_candidates), "needs_human": len(needs_human),
                             "spent_usd": round(self._spend_usd, 2),
-                            "cost_cap_usd": self._cost_cap})
+                            "cost_cap_usd": self._cost_cap, "max_criticals": self._max_criticals,
+                            "cpu_pct": self._cpu_pct(),
+                            "elapsed_s": int(_t.monotonic() - getattr(self, "_hunt_t0", round_start))})
                 # Persist findings each round so a later stop/kill always leaves them on disk.
                 self._write_findings_json(findings, all_candidates, needs_human)
                 # Persist a full RESUMABLE snapshot so a kill/rate-limit can be jump-started from here.
                 self._write_state(tracks, critical_means, hunters, findings, all_candidates, seen, depth,
                                   oracle_desc=reference_hint)
+
+                # STOP-AFTER-N-CRITICALS: if the operator set a target, stop once enough criticals are
+                # CONFIRMED (post-debate count). Unset = never-quit. Graceful: findings already on disk.
+                if self._max_criticals is not None and crit >= self._max_criticals:
+                    self._emit(self.name, "lifecycle",
+                               {"event": "criticals_target_reached", "confirmed_criticals": crit,
+                                "target": self._max_criticals, "round": depth})
+                    watchdog.cancel()
+                    self._stop_fork()
+                    return self._result(EngagementStatus.REPORT_READY, plan, guard, findings, all_candidates, depth)
 
                 # Rate-limit / dead-round BACKOFF (§8): a round that finished FAST and produced nothing
                 # (or whose sessions errored as rate-limited) means we're throttled — do NOT spin empty

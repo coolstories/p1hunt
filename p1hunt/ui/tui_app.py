@@ -86,11 +86,13 @@ class TuiState:
         self._t0 = time.monotonic()  # wall-clock start, for the header's elapsed timer
         self.round = 0               # latest round number seen (header headline)
         self.findings_full: list[dict] = []  # enriched confirmed-finding events → finding cards
+        self.settings: dict = {}     # config snapshot emitted by the swarm (Settings tab)
+        self.stats: dict = {}        # latest round stats (cpu, spend, counts) for the Settings tab
 
     # --- tabs -------------------------------------------------------------
     def tabs(self) -> list[str]:
         extra = ["run.log"] if self.run_log_path else []
-        return ["blackboard", "findings", "firehose"] + self.agent_order + extra
+        return ["blackboard", "settings", "findings", "firehose"] + self.agent_order + extra
 
     def toggle_theme(self) -> None:
         self.dark = not self.dark
@@ -210,7 +212,30 @@ class TuiState:
                     self._add(agent, "finding", f"★ {data.get('title','')} [{data.get('severity','')}]")
             elif kind == "lifecycle":
                 ev = data.get("event")
-                if ev == "spawn":
+                if ev == "settings":
+                    self.settings = dict(data)  # captured for the Settings tab (not a transcript line)
+                    return
+                elif ev == "duplicate_dropped":
+                    self._add("dedup", "verdict",
+                              f"♻ DUPLICATE of #{data.get('of','?')} — dropped: {str(data.get('reason',''))[:80]}")
+                elif ev == "debate_upheld":
+                    self._add("debate", "finding", f"⚖✓ DEBATE upheld critical: {str(data.get('title',''))[:60]}")
+                elif ev == "debate_downgraded":
+                    self._add("debate", "verdict",
+                              f"⚖↓ DEBATE downgraded → {data.get('to','?')}: {str(data.get('title',''))[:50]} — {str(data.get('reason',''))[:60]}")
+                elif ev == "debate_rejected":
+                    self._add("debate", "deny",
+                              f"⚖✗ DEBATE rejected: {str(data.get('title',''))[:50]} — {str(data.get('reason',''))[:60]}")
+                elif ev == "debate_error":
+                    self._add("debate", "system", f"⚖ debate error: {str(data.get('detail',''))[:80]}")
+                elif ev == "needs_human_review":
+                    self._add(agent, "verdict", f"⚠ NEEDS-HUMAN P1: {str(data.get('title',''))[:60]}")
+                elif ev == "criticals_target_reached":
+                    self._add("parent_a", "round",
+                              f"🎯 TARGET REACHED: {data.get('confirmed_criticals','?')}/{data.get('target','?')} criticals — stopping")
+                elif ev in ("memory_recalled", "dynamic_armed", "toolchain_missing_warning"):
+                    self._add("parent_a", "round", f"⚙ {ev}: {str({k:v for k,v in data.items() if k!='event'})[:90]}")
+                elif ev == "spawn":
                     self._add(agent, "system", "↳ spawned: " + str(data.get("path", ""))[:80])
                 elif ev == "poc_refuted":
                     self._add(agent, "verdict", f"🧪✗ PoC DISPROVED (dropped): {str(data.get('title',''))[:60]} — {str(data.get('detail',''))[:90]}")
@@ -257,7 +282,13 @@ class TuiState:
         elif d.get("phase") == "fuzz":
             self._add(agent, "system", f"⚗ {d.get('mode','')} fuzzing «{d.get('subsystem','')}» — {d.get('invariants',0)} invariants")
         elif d.get("phase") == "round_summary":
+            self.stats = {"round": d.get("round"), "criticals": d.get("criticals_total", 0),
+                          "candidates": d.get("candidates_total", 0), "needs_human": d.get("needs_human", 0),
+                          "spent_usd": d.get("spent_usd"), "cpu_pct": d.get("cpu_pct"),
+                          "elapsed_s": d.get("elapsed_s"), "max_criticals": d.get("max_criticals")}
             self._add(agent, "system", f"round {d.get('round')} — criticals {d.get('criticals_total',0)}, candidates {d.get('candidates_total',0)}")
+        elif d.get("phase") == "debate":
+            self._add("debate", "system", f"⚖ debate panel convened on: {str(d.get('title',''))[:70]}")
         elif d.get("phase") == "notice":
             self._add(agent, "round", f"📨 OPERATOR NOTICE: {d.get('notice','')}")
         elif d.get("phase") == "resteer":
@@ -298,11 +329,51 @@ class TuiState:
         rnd = f"r{self.round} · " if self.round else ""
         # Lead with the headline metric — confirmed P1 count — then round, elapsed, tokens, cost.
         p1str = f"{T.FINDING} {p1} P1" if p1 else "0 P1"
-        return (f"{self.program or 'hunt'}  ·  {p1str}  ·  {rnd}{elapsed}  ·  "
+        mc = self.stats.get("max_criticals") or self.settings.get("max_criticals")
+        target = f"/{mc}" if mc else ""
+        cpu = self.stats.get("cpu_pct")
+        cpustr = f"  ·  {cpu}% cpu" if cpu is not None else ""
+        return (f"{self.program or 'hunt'}  ·  {p1str}{target}  ·  {rnd}{elapsed}{cpustr}  ·  "
                 f"{fmt_tokens(t['total'])} tok · ${t['cost']:.2f}")
 
     def thread_entries(self, tab: str) -> list[tuple[str, str]]:
         with self.lock:
+            if tab == "settings":
+                s, st, t = self.settings, self.stats, self.tokens
+                def _yn(b): return "on" if b else "off"
+                mc = s.get("max_criticals") or st.get("max_criticals")
+                rows: list[tuple[str, str]] = [
+                    ("assign", "SETTINGS & STATUS — this run's configuration and live stats"),
+                    ("system", ""),
+                    ("round", "── run ──"),
+                    ("system", f"  program        : {s.get('program', self.program)}"),
+                    ("system", f"  target class   : {s.get('target_class','?')}"),
+                    ("system", f"  run mode       : {s.get('run_mode','?')}"),
+                    ("round", "── stop / scale ──"),
+                    ("system", f"  stop at criticals : {mc if mc else 'never-quit (unset)'}"),
+                    ("system", f"  max rounds        : {s.get('max_rounds') if s.get('max_rounds') is not None else 'unbounded'}"),
+                    ("system", f"  cost cap          : {('$'+str(s.get('cost_cap_usd'))) if s.get('cost_cap_usd') else 'none'}"),
+                    ("system", f"  fuzz campaigns    : {s.get('fuzz_campaigns','?')}   second-opinion: {_yn(s.get('second_opinion'))}"),
+                    ("round", "── gates ──"),
+                    ("system", f"  dedup agent    : {_yn(s.get('dedup'))}"),
+                    ("system", f"  debate panel   : max {s.get('debate_max','?')} criticals/round (0=off)"),
+                    ("system", f"  recon turns    : {s.get('recon_turns','?')}"),
+                    ("round", "── models ──"),
+                ]
+                for role, mdl in (s.get("models", {}) or {}).items():
+                    rows.append(("system", f"  {role:<13}: {mdl}"))
+                rows += [
+                    ("round", "── live status ──"),
+                    ("finding", f"  confirmed criticals : {sum(1 for sv,_ in self.confirmed if str(sv).lower()=='critical')}"
+                                f"{('/'+str(mc)) if mc else ''}"),
+                    ("system", f"  needs-human / candidates : {st.get('needs_human','?')} / {st.get('candidates','?')}"),
+                    ("system", f"  round              : {st.get('round', self.round)}"),
+                    ("system", f"  uptime             : {T.fmt_duration(st['elapsed_s']) if st.get('elapsed_s') is not None else T.fmt_duration(time.monotonic()-self._t0)}"),
+                    ("system", f"  CPU                : {st.get('cpu_pct','?')}%"),
+                    ("system", f"  tokens / cost      : {fmt_tokens(t['total'])} · ${t['cost']:.2f}"),
+                    ("system", f"  events ingested    : {self.nevents}"),
+                ]
+                return rows
             if tab == "run.log":
                 import re
                 from pathlib import Path

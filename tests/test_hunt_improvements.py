@@ -191,5 +191,69 @@ class TestDryRunEgress(unittest.TestCase):
         self.assertTrue(d.allow)
 
 
+class TestDedupAndDebate(unittest.TestCase):
+    def _cf(self, **kw):
+        base = {"title": "t", "file": "a.cpp", "line": 1, "root_cause": "rc", "counterfactual": "cf"}
+        base.update(kw)
+        return ClaudeFinding.from_dict(base, "lens")
+
+    def _finding(self, title, rc):
+        from p1hunt.models import ArtifactRef, Finding, Hypothesis, SafeValidationPlan
+        return Finding(id="F1", hypothesis_id="h", title=title, root_cause=rc,
+                       poc=ArtifactRef(id="a", kind="repro", path="x.cpp:1", description="", reproduced=True),
+                       severity="critical", severity_rationale="r", counterfactual="c",
+                       remediation="fix", safe_harbor_attestation="att", verified=True)
+
+    def test_dedup_prompt_lists_existing(self):
+        from p1hunt.agents.claude_hunter import dedup_prompt
+        p = dedup_prompt(self._cf(title="nonce reuse v2"),
+                         [self._finding("nonce reuse", "presig resurrected")])
+        self.assertIn("deduplicator", p.lower())
+        self.assertIn("nonce reuse", p)            # existing one listed
+        self.assertIn("duplicate", p)
+
+    def test_debate_prompts_have_both_sides(self):
+        from p1hunt.agents.claude_hunter import debate_prompt, debate_judge_prompt
+        self.assertIn("PROSECUTOR", debate_prompt(self._cf(), "prosecutor"))
+        self.assertIn("DEFENDER", debate_prompt(self._cf(), "defender"))
+        j = debate_judge_prompt(self._cf(), "pros argument", "def argument")
+        self.assertIn("uphold|downgrade|reject", j)
+        self.assertIn("JUDGE", j)
+
+
+class TestStopAndPanelConfig(unittest.TestCase):
+    def _swarm_with_env(self, tmp, **env):
+        import os
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update({k: str(v) for k, v in env.items()})
+        try:
+            return _swarm(tmp)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_max_criticals_parsed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._swarm_with_env(tmp, P1HUNT_MAX_CRITICALS=3)._max_criticals, 3)
+
+    def test_max_criticals_blank_means_never_quit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(self._swarm_with_env(tmp, P1HUNT_MAX_CRITICALS=0)._max_criticals)
+            self.assertIsNone(_swarm(tmp)._max_criticals)  # unset -> None
+
+    def test_debate_and_dedup_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sw = _swarm(tmp)
+            self.assertTrue(sw._dedup_on)        # dedup on by default
+            self.assertEqual(sw._debate_max, 3)  # bounded debate by default
+
+    def test_debate_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._swarm_with_env(tmp, P1HUNT_DEBATE_MAX=0)._debate_max, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

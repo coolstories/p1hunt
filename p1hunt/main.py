@@ -213,6 +213,20 @@ def _hunt(args: argparse.Namespace) -> int:
         # same folder because the eng_id is derived from the program, so do NOT wipe it.)
         os.environ["P1HUNT_RESUME"] = "1"
         print("↻ RESUME mode: continuing from saved state (no cold re-scope).")
+    # AUTO-SCOPE: no target given but a program name is → research the engagement on its platform,
+    # confirm safe harbor, pull ONLY the chosen in-scope source, and record out-of-scope.
+    if not args.target:
+        if not args.program:
+            print("Give a target (path/URL), or --program (+ --platform) to auto-discover the scope.")
+            return 2
+        auto = _auto_scope(config, args.program, args.platform,
+                           getattr(args, "only", "") or "", getattr(args, "url", "") or "")
+        if auto is None:
+            return 2
+        args.target = auto["repo"]
+        if auto.get("oos_globs"):
+            merged = [g for g in [(args.out_of_scope or ""), *auto["oos_globs"]] if g]
+            args.out_of_scope = ",".join(merged)
     program = args.program or f"Ad-hoc engagement ({args.target})"
     oos = [g.strip() for g in (args.out_of_scope or "").split(",") if g.strip()]
     # Authorized LIVE dynamic target (web/API criticals): from --base-url or P1HUNT_BASE_URL/GQL.
@@ -318,6 +332,72 @@ def _platform_of(url: str) -> str:
         if p in u:
             return p
     return "bug-bounty"
+
+
+def select_in_scope_repo(brief: dict, *, only: str = "", program: str = "") -> tuple[str | None, list[str]]:
+    """From a researched brief, pick the ONE in-scope repo to scan (the one matching --only, else the
+    program name, else the first) and return (chosen, other_in_scope_repos). Pure — no I/O."""
+    repos = [r for r in (brief.get("repos") or []) if isinstance(r, str) and r.strip()]
+    if not repos:
+        return None, []
+    needle = (only or program or "").lower().replace(" ", "").replace("-", "")
+    matches = [r for r in repos if needle and needle in r.lower().replace(" ", "").replace("-", "")]
+    chosen = (matches or repos)[0]
+    return chosen, [r for r in repos if r != chosen]
+
+
+def out_of_scope_globs(brief: dict) -> list[str]:
+    """Path-type out-of-scope entries from a brief → globs the ScopeGuard can enforce in the repo."""
+    out: list[str] = []
+    for o in (brief.get("out_of_scope") or []):
+        if isinstance(o, dict) and o.get("kind") == "path" and o.get("value"):
+            out.append(str(o["value"]).strip())
+    return out
+
+
+def _auto_scope(config: Config, program: str, platform: str, only: str, url: str) -> dict | None:
+    """Research a program by NAME (+platform) over the live web, confirm safe harbor, and return
+    {repo, oos_globs, brief} — or None to abort. ONLY the single chosen in-scope repo is scanned;
+    out-of-scope is recorded and (for path entries) enforced. Refuses to guess if scope is unconfirmed."""
+    from .intake_agent import research_program
+
+    if not config.use_claude:
+        print("Auto-scope needs the Claude brain for web research — install/auth the SDK, or pass a target path/URL.")
+        return None
+    print(f"\n🔎 Researching {platform or 'bug-bounty'} program '{program}'… (live web)")
+    brief = asyncio.run(
+        research_program(program, url or "", only, platform=platform, model=config.models.orchestrator)
+    )
+    if not brief.get("_ok"):
+        print(f"  Could not read the program: {brief.get('_error') or brief.get('notes') or 'unknown'}")
+        return None
+    if brief.get("safe_harbor") is False:
+        print("  ⚠ This program does not appear to authorize testing (no safe harbor). Aborting per safe-harbor policy.")
+        return None
+    repo, others = select_in_scope_repo(brief, only=only, program=program)
+    if not repo:
+        print("  No in-scope SOURCE repository was found. " + str(brief.get("notes", ""))[:200])
+        print("  (Pass an explicit target path/URL if you already have the in-scope source.)")
+        return None
+
+    print("\n\033[32m✓ Scope discovered\033[0m")
+    if brief.get("policy_url"):
+        print(f"  policy   : {brief['policy_url']}")
+    if brief.get("summary"):
+        print(f"  about    : {brief['summary']}")
+    if brief.get("critical_means"):
+        print(f"  P1 means : {brief['critical_means']}")
+    if brief.get("rules"):
+        print("  rules    : " + "; ".join(brief["rules"][:3]))
+    print(f"  IN-SCOPE → {repo}" + (f"   (matched '{only}')" if only else ""))
+    if others:
+        print(f"  not scanned (other in-scope): {', '.join(others[:4])}")
+    oos = brief.get("out_of_scope") or []
+    if oos:
+        print("  OUT-OF-SCOPE:")
+        for o in oos[:8]:
+            print(f"    ✗ {o.get('value') if isinstance(o, dict) else o}")
+    return {"repo": repo, "oos_globs": out_of_scope_globs(brief), "brief": brief}
 
 
 def _scope_from_brief(name: str, brief: dict, repo_value: str, platform: str) -> Scope:
@@ -509,6 +589,11 @@ def _jumpstart(args: argparse.Namespace) -> int:
     return 0
 
 
+def _web(args: argparse.Namespace) -> int:
+    from .web.server import serve
+    return serve(args.host, args.port)
+
+
 def _status(_args: argparse.Namespace) -> int:
     config = Config.from_env()
     from .agents.claude_session import _THROTTLE_FILE, sdk_available
@@ -557,9 +642,18 @@ def main(argv: list[str] | None = None) -> int:
     demo.set_defaults(func=_demo)
 
     hunt = sub.add_parser("hunt", help="Hunt a REAL target (local path or repo URL) with the Claude swarm.")
-    hunt.add_argument("target", help="Local path to a repo, or a git/GitHub URL to clone.")
-    hunt.add_argument("--program", help="Program/engagement name.")
-    hunt.add_argument("--platform", default="local")
+    hunt.add_argument("target", nargs="?", default="",
+                      help="Local path to a repo, or a git/GitHub URL to clone. OPTIONAL when you pass "
+                           "--program (+ --platform): the swarm then auto-discovers the engagement scope "
+                           "and pulls the in-scope source itself.")
+    hunt.add_argument("--program", help="Program/engagement name (e.g. 'Seaport'). With no target, this "
+                                        "triggers live auto-scoping from the bounty platform.")
+    hunt.add_argument("--platform", default="local",
+                      help="Bounty platform to research for auto-scope (bugcrowd|hackerone|immunefi|…).")
+    hunt.add_argument("--only", default="",
+                      help="Restrict auto-scope to the in-scope asset matching this (e.g. 'seaport').")
+    hunt.add_argument("--url", default="",
+                      help="Explicit program/policy URL (skips the discovery search step).")
     hunt.add_argument("--max-rounds", type=int, default=None, dest="max_rounds",
                       help="Optional safety cap. Default: never stop until a critical is confirmed.")
     hunt.add_argument("--live", action="store_true", help="Stream Claude's reasoning and tool calls live (scrolling).")
@@ -610,6 +704,11 @@ def main(argv: list[str] | None = None) -> int:
 
     status = sub.add_parser("status", help="Show detector brain, run mode, models, rate-limit gate, and config.")
     status.set_defaults(func=_status)
+
+    web = sub.add_parser("web", help="Launch the Threat Operations Center — a live web dashboard over the engagements.")
+    web.add_argument("--host", default="127.0.0.1", help="bind address (default loopback)")
+    web.add_argument("--port", type=int, default=8787)
+    web.set_defaults(func=_web)
 
     jump = sub.add_parser("jumpstart", help="Override the rate-limit cooldown: tell a waiting hunt to retry NOW (and print how to resume a dead one).")
     jump.set_defaults(func=_jumpstart)
