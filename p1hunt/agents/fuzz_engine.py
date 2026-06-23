@@ -66,6 +66,7 @@ def fuzz_prompt(
     build_status: str = "",
     coverage_hint: str = "",
     entrypoints: list[str] | None = None,
+    poc_reldir: str = ".p1hunt-poc",
 ) -> str:
     inv = "\n  - ".join(invariants) if invariants else "(derive the invariants yourself from the code)"
     files = "\n  - ".join(focus_files[:8]) if focus_files else "(find the relevant in-scope files)"
@@ -132,13 +133,15 @@ METHOD (execution is the whole point):
    can't deploy the real code proves nothing. Then build your harness against the REAL contracts.
    If a tool you need is missing (forge/anvil, cmake, a compiler, a fuzzer), INSTALL it yourself —
    sudo package manager, pip/cargo/npm/go, or an official installer are all permitted.
-1. Write a fuzzing/invariant harness in the target's OWN test framework into ./.p1hunt-poc/ —
+1. Write a fuzzing/invariant harness in the target's OWN test framework into ./{poc_reldir}/ (this path
+   is ALREADY inside the project's build/test tree, so the toolchain compiles & discovers it and imports
+   resolve — do NOT write tests elsewhere or forge will report "No tests found") —
    for Solidity a Foundry test (a `Handler` contract + `invariant_*` functions, or a `testFuzz_*`/
    differential test); for Go `go test -fuzz`; for Rust `cargo fuzz`/`proptest`; for Python
    Hypothesis; for a web API a property-based request loop. Target the REAL contracts/functions,
    not a toy reimplementation. Use the SCAFFOLD above so you reach PAST gates (signatures, approvals)
    into the value-moving logic.
-2. RUN it for real (e.g. `forge test --match-path ./.p1hunt-poc/X.t.sol -vvv`, raising fuzz runs/
+2. RUN it for real (e.g. `forge test --match-path '{poc_reldir}/X.t.sol' -vvv`, raising fuzz runs/
    depth via flags or a foundry.toml profile). Iterate until it COMPILES and actually fuzzes — fix
    harness bugs; a harness that doesn't run proves nothing.{fork_line}
 3. Read the result. A FAILED invariant / divergence / failing assertion WITH a counterexample =
@@ -160,7 +163,7 @@ Report ONLY JSON:
    "concrete_loss": "the loss actually demonstrated — funds|data|control|availability|none",
    "remediation": "the specific fix for THIS root cause (derived, not generic)",
    "confidence": "high|medium|low",
-   "poc": "path to the harness under .p1hunt-poc + command + the forge counterexample output proving it",
+   "poc": "path to the harness under {poc_reldir} + command + the forge counterexample output proving it",
    "evidence": "the exact failing assertion + counterexample sequence from the run"}}],
  "coverage": ["<what input space / invariants you fuzzed and how deep, so the next pass widens it>"],
  "covered": ["<the exact entrypoints/functions your harness actually EXERCISED this round (so the next pass targets the dark ones)>"]}}
@@ -225,7 +228,8 @@ class ClaudeFuzzer:
                              reference_hint=reference_hint, known_patterns=known_patterns,
                              prior_counterexamples=prior, scaffold=scaffold, fork_url=fork_url,
                              build_status=build_status, coverage_hint=coverage_hint,
-                             entrypoints=entrypoints)
+                             entrypoints=entrypoints,
+                             poc_reldir=getattr(self, "poc_reldir", ".p1hunt-poc"))
         res: SessionResult = await session.run(prompt, repo_path, lens=subsystem)
         parsed = _parse_obj(res.text)
         findings = list(live)

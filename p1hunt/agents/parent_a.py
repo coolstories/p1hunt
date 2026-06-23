@@ -69,6 +69,11 @@ class HuntResult:
     demoted_to_warm_pool: bool
     attestation: str
     candidates: list = field(default_factory=list)  # all surfaced candidates (real-scan visibility)
+    # Believed-real, high-confidence P1s the Falsifier accepted but the deterministic runner could
+    # NOT auto-reproduce (no live target / no runner / hard-to-harness). GENUINE output — surfaced
+    # here so confirmed_critical=0 never reads as "found nothing" (the reproduce-or-bust gate is
+    # also what parks true positives). Triage these.
+    needs_human: list = field(default_factory=list)
     brain: str = "deterministic"  # "claude" | "deterministic"
     confirmed_critical: bool = field(init=False)
 

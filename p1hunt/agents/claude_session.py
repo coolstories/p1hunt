@@ -491,7 +491,12 @@ class ClaudeSession:
                 return True, "web research (technique/spec)", None
             if tool_name in ("Task", "Agent"):
                 # Sub-agent dispatch is allowed; the sub-agent's OWN tool calls hit this same hook,
-                # so the workspace-jail still gates everything it does.
+                # so the workspace-jail still gates everything it does. Emit a lifecycle marker so the
+                # cockpit shows "working (sub-agent)" instead of the thread looking FROZEN while the
+                # sub-agent reads silently (the main cause of an agent appearing stuck).
+                _desc = str(tool_input.get("description") or tool_input.get("prompt") or "deep read")[:80]
+                self.on_event(self.agent_name, "lifecycle",
+                              {"event": "subagent", "detail": f"dispatched sub-agent: {_desc}"})
                 return True, "sub-agent dispatch", None
             if tool_name.startswith("mcp__p1hunt__"):
                 return True, "blackboard write (write-only)", None
@@ -647,22 +652,33 @@ class ClaudeSession:
         # attempting (so we never spin/hammer the API). Resumes the instant the window clears.
         await _await_throttle(self.on_event, self.agent_name)
 
-        # Try the configured model; if it is usage/rate-limited (Opus throttles first),
-        # downgrade and retry so the swarm keeps working rather than silently degrading.
-        candidates: list[str | None] = []
-        for m in (self.model, "sonnet", None):
-            if m not in candidates:
-                candidates.append(m)
+        # Try the configured model; if it is usage/rate-limited (Opus throttles first), normally
+        # downgrade and retry so the swarm keeps working. But silently dropping a DEEP reasoning
+        # agent from Opus to Sonnet mid-hunt quietly degrades discovery quality — so when
+        # P1HUNT_NO_MODEL_DOWNGRADE=1, we do NOT downgrade: we trip the shared cooldown and wait,
+        # then retry on the SAME (strongest) model. Keeps every discovery turn at full capability.
+        no_downgrade = os.environ.get("P1HUNT_NO_MODEL_DOWNGRADE", "0") == "1"
+        candidates: list[str | None] = [self.model]
+        if not no_downgrade:
+            for m in ("sonnet", None):
+                if m not in candidates:
+                    candidates.append(m)
         last = SessionResult(ok=False, text="", error="no attempt")
         for model in candidates:
             last = await _attempt(model)
             if last.ok:
                 _clear_throttle()  # window is open again — release the whole swarm
+                self.on_event(self.agent_name, "lifecycle",
+                              {"event": "model_status", "engine": "claude",
+                               "model": str(model or self.model), "state": "available"})
                 return last
             if last.error != "rate_limited":
                 return last
             self.on_event(self.agent_name, "lifecycle",
                           {"event": "model_downgrade", "from": str(model), "reason": "usage/rate limit"})
+            self.on_event(self.agent_name, "lifecycle",
+                          {"event": "model_status", "engine": "claude",
+                           "model": str(model or self.model), "state": "rate_limited"})
         # Every model was throttled → trip the shared cooldown so all sessions back off together.
         backoff = _trip_throttle(reason=f"{self.agent_name} exhausted all models")
         self.on_event(self.agent_name, "lifecycle",

@@ -21,6 +21,13 @@ class Models:
     #                                   reasoning is the primary way a P1 is found on hardened code
     warm_pool: str = "claude-haiku-4-5"
     falsifier: str = "claude-opus-4-8"
+    # DISCOVERY ENGINE: which model drives the HUNTERS (the discovery phase). "claude" (default)
+    # runs the Claude hunters; "codex" runs OpenAI's Codex CLI (GPT-5.5-Codex) at xhigh reasoning
+    # — a second strong model to widen what gets found (EVMbench model-alloy). Verification, PoC,
+    # and the exploit-development depth phase ALWAYS stay on Claude regardless.
+    discovery_engine: str = "claude"        # "claude" | "codex"
+    codex_model: str = ""                   # "" = codex account default (ChatGPT auth rejects slugs)
+    codex_effort: str = "xhigh"             # minimal | low | medium | high | xhigh
 
 
 @dataclass
@@ -82,6 +89,11 @@ class Config:
 
         env_flag = os.environ.get("P1HUNT_USE_CLAUDE")
         cfg.use_claude = (env_flag == "1") if env_flag is not None else sdk_available()
+        # DISCOVERY ENGINE selector (Claude hunters by default; Codex GPT-5.5-Codex xhigh opt-in).
+        _eng = os.environ.get("P1HUNT_DISCOVERY_ENGINE", cfg.models.discovery_engine).strip().lower()
+        cfg.models.discovery_engine = _eng if _eng in ("claude", "codex") else "claude"
+        cfg.models.codex_model = os.environ.get("P1HUNT_CODEX_MODEL", cfg.models.codex_model)
+        cfg.models.codex_effort = os.environ.get("P1HUNT_CODEX_EFFORT", cfg.models.codex_effort)
         cfg.provision = os.environ.get("P1HUNT_PROVISION", "1") != "0"
         cfg.provision_network = os.environ.get("P1HUNT_PROVISION_NETWORK", "1") != "0"
         cfg.auto_install_toolchain = os.environ.get("P1HUNT_AUTO_INSTALL_TOOLCHAIN", "0") == "1"

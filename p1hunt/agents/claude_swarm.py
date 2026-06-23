@@ -29,7 +29,14 @@ from ..orchestrator.blackboard import Blackboard
 from ..orchestrator.bus import MessageBus
 from ..orchestrator.event_log import EventLog
 from ..safety.scopeguard import ScopeGuard
-from .claude_hunter import ClaudeDebate, ClaudeDeduplicator, ClaudeHunter, ClaudePoCProver, ClaudeVerifier
+from .claude_hunter import (
+    ClaudeDebate,
+    ClaudeDeduplicator,
+    ClaudeExploitDeveloper,
+    ClaudeHunter,
+    ClaudePoCProver,
+    ClaudeVerifier,
+)
 from .claude_session import ClaudeFinding
 from .fuzz_engine import ClaudeFuzzer
 from .derive import derive_plan
@@ -51,6 +58,30 @@ _LENSES = [
 ]
 
 
+def _poc_reldir(repo_path) -> str:
+    """The relative dir (under the target repo) where PoC harnesses must be written so the target's
+    OWN toolchain can actually RUN them.
+
+    For a Foundry project this MUST sit inside the project's configured ``test`` tree: files outside
+    ``src``/``test`` are not compiled, so ``forge test --match-path`` reports "No tests found" and
+    remappings (e.g. ``seaport-core/``) fail to resolve. This was the single biggest reason real PoCs
+    never executed (every harness was written to ``.p1hunt-poc/``, which Foundry ignores). We nest
+    under ``<test_dir>/p1hunt`` so the harnesses are discovered, compile, and resolve imports, while
+    staying clearly separated from the project's own tests. Non-Foundry targets keep ``.p1hunt-poc``.
+    """
+    import re
+    try:
+        ft = Path(repo_path) / "foundry.toml"
+        if ft.is_file():
+            # First `test = '...'` is the default profile's test dir (Foundry convention).
+            m = re.search(r"(?m)^\s*test\s*=\s*['\"]([^'\"]+)['\"]", ft.read_text(encoding="utf-8", errors="replace"))
+            test_dir = (m.group(1).strip().rstrip("/") if m else "test") or "test"
+            return f"{test_dir}/p1hunt"
+    except Exception:
+        pass
+    return ".p1hunt-poc"
+
+
 class ClaudeSwarm:
     def __init__(
         self,
@@ -69,6 +100,19 @@ class ClaudeSwarm:
         self.bus = bus
         self.bb = blackboard
         self.log = event_log
+        # DEEP-DISCOVERY mode: trade breadth for sustained depth — fewer concurrent hunters, each
+        # with a much larger turn + wall-clock budget, so a single hard lead gets the hours of
+        # compounding reasoning a hardened-target critical needs (instead of many short shallow
+        # passes). Also reduces parallel API load -> less rate-limit downgrade (see Fix #3).
+        self._deep_discovery = os.environ.get("P1HUNT_DEEP_DISCOVERY", "0") == "1"
+        try:
+            _mc_env = int(os.environ.get("P1HUNT_MAX_CONCURRENCY", "0") or 0)
+        except ValueError:
+            _mc_env = 0
+        if _mc_env > 0:
+            max_concurrency = _mc_env
+        elif self._deep_discovery:
+            max_concurrency = min(max_concurrency, 2)  # fewer, deeper hunters -> full quota each
         self.sem = asyncio.Semaphore(max_concurrency)
         self.name = "parent_a"
         self._safety_event = False
@@ -90,7 +134,11 @@ class ClaudeSwarm:
         self._healing = False
         self._heals = 0
         # PoC sandbox: the ONLY place agents may write (proof-of-concept files), never source.
-        self.poc_dir = Path(repo_path) / ".p1hunt-poc"
+        # For a Foundry target this MUST live inside the project's configured `test` tree — otherwise
+        # `forge test` cannot compile/discover the harness and remappings break (the #1 reason every
+        # PoC silently never ran in the Seaport engagement). See _poc_reldir.
+        self.poc_reldir = _poc_reldir(repo_path)
+        self.poc_dir = Path(repo_path) / self.poc_reldir
         self.poc_dir.mkdir(parents=True, exist_ok=True)
         self.bus.register(self.name, "parent")
         # THE ONE HARD GUARDRAIL: the in-scope workspace folder. Agents may do anything INSIDE it
@@ -141,7 +189,39 @@ class ClaudeSwarm:
             self._debate_max = max(0, int(os.environ.get("P1HUNT_DEBATE_MAX", "3")))
         except ValueError:
             self._debate_max = 3
-        self._debated: set[str] = set()  # finding ids already through the debate panel
+        # Debate-panel ledgers, keyed by a STABLE finding key (not the ephemeral id) so a finding
+        # that is re-found in a later round inherits its prior debate verdict. A critical is only
+        # ever written as a CONFIRMED critical if debate UPHELD it (when debate is enabled); a
+        # rejected one can never come back, and a downgraded one is recorded at its lowered severity.
+        self._debated: set[str] = set()           # keys already adjudicated by the panel
+        self._debate_rejected: set[str] = set()   # keys debate rejected -> never confirmed
+        self._debate_upheld: set[str] = set()     # keys debate upheld -> eligible to be confirmed
+        self._debate_downgraded: dict[str, str] = {}  # key -> downgraded severity
+        # EXPLOIT-DEVELOPMENT DEPTH PHASE: the organ that turns a believed primitive into a PROVEN
+        # attacker-win. When enabled, a critical is confirmed ONLY if this phase demonstrated the
+        # rubric's attacker-win in shipped code (primitive != critical). Bounded by top-N per round.
+        self._deepdive_on = os.environ.get("P1HUNT_DEEPDIVE", "1") != "0"
+        try:
+            self._deepdive_top_n = max(1, int(os.environ.get("P1HUNT_DEEPDIVE_TOP_N", "2")))
+        except ValueError:
+            self._deepdive_top_n = 2
+        try:
+            self._deepdive_turns = max(20, int(os.environ.get("P1HUNT_DEEPDIVE_TURNS", "60")))
+        except ValueError:
+            self._deepdive_turns = 60
+        self._exploit_proven: set[str] = set()    # keys with a DEMONSTRATED attacker-win (shipped code)
+        self._deepdived: set[str] = set()         # legacy; pursuit now tracked in _lead_log
+        # PERSISTENT LEAD PURSUIT (tenacity): a promising lead is RE-attacked with a DIFFERENT angle
+        # across rounds instead of being abandoned after one failed PoC. Each key maps to
+        # {"attempts": [{strategy, why_failed}], "status": "open|proven|exhausted|maxed"}. A lead
+        # closes ONLY on a proven win or a rigorous cross-angle impossibility; after a hard attempt
+        # cap it is PARKED (needs_human), never silently dropped. Failed attempts decay its priority
+        # so the engine rotates to fresher leads but keeps cycling back.
+        self._lead_log: dict[str, dict] = {}
+        try:
+            self._lead_max_attempts = max(1, int(os.environ.get("P1HUNT_LEAD_MAX_ATTEMPTS", "5")))
+        except ValueError:
+            self._lead_max_attempts = 5
         # CROSS-ENGAGEMENT MEMORY: learn from our OWN confirmed findings across engagements. Records
         # on promote; recalled at arm time as fallible "hunt a new variant" priors (NOTHING PRESET —
         # derived from past wins, not a baked-in catalog). Disable with P1HUNT_MEMORY=0.
@@ -317,6 +397,70 @@ class ClaudeSwarm:
             # token without "/" or "*" is treated as a directory, handled by the boundary check above.
         return False
 
+    def _finding_key(self, f) -> str:
+        """A STABLE identity for a finding across rounds (title + file), so debate verdicts persist
+        even when the finding is re-discovered with a fresh ephemeral id."""
+        return f"{(getattr(f, 'title', '') or '').strip().lower()[:140]}|{getattr(f, 'file', '') or ''}"
+
+    def _lead_attempts(self, key: str) -> int:
+        return len(self._lead_log.get(key, {}).get("attempts", []))
+
+    def _lead_status(self, key: str) -> str:
+        return self._lead_log.get(key, {}).get("status", "open")
+
+    def _lead_open(self, key: str) -> bool:
+        """True if this lead should still be PURSUED — not proven, not exhausted, not over the
+        attempt cap. This is what makes the engine tenacious instead of one-and-done."""
+        if key in self._exploit_proven:
+            return False
+        if self._lead_status(key) in ("proven", "exhausted", "maxed"):
+            return False
+        return self._lead_attempts(key) < self._lead_max_attempts
+
+    def _record_lead_attempt(self, key: str, verdict: dict | None) -> str:
+        """Log one failed attempt and decide the lead's next state: 'exhausted' (rigorous
+        impossibility -> stop), 'maxed' (hit the attempt cap -> park as needs_human), or 'open'
+        (keep pursuing next round with a fresh angle). Returns the new status."""
+        rec = self._lead_log.setdefault(key, {"attempts": [], "status": "open"})
+        v = verdict or {}
+        rec["attempts"].append({
+            "strategy": str(v.get("strategy", "") or "attempt")[:200],
+            "why_failed": str(v.get("why_failed", "") or v.get("impossibility", "")
+                              or v.get("evidence", ""))[:300],
+        })
+        if v.get("exhausted"):
+            rec["status"] = "exhausted"
+        elif len(rec["attempts"]) >= self._lead_max_attempts:
+            rec["status"] = "maxed"
+        else:
+            rec["status"] = "open"
+        return rec["status"]
+
+    def _confirmed_crits(self, findings) -> list:
+        """The findings that count as CONFIRMED CRITICALS — the single source of truth, enforcing the
+        debate gate. A critical qualifies ONLY if: (a) debate did not reject it, (b) it isn't
+        debate-downgraded below critical, and (c) when the debate panel is enabled, debate UPHELD it.
+        Pending-debate criticals are intentionally NOT confirmed yet (they confirm once upheld)."""
+        gate = bool(self._debate_max) and self.config.use_claude
+        deepdive = self._deepdive_on and self.config.use_claude
+        out = []
+        for f in findings:
+            key = self._finding_key(f)
+            if key in self._debate_rejected:
+                continue
+            sev = self._debate_downgraded.get(key, getattr(f, "severity", ""))
+            if sev != "critical":
+                continue
+            if deepdive:
+                # GOLD STANDARD: a critical is confirmed ONLY if the exploit-development phase
+                # demonstrated the attacker-win in shipped code. A primitive is not a critical.
+                if key not in self._exploit_proven:
+                    continue
+            elif gate and key not in self._debate_upheld:
+                continue  # no deep-dive: fall back to the debate gate
+            out.append(f)
+        return out
+
     def _write_findings_json(self, findings, candidates, needs_human=None) -> None:
         """Persist the current findings to ``findings.json`` in the engagement folder. Called at
         every round boundary (so it's always fresh) and on stop/cap — when the scan is stopped,
@@ -330,7 +474,7 @@ class ClaudeSwarm:
         if path is None:
             return
         out = Path(path).with_name("findings.json")
-        crits = [f for f in findings if f.severity == "critical"]
+        crits = self._confirmed_crits(findings)  # debate-gated: only criticals that survived the panel
         nh = needs_human or []
         doc = {
             "program": self.scope.program,
@@ -862,10 +1006,13 @@ class ClaudeSwarm:
     def _hunter_base_turns(self) -> int:
         """Base per-round turn budget for a hunter (P1HUNT_HUNTER_TURNS). Adaptive budget scales
         promising tracks UP from this and lets exhausted ones fall back to it (see hunt loop)."""
+        # Deep-discovery raises the floor so a hunter can sustain a long, compounding investigation
+        # within a round (its accumulated `model` already carries across rounds). Env always wins.
+        _default = 80 if self._deep_discovery else 28
         try:
-            return max(8, int(os.environ.get("P1HUNT_HUNTER_TURNS", "28")))
+            return max(8, int(os.environ.get("P1HUNT_HUNTER_TURNS", str(_default))))
         except ValueError:
-            return 28
+            return _default
 
     def _retune_budgets(self, hunters, per_hunter) -> None:
         """ADAPTIVE BUDGET (§8): pour more turns into the tracks showing real leads and let cold
@@ -956,8 +1103,16 @@ class ClaudeSwarm:
             "event": "settings", "program": self.scope.program, "target_class": self._target_class,
             "max_criticals": self._max_criticals, "max_rounds": max_rounds,
             "dedup": self._dedup_on, "debate_max": self._debate_max,
+            "deepdive": self._deepdive_on, "deepdive_top_n": self._deepdive_top_n,
+            "deepdive_turns": self._deepdive_turns, "lead_max_attempts": self._lead_max_attempts,
+            "deep_discovery": self._deep_discovery,
+            "no_model_downgrade": os.environ.get("P1HUNT_NO_MODEL_DOWNGRADE", "0") == "1",
             "run_mode": self.config.run_mode, "cost_cap_usd": self._cost_cap,
-            "models": {"orchestrator": m.orchestrator, "worker": m.worker, "falsifier": m.falsifier,
+            "discovery_engine": m.discovery_engine,
+            "models": {"orchestrator": m.orchestrator,
+                       "worker": (f"codex:{m.codex_model}/{m.codex_effort}"
+                                  if m.discovery_engine == "codex" else m.worker),
+                       "falsifier": m.falsifier,
                        "warm_pool": m.warm_pool, "debate": m.falsifier, "dedup": m.warm_pool},
             "fuzz_campaigns": int(os.environ.get("P1HUNT_FUZZ_CAMPAIGNS", "1") or 1),
             "second_opinion": os.environ.get("P1HUNT_SECOND_OPINION") == "1",
@@ -1067,6 +1222,18 @@ class ClaudeSwarm:
                 h.fuzz_mode = str(tr.get("fuzz_mode", "") or "")
                 h.perms = self._perms  # Parent A's permission posture for this engagement
                 h.egress_hosts = self._egress_hosts  # live-testing host jail (None = static mode)
+                h.poc_reldir = self.poc_reldir  # where forge can actually compile/run PoCs
+                # Discovery engine: Claude hunters by default, or optional Codex (GPT-5.5-Codex xhigh).
+                h.discovery_engine = self.config.models.discovery_engine
+                h.codex_model = self.config.models.codex_model
+                h.codex_effort = self.config.models.codex_effort
+                # Live web-app pentest context (XBOW-style). web_mode flips the hunter to the
+                # black-box HTTP methodology when an authorized live target is armed.
+                h.web_mode = self._egress_hosts is not None
+                h.base_urls = [getattr(t, "base_url", "") for t in (self.scope.dynamic_targets or [])]
+                h.identities = [getattr(idn, "name", "") for idn in (getattr(self.scope, "test_identities", None) or [])]
+                h.oob_available = self._oob is not None
+                h.scope_note = getattr(self.scope, "safe_harbor_text", "") or ""
                 if resume:  # restore this track's memory so it resumes at depth, not from scratch
                     h._ruled_out = list(tr.get("ruled_out", []) or [])
                     h._directive = str(tr.get("directive", "") or "")
@@ -1092,6 +1259,12 @@ class ClaudeSwarm:
                 so.invariants = [str(x) for x in (tr0.get("invariants") or []) if str(x).strip()]
                 so.perms = self._perms
                 so.egress_hosts = self._egress_hosts
+                so.poc_reldir = self.poc_reldir
+                so.web_mode = self._egress_hosts is not None
+                so.base_urls = [getattr(t, "base_url", "") for t in (self.scope.dynamic_targets or [])]
+                so.identities = [getattr(idn, "name", "") for idn in (getattr(self.scope, "test_identities", None) or [])]
+                so.oob_available = self._oob is not None
+                so.scope_note = getattr(self.scope, "safe_harbor_text", "") or ""
                 hunters.append(so)
                 self._emit(self.name, "lifecycle",
                            {"event": "second_opinion", "subsystem": so.subsystem,
@@ -1108,6 +1281,17 @@ class ClaudeSwarm:
                                      guard_check=self._guard_check(guard, "poc_prover"))
             prover.perms = self._perms
             prover.egress_hosts = self._egress_hosts
+            prover.poc_reldir = self.poc_reldir
+            # EXPLOIT-DEVELOPMENT depth phase (strong model, large turn budget, sustained focus):
+            # takes a believed primitive and builds the full attacker-WIN exploit, or proves it can't.
+            self.bus.register("exploit_dev", "prover")
+            developer = ClaudeExploitDeveloper("exploit_dev", model=self.config.models.falsifier,
+                                               on_event=self._emit,
+                                               guard_check=self._guard_check(guard, "exploit_dev"),
+                                               max_turns=self._deepdive_turns)
+            developer.perms = self._perms
+            developer.egress_hosts = self._egress_hosts
+            developer.poc_reldir = self.poc_reldir
             # Dedup agent (cheap model — confirmation-gate de-duplication) and the debate panel
             # (strong model — round-end adversarial re-test of confirmed criticals).
             self.bus.register("dedup", "verifier")
@@ -1150,6 +1334,7 @@ class ClaudeSwarm:
                                    guard_check=self._guard_check(guard, fname))
                 _fz.perms = self._perms
                 _fz.egress_hosts = self._egress_hosts
+                _fz.poc_reldir = self.poc_reldir
                 fuzzers.append(_fz)
                 self._emit(self.name, "message",
                            {"to": fname, "kind": "assign",
@@ -1181,13 +1366,13 @@ class ClaudeSwarm:
                     watchdog.cancel()
                     self._stop_fork()
                     status = EngagementStatus.REPORT_READY if findings else EngagementStatus.RUNNING
-                    return self._result(status, plan, guard, findings, all_candidates, depth - 1)
+                    return self._result(status, plan, guard, findings, all_candidates, depth - 1, needs_human)
                 if self.bb.has_stop(self.name) or self._safety_event:
                     self._emit(self.name, "lifecycle", {"event": "stop", "reason": "operator/safety"})
                     self._write_findings_json(findings, all_candidates, needs_human)
                     watchdog.cancel()
                     self._stop_fork()
-                    return self._result(EngagementStatus.STOPPED, plan, guard, findings, all_candidates, depth)
+                    return self._result(EngagementStatus.STOPPED, plan, guard, findings, all_candidates, depth, needs_human)
                 # COST CEILING (opt-in): stop a never-quit run gracefully once the operator's budget
                 # is spent — no surprise unbounded bills. Spend is emitted every round regardless.
                 if self._cost_cap is not None and self._spend_usd >= self._cost_cap:
@@ -1198,7 +1383,7 @@ class ClaudeSwarm:
                     watchdog.cancel()
                     self._stop_fork()
                     status = EngagementStatus.REPORT_READY if findings else EngagementStatus.RUNNING
-                    return self._result(status, plan, guard, findings, all_candidates, depth - 1)
+                    return self._result(status, plan, guard, findings, all_candidates, depth - 1, needs_human)
 
                 self._drain_control()  # pick up any `p1hunt notify` directives before this round
                 self._emit(self.name, "message", {"phase": "round", "round": depth, "lenses": len(hunters)})
@@ -1209,7 +1394,9 @@ class ClaudeSwarm:
                 # Fan out: every Child B hunts its derived track this round (bounded concurrency).
                 # Each hunter has a WALL-CLOCK cap so one that keeps emitting can't grind forever and
                 # block the round (the inactivity timeout only catches SILENCE, not endless grinding).
-                hunter_cap = float(os.environ.get("P1HUNT_HUNTER_TIMEOUT", "1200"))  # 20 min/round/hunter
+                # Wall-clock per hunter per round. Deep-discovery extends it to 1h so a sustained
+                # investigation isn't guillotined mid-reasoning (the #1 cause of shallow passes). Env wins.
+                hunter_cap = float(os.environ.get("P1HUNT_HUNTER_TIMEOUT", "3600" if self._deep_discovery else "1200"))
 
                 async def _run(h: ClaudeHunter) -> list[ClaudeFinding]:
                     async with self.sem:
@@ -1445,6 +1632,110 @@ class ClaudeSwarm:
                     self._emit("poc_prover", "lifecycle",
                                {"event": "candidate_verify_error", "title": cf.title, "detail": str(exc)[:200]})
 
+                # EXPLOIT-DEVELOPMENT DEPTH PHASE (round end): take the top believed-real primitives
+                # (needs-human P1s + un-proven criticals) and SUSTAIN focus to build the full
+                # attacker-win exploit. ONLY a demonstrated win in shipped code promotes to a confirmed
+                # critical (a primitive is not a critical). Bounded by P1HUNT_DEEPDIVE_TOP_N per round.
+                if self._deepdive_on and self.config.use_claude:
+                    _dt = float(os.environ.get("P1HUNT_DEEPDIVE_TIMEOUT", "3600"))
+                    rubric = (getattr(self.scope, "scope_note", "")
+                              or getattr(self.scope, "safe_harbor_text", "") or "")
+                    # The pool is needs-human P1s + un-proven criticals + the IN-RUBRIC candidates
+                    # (key/signature/nonce classes) — so the depth phase chases the leads with real
+                    # Critical potential (e.g. MtA decrypt-before-verify), not just whatever was
+                    # already promoted. Then PRIORITIZE: in-rubric key/sig leads first, off-rubric
+                    # (freeze/availability) last, so the expensive budget isn't spent on non-criticals.
+                    import re as _re_dd
+                    _inrub = _re_dd.compile(
+                        r"decrypt.?before|\bmta\b|nonce|reuse|bias|forge|rogue|recover|extract|"
+                        r"signature|lattice|paillier|\bzkp\b|proof|small.?factor|alpha.?ray|key", _re_dd.I)
+                    _offrub = _re_dd.compile(r"freeze|conserv|availab|desync|resurrect|permanent|\bdos\b", _re_dd.I)
+
+                    def _promise(_f) -> int:
+                        t = (getattr(_f, "title", "") or "").lower()
+                        sc = 0
+                        if _inrub.search(t):
+                            sc += 3
+                        if _offrub.search(t):
+                            sc -= 4
+                        if getattr(_f, "severity", "") == "critical":
+                            sc += 1
+                        return sc
+
+                    inrubric_cands = [c for c in all_candidates
+                                      if _inrub.search((getattr(c, "title", "") or ""))
+                                      and not _offrub.search((getattr(c, "title", "") or ""))]
+                    pool = (list(needs_human)
+                            + [f for f in findings if f.severity == "critical"
+                               and self._finding_key(f) not in self._exploit_proven]
+                            + inrubric_cands)
+                    # TENACITY: select the highest-promise leads that are still OPEN (not proven, not
+                    # exhausted, under the attempt cap). A failed attempt DECAYS a lead's priority so
+                    # the engine rotates to fresher leads, but keeps cycling back — it never abandons a
+                    # lead after one failed PoC; it changes the angle and tries again next round.
+                    def _eff_promise(_f) -> float:
+                        return _promise(_f) - 2.0 * self._lead_attempts(self._finding_key(_f))
+                    pool.sort(key=_eff_promise, reverse=True)
+                    todo, seen_k = [], set()
+                    for f in pool:
+                        k = self._finding_key(f)
+                        if k in seen_k or _promise(f) < 0:
+                            continue  # skip dups and off-rubric (freeze) leads
+                        if not self._lead_open(k):
+                            continue  # proven / exhausted / hit the attempt cap -> stop pursuing
+                        seen_k.add(k)
+                        todo.append(f)
+                        if len(todo) >= self._deepdive_top_n:
+                            break
+                    for f in todo:
+                        k = self._finding_key(f)
+                        prior = self._lead_log.get(k, {}).get("attempts", [])
+                        try:
+                            verdict = await asyncio.wait_for(
+                                developer.develop(f, self.repo_path, rubric=rubric, scaffold="",
+                                                  fork_url=self._fork_url, prior_attempts=prior),
+                                timeout=_dt)
+                        except Exception as exc:
+                            # transient -> NOT counted as an attempt; the lead stays open and retries
+                            self._emit(self.name, "lifecycle",
+                                       {"event": "exploit_dev_error", "title": f.title, "detail": str(exc)[:160]})
+                            continue
+                        if verdict and verdict.get("_achieved"):
+                            tier = str(verdict.get("tier", "critical")).lower()
+                            f.severity = tier if tier in ("critical", "high") else "critical"
+                            try:
+                                f.verified = True
+                            except Exception:
+                                pass
+                            self._exploit_proven.add(k)
+                            self._lead_log.setdefault(k, {"attempts": [], "status": "open"})["status"] = "proven"
+                            if f not in findings:
+                                findings.append(f)
+                                if f in needs_human:
+                                    needs_human.remove(f)
+                            self._emit(self.name, "lifecycle",
+                                       {"event": "exploit_confirmed", "title": f.title, "tier": tier,
+                                        "win": str(verdict.get("win", ""))[:160],
+                                        "aborts": str(verdict.get("aborts", "")),
+                                        "attempts": self._lead_attempts(k) + 1})
+                        else:
+                            # NOT a win -> log the failed angle and decide: keep pursuing, exhausted, or capped.
+                            status = self._record_lead_attempt(k, verdict)
+                            n = self._lead_attempts(k)
+                            if status == "exhausted":
+                                self._emit(self.name, "lifecycle",
+                                           {"event": "exploit_exhausted", "title": f.title, "attempts": n,
+                                            "detail": str((verdict or {}).get("impossibility", ""))[:200]})
+                            elif status == "maxed":
+                                self._emit(self.name, "lifecycle",
+                                           {"event": "exploit_pursuit_capped", "title": f.title, "attempts": n,
+                                            "detail": f"no win after {n} angles — parked for human review"})
+                            else:
+                                self._emit(self.name, "lifecycle",
+                                           {"event": "exploit_retry", "title": f.title, "attempts": n,
+                                            "next_angle": str((verdict or {}).get("next_angle", ""))[:160],
+                                            "detail": "lead still open — will try a different angle next round"})
+
                 # DEBATE PANEL (round end, CRITICALS ONLY): adversarially re-test each newly-confirmed
                 # critical — a prosecutor argues to invalidate/downgrade, a defender argues it's a real
                 # critical, a judge rules. reject -> remove; downgrade -> lower severity (no longer a
@@ -1453,33 +1744,40 @@ class ClaudeSwarm:
                 if self._debate_max and self.config.use_claude:
                     _vt = float(os.environ.get("P1HUNT_VERIFY_TIMEOUT", "900"))
                     pending = [f for f in findings
-                               if f.severity == "critical" and f.id not in self._debated][:self._debate_max]
+                               if f.severity == "critical"
+                               and self._finding_key(f) not in self._debated][:self._debate_max]
                     for f in pending:
-                        self._debated.add(f.id)
+                        key = self._finding_key(f)
                         try:
                             verdict, sev, why = await asyncio.wait_for(
                                 debate.adjudicate(f, self.repo_path), timeout=_vt)
                         except Exception as exc:
+                            # Do NOT mark debated on error -> it retries next round, and stays
+                            # OUT of confirmed (un-upheld) until it genuinely passes the panel.
                             self._emit(self.name, "lifecycle",
                                        {"event": "debate_error", "title": f.title, "detail": str(exc)[:160]})
                             continue
+                        self._debated.add(key)
                         if verdict == "reject":
-                            findings[:] = [x for x in findings if x.id != f.id]
+                            self._debate_rejected.add(key)  # never confirmable again
+                            findings[:] = [x for x in findings if self._finding_key(x) != key]
                             self._emit(self.name, "lifecycle",
                                        {"event": "debate_rejected", "title": f.title, "reason": why[:200]})
                         elif verdict == "downgrade":
                             f.severity = sev if sev in ("high", "medium", "low") else "high"
+                            self._debate_downgraded[key] = f.severity
                             f.severity_rationale = f"[DEBATE-DOWNGRADED to {f.severity}] {why} | {f.severity_rationale}"
                             self._emit(self.name, "lifecycle",
                                        {"event": "debate_downgraded", "title": f.title,
                                         "to": f.severity, "reason": why[:200]})
                         else:
+                            self._debate_upheld.add(key)  # survived the panel -> now confirmable
                             self._emit(self.name, "lifecycle", {"event": "debate_upheld", "title": f.title})
 
                 # Find ALL criticals — do NOT stop at the first. Keep hunting/reframing across
                 # rounds (every lens deepening its angle) until the round cap or an operator stop,
                 # so multiple independent P1s surface rather than just the first one found.
-                crit = sum(f.severity == "critical" for f in findings)
+                crit = len(self._confirmed_crits(findings))  # debate-gated count (matches findings.json)
                 self._emit(self.name, "message",
                            {"phase": "round_summary", "round": depth, "criticals_total": crit,
                             "candidates_total": len(all_candidates), "needs_human": len(needs_human),
@@ -1501,7 +1799,7 @@ class ClaudeSwarm:
                                 "target": self._max_criticals, "round": depth})
                     watchdog.cancel()
                     self._stop_fork()
-                    return self._result(EngagementStatus.REPORT_READY, plan, guard, findings, all_candidates, depth)
+                    return self._result(EngagementStatus.REPORT_READY, plan, guard, findings, all_candidates, depth, needs_human)
 
                 # Rate-limit / dead-round BACKOFF (§8): a round that finished FAST and produced nothing
                 # (or whose sessions errored as rate-limited) means we're throttled — do NOT spin empty
@@ -1686,7 +1984,14 @@ class ClaudeSwarm:
             "properties its own tests assert), state it as a machine-checkable property a fuzzer can "
             "assert, and cite file:line. No generic textbook properties — every one SPECIFIC to THIS "
             "code. Point focus_files at the exact IN-SCOPE files. Choose each subsystem's SEARCH "
-            "STRATEGY: 'differential' (if the oracle covers it) or 'invariant' (stateful fuzzing).\n\n"
+            "STRATEGY: 'differential' (if the oracle covers it) or 'invariant' (stateful fuzzing).\n"
+            "   CROSS-CUTTING: real P1s in hardened code usually live in the SEAMS BETWEEN subsystems "
+            "(a check in one composing unsafely with a flow in another), not inside one. So make ONE "
+            "track explicitly own the COMPOSITION / trust-boundary seams — the end-to-end attacker "
+            "FLOWS that cross subsystem lines — and give it the focus_files of EVERY subsystem the flow "
+            "touches. focus_files MAY OVERLAP across tracks where a flow spans them; do NOT carve the "
+            "code into disjoint slices that hide the interaction. A track must own a whole flow, not a "
+            "fragment.\n\n"
             "8) PLACE YOUR BET. State the SINGLE most promising hypothesis — where YOU would bet the "
             "P1 is, citing the code, and the first concrete attacker move to test it. Be decisive.\n\n"
             "Your hunters AND an automated fuzzer will PROVE or disprove each lead by writing and "
@@ -1787,7 +2092,8 @@ class ClaudeSwarm:
         self._workspace_root = str(chosen)
         # If Parent A narrowed the boundary, keep the PoC sandbox inside it so writes stay in scope.
         if narrowed:
-            self.poc_dir = Path(self._workspace_root) / ".p1hunt-poc"
+            self.poc_reldir = _poc_reldir(self._workspace_root)
+            self.poc_dir = Path(self._workspace_root) / self.poc_reldir
             try:
                 self.poc_dir.mkdir(parents=True, exist_ok=True)
             except OSError:
@@ -1814,12 +2120,16 @@ class ClaudeSwarm:
                               "this can only tighten the rules-derived floor, never loosen it"})
 
     def _fallback_tracks(self) -> list[dict]:
-        """Only when no Claude brain is available (offline/tests): generic lens tracks with a
-        mechanical file partition. No bug-class hints."""
+        """Only when no Claude brain is available (offline/tests): generic lens tracks. Each track
+        gets the FULL file set (NOT a disjoint 1/N slice) so a hunter can follow a value/trust flow
+        ACROSS files instead of being boxed into a fragment — disjoint partitioning severs the
+        cross-cutting bugs where real P1s live. Plus one explicit cross-cutting 'composition' track
+        that owns the SEAMS between subsystems."""
         files = self._enumerate_targets()
+        lenses = list(_LENSES) + ["composition-and-trust-seams"]
         return [
-            {"theme": lens, "focus_files": files[i :: len(_LENSES)], "investigate": []}
-            for i, lens in enumerate(_LENSES)
+            {"theme": lens, "focus_files": list(files), "investigate": []}
+            for lens in lenses
         ]
 
     def _record_hypothesis(self, cf: ClaudeFinding) -> None:
@@ -1975,11 +2285,12 @@ class ClaudeSwarm:
         self._safety_event = True
         self._emit(self.name, "lifecycle", {"event": "safety_event", "reason": reason})
 
-    def _result(self, status, plan, guard, findings, candidates, rounds) -> HuntResult:
+    def _result(self, status, plan, guard, findings, candidates, rounds, needs_human=None) -> HuntResult:
         return HuntResult(
             status=status, plan=plan, rounds_run=rounds, findings=findings,
             reframes=self._reframes, demoted_to_warm_pool=False, attestation=guard.attestation(),
-            candidates=[c.__dict__ for c in candidates], brain="claude",
+            candidates=[c.__dict__ for c in candidates],
+            needs_human=[getattr(f, "__dict__", f) for f in (needs_human or [])], brain="claude",
         )
 
 

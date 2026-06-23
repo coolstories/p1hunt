@@ -140,7 +140,7 @@ def _demo(args: argparse.Namespace) -> int:
         print(f"\nReport written to {args.report}")
     print(
         f"\nResult: {result.status.value} | rounds={result.rounds_run} | reframes={result.reframes} | "
-        f"critical_confirmed={result.confirmed_critical}"
+        f"needs_human={len(result.needs_human)} | critical_confirmed={result.confirmed_critical}"
     )
     return 0
 
@@ -201,12 +201,120 @@ def build_scope(
     )
 
 
+def _web_hosts_from_brief(brief: dict) -> list[str]:
+    """Pull the in-scope WEB hosts (domains/URLs) from a researched scope brief — for --web live runs."""
+    out: list[str] = []
+    for a in (brief.get("in_scope") or []):
+        if not isinstance(a, dict):
+            continue
+        kind = str(a.get("kind", "")).lower()
+        val = str(a.get("value", "")).strip()
+        if not val or kind in ("repo", "contract", "source", "code", "package"):
+            continue  # not a live web host (a repo/contract URL is not a target to hit)
+        if "github.com" in val or "gitlab.com" in val:
+            continue
+        if kind in ("domain", "url", "web", "host", "api", "endpoint") or val.startswith(("http://", "https://")):
+            out.append(val)
+    return list(dict.fromkeys(out))
+
+
+def _norm_url(host: str) -> str:
+    h = host.strip().rstrip("/")
+    if not h:
+        return ""
+    if not h.startswith(("http://", "https://")):
+        h = "https://" + h.lstrip("*.")  # *.t-mobile.com -> https://t-mobile.com (recon expands subdomains)
+    return h
+
+
+def _web_hunt(config: Config, args: argparse.Namespace) -> int:
+    """Black-box WEB-APP pentest of a LIVE authorized target (XBOW-style). Resolves the in-scope
+    hosts (explicit target URL, or auto-scoped program domains), arms the live egress jail, and runs
+    the web methodology. run_mode is forced active; 'production' bare-label is still refused."""
+    from .models import DynamicTarget
+
+    program = args.program or f"Web engagement ({args.target})"
+    config.run_mode = "active"
+    config.live_environment = args.live_env or (config.live_environment if config.live_environment != "uat" else "bounty")
+
+    hosts: list[str] = []
+    if args.target and (looks_like_repo(args.target) is False) and ("." in args.target or args.target.startswith("http")):
+        hosts = [args.target]
+    elif args.program:
+        auto = _auto_scope(config, args.program, args.platform, getattr(args, "only", "") or "", getattr(args, "url", "") or "")
+        if auto is None:
+            return 2
+        hosts = _web_hosts_from_brief(auto["brief"])
+        if auto.get("oos_globs"):
+            args.out_of_scope = ",".join(filter(None, [(args.out_of_scope or ""), *auto["oos_globs"]]))
+    hosts = [u for u in (_norm_url(h) for h in hosts) if u]
+    if not hosts:
+        print("--web: could not resolve any in-scope web host. Pass a target URL/domain, or --program (+ --platform).")
+        return 2
+
+    config.live_base_url = hosts[0]
+    dyn = [DynamicTarget(base_url=h, environment=config.live_environment, kind="rest") for h in hosts]
+    identities = _identities_from_env()
+    oos = [g.strip() for g in (args.out_of_scope or "").split(",") if g.strip()]
+    scope = build_scope(program, hosts[0], platform=args.platform, out_of_scope_globs=oos,
+                        scope_note=getattr(args, "scope_note", "") or "", environment=config.live_environment,
+                        dynamic_targets=dyn, test_identities=identities)
+
+    eng_id = "".join(c if c.isalnum() else "-" for c in program.lower())[:40] or "engagement"
+    eng_folder = Path(config.engagements_root) / eng_id
+    # Black-box: there may be no source. Use a scratch workspace the agents recon/write PoCs into.
+    artifact_dir = str((eng_folder / "artifacts").resolve())
+    Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+
+    print(f"\n🌐 WEB-APP PENTEST · {program} [{config.live_environment}]")
+    print(f"  in-scope hosts ({len(hosts)}): {', '.join(hosts[:6])}{' …' if len(hosts) > 6 else ''}")
+    print(f"  identities: {', '.join(i.name for i in identities) or 'none (set P1HUNT_TOKEN_A/_B to test authz)'}")
+    if oos:
+        print(f"  out-of-scope: {', '.join(oos[:6])}")
+    print("  safe harbor: in-scope hosts only · non-destructive · no DoS · rate-limited\n")
+
+    max_rounds = args.max_rounds
+    if getattr(args, "tui", False):
+        out = run_with_tui(scope, artifact_dir, config=config, rounds=max_rounds, program=program)
+        if not out:
+            print("Hunt ended.")
+            return 0
+        result, bb, log, bus, report = out
+    else:
+        result, bb, log, bus, report = asyncio.run(
+            run_engagement(scope, artifact_dir, config=config, rounds=max_rounds, live=args.live))
+    print(render_snapshot(log, bb, bus))
+    if result is None:
+        print("\nEngagement BLOCKED — needs a human scope decision.")
+        return 2
+    print("\n" + report)
+    if args.report:
+        Path(args.report).write_text(report, encoding="utf-8")
+        print(f"\nReport written to {args.report}")
+    print(f"\nResult: {result.status.value} | brain={result.brain} | rounds={result.rounds_run} | "
+          f"candidates={len(result.candidates)} | needs_human={len(result.needs_human)} | critical_confirmed={result.confirmed_critical}")
+    return 0
+
+
 def _hunt(args: argparse.Namespace) -> int:
     config = Config.from_env()
     if args.no_claude:
         config.use_claude = False
+    if getattr(args, "web", False):
+        return _web_hunt(config, args)
     if getattr(args, "auto_install_toolchain", False):
         config.auto_install_toolchain = True
+    if getattr(args, "discovery_engine", None):
+        config.models.discovery_engine = args.discovery_engine
+    if config.models.discovery_engine == "codex":
+        from .agents.codex_session import codex_available
+        if not codex_available():
+            print("⚠ discovery-engine=codex but the `codex` CLI is not on PATH — install it "
+                  "(`npm i -g @openai/codex`) or use --discovery-engine claude. Falling back to Claude.")
+            config.models.discovery_engine = "claude"
+        else:
+            print(f"◈ Discovery engine: CODEX ({config.models.codex_model} @ {config.models.codex_effort} "
+                  "reasoning) — verification/PoC/depth stay on Claude.")
     if getattr(args, "resume", False):
         # Continue from the saved snapshot (state.json) in the existing engagement folder —
         # skips cold reconnaissance, restores tracks/candidates/ruled-out/round. (Reuses the
@@ -284,7 +392,7 @@ def _hunt(args: argparse.Namespace) -> int:
         print(f"\nReport written to {args.report}")
     print(
         f"\nResult: {result.status.value} | brain={result.brain} | rounds={result.rounds_run} | "
-        f"candidates={len(result.candidates)} | critical_confirmed={result.confirmed_critical}"
+        f"candidates={len(result.candidates)} | needs_human={len(result.needs_human)} | critical_confirmed={result.confirmed_critical}"
     )
     return 0
 
@@ -489,7 +597,7 @@ def interactive() -> int:
     if result is not None:
         print("\n" + report)
         print(f"\nResult: {result.status.value} | candidates={len(result.candidates)} | "
-              f"critical_confirmed={result.confirmed_critical}")
+              f"needs_human={len(result.needs_human)} | critical_confirmed={result.confirmed_critical}")
         print(f"Replay anytime:  python3 -m p1hunt.main watch {eng_folder}")
     return 0
 
@@ -527,7 +635,7 @@ def _new(args: argparse.Namespace) -> int:
         Path(args.report).write_text(report, encoding="utf-8")
         print(f"\nReport written to {args.report}")
     print(f"\nResult: {result.status.value} | brain={result.brain} | rounds={result.rounds_run} | "
-          f"candidates={len(result.candidates)} | critical_confirmed={result.confirmed_critical}")
+          f"candidates={len(result.candidates)} | needs_human={len(result.needs_human)} | critical_confirmed={result.confirmed_critical}")
     return 0
 
 
@@ -669,11 +777,22 @@ def main(argv: list[str] | None = None) -> int:
                            "(IDOR/SSRF/auth-bypass). Needs P1HUNT_RUN_MODE=active + agent creds; "
                            "supply test creds via P1HUNT_TOKEN_A / P1HUNT_TOKEN_B env vars.")
     hunt.add_argument("--live-env", dest="live_env", default=None,
-                      choices=["uat", "owned", "testnet", "staging", "local"],
-                      help="Environment class of --base-url (default uat). Production is never allowed.")
+                      choices=["uat", "owned", "testnet", "staging", "local", "bounty"],
+                      help="Environment class of the live target (default uat). 'bounty' = an authorized "
+                           "public bug-bounty program whose safe harbor permits in-scope live testing "
+                           "(e.g. T-Mobile on HackerOne). The bare label 'production' is never allowed.")
+    hunt.add_argument("--web", action="store_true",
+                      help="Black-box WEB-APP pentest of a live authorized target (XBOW-style): recon the "
+                           "in-scope hosts, hunt IDOR/BOLA, auth bypass, SSRF, injection, business-logic, "
+                           "etc., and prove each against the live target. Implies run_mode=active; pair with "
+                           "--program/--platform (auto-scope the in-scope domains) or a target URL/domain.")
     hunt.add_argument("--scope-note", dest="scope_note",
                       help="Rules-of-engagement note surfaced to Parent A and the hunters.")
     hunt.add_argument("--no-claude", action="store_true", help="Force the deterministic offline brain.")
+    hunt.add_argument("--discovery-engine", dest="discovery_engine", choices=("claude", "codex"), default=None,
+                      help="Which model drives the HUNTERS (discovery). 'claude' (default) or 'codex' "
+                           "(GPT-5.5-Codex at xhigh reasoning — a second strong model to widen what gets "
+                           "found). Verification/PoC/depth always stay on Claude. Needs the `codex` CLI.")
     hunt.add_argument("--auto-install-toolchain", dest="auto_install_toolchain", action="store_true",
                       help="Install Foundry (forge/anvil) if missing so the reproduction gate can actually "
                            "fire — the biggest unblocker for confirmed criticals on EVM targets.")

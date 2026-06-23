@@ -21,10 +21,11 @@ const ROLE = (a) => {
 };
 
 const S = {
-  eng: null, offset: 0, feed: [], agents: {}, settings: {}, stats: {},
+  eng: null, offset: 0, feed: [], agents: {}, settings: {}, stats: {}, models: {},
   tokens: { total: 0, cost: 0 }, findings: { confirmed_criticals: [], needs_human_review: [], candidates: [] },
   debate: [], dedup: [], running: false, lastRx: 0,
 };
+const rosterRows = {};    // agent name -> cached row nodes, updated in place (no flicker)
 let feedRendered = 0;     // how many S.feed lines are already in the DOM (incremental append)
 let panelsDirty = true;   // metrics/roster/findings re-render on a throttle, not per-event
 let es = null;            // the live EventSource
@@ -32,6 +33,14 @@ const evTimes = [];       // event arrival times → live events/sec meter
 let view = "unified";     // "unified" | 1 | 2 | 4 | 6  (split-screen pane count)
 let panes = [];           // which agent each split pane shows
 let focusFilter = null;   // when set, the UNIFIED feed shows only this agent (roster stays put)
+let expandAll = false;    // global: show full (unclamped) text for every feed line
+
+// Apply the global expand flag to the feed + every split pane (called after each render so new
+// content honors it). Per-line expand (click) is independent and survives this.
+function applyExpand() {
+  const f = $("feed"); if (f) f.classList.toggle("expanded", expandAll);
+  for (let i = 0; i < 8; i++) { const p = $("pane" + i); if (p) p.classList.toggle("expanded", expandAll); }
+}
 
 function fmtDur(s) {
   if (s == null) return "--"; s = Math.max(0, Math.floor(s));
@@ -44,9 +53,9 @@ function fmtTok(n) { n = n || 0; return n >= 1e6 ? (n/1e6).toFixed(2)+"M" : n >=
 function fmtEvent(e) {
   const d = e.data || {}, k = e.kind, ag = AGENT(e.agent);
   const L = (cls, text) => ({ ts: e.ts, ag, cls, text });
-  if (k === "thinking") return L("thinking", clip(d.text, 260));
-  if (k === "output") return L("output", clip(d.text, 260));
-  if (k === "tool_call") return L("tool", `${d.tool || ""}  ${clip(d.target, 110)}`);
+  if (k === "thinking") return L("thinking", clip(d.text, 4000));
+  if (k === "output") return L("output", clip(d.text, 4000));
+  if (k === "tool_call") return L("tool", `${d.tool || ""}  ${clip(d.target, 600)}`);
   if (k === "finding_reported") return L("finding", `★ posted: ${clip(d.title,90)} [${d.severity||"?"}]`);
   if (k === "finding") return L("finding", d.event === "critical_confirmed"
       ? `★★★ CRITICAL CONFIRMED ×${d.count||1}` : `★ ${clip(d.title,90)} [${d.severity||""}]`);
@@ -105,6 +114,12 @@ function ingest(events) {
     }
     if (e.kind === "usage") { S.tokens.total += e.data?.total || 0; S.tokens.cost += e.data?.cost || 0; continue; }
     if (e.kind === "lifecycle" && e.data?.event === "settings") { S.settings = e.data; continue; }
+    if (e.kind === "lifecycle" && e.data?.event === "model_status") {
+      const m = e.data.model || "?";
+      S.models[m] = { engine: e.data.engine || "", state: e.data.state || "?",
+                      cooldown: e.data.cooldown_s || 0, ts: e.ts || (Date.now()/1000) };
+      continue;
+    }
     if (e.kind === "message" && e.data?.phase === "round_summary") S.stats = e.data;
     if (e.kind === "lifecycle" && e.data?.event === "duplicate_dropped")
       S.dedup.unshift({ cls: "", t: `♻ dup of #${e.data.of||"?"} — ${clip(e.data.reason,80)}` });
@@ -140,48 +155,106 @@ function render() {
   $("mThreat").textContent = lvl[0]; $("threatFill").style.width = lvl[1] + "%";
   $("mThreat").style.color = crit ? "var(--red)" : nh ? "var(--amber)" : "var(--green)";
 
-  // roster
-  const now = Date.now()/1000;
-  const names = Object.keys(S.agents).sort();
-  $("agentCount").textContent = names.length;
-  $("roster").innerHTML = names.map(n => {
-    const a = S.agents[n], age = now - a.last, st = a.busy ? "busy" : age < 90 ? "active" : "";
-    const foc = (focusFilter === n || (view !== "unified" && panes.includes(n))) ? "focus" : "";
-    return `<div class="agent ${st} ${foc}" data-agent="${esc(n)}" title="click to focus this agent">`
-      + `<span class="light"></span><span class="aname">${esc(n)}</span>`
-      + `<span class="arole">${esc(a.role)}</span><span class="aage">${a.last?fmtDur(age)+" ago":""}</span></div>`;
-  }).join("") || '<div class="muted">no agents yet</div>';
-  document.querySelectorAll("#roster .agent").forEach(el => el.onclick = () => focusAgent(el.dataset.agent));
+  // roster — update rows IN PLACE (no wholesale innerHTML rebuild) so it never flickers and the
+  // click target survives between renders.
+  renderRoster();
 
   // settings
   const s = S.settings, m = s.models || {};
   if (Object.keys(s).length) {
     const row = (k, v) => `<div class="srow"><span class="sk">${esc(k)}</span><span class="sv">${esc(v)}</span></div>`;
+    const pill = (on) => `<span class="pill ${on ? "on" : "off"}">${on ? "on" : "off"}</span>`;
+    const rowP = (k, on) => `<div class="srow"><span class="sk">${esc(k)}</span><span class="sv">${pill(on)}</span></div>`;
+    const eng = s.discovery_engine || "claude";
+    const engPill = `<span class="pill ${eng === "codex" ? "codex" : "claude"}">${esc(eng)}</span>`;
     $("settings").innerHTML =
       row("program", s.program) + row("target class", s.target_class) + row("run mode", s.run_mode) +
+      `<div class="sgroup">DISCOVERY ENGINE</div>` +
+      `<div class="srow"><span class="sk">engine</span><span class="sv">${engPill}</span></div>` +
+      rowP("deep discovery", s.deep_discovery) + rowP("no-downgrade", s.no_model_downgrade) +
       `<div class="sgroup">STOP / SCALE</div>` +
       row("stop @ criticals", s.max_criticals || "never-quit") +
       row("max rounds", s.max_rounds == null ? "unbounded" : s.max_rounds) +
       row("cost cap", s.cost_cap_usd ? "$"+s.cost_cap_usd : "none") +
-      row("fuzz campaigns", s.fuzz_campaigns) + row("second opinion", s.second_opinion ? "on":"off") +
+      row("fuzz campaigns", s.fuzz_campaigns) + rowP("second opinion", !!s.second_opinion) +
       `<div class="sgroup">GATES</div>` +
-      row("dedup", s.dedup ? "on":"off") + row("debate panel", "max "+s.debate_max) + row("recon turns", s.recon_turns) +
+      rowP("dedup", s.dedup) + row("debate panel", "max "+s.debate_max) +
+      rowP("deepdive", s.deepdive) +
+      (s.deepdive ? row("· depth", (s.deepdive_top_n||"?")+" leads × "+(s.deepdive_turns||"?")+" turns") : "") +
+      (s.recon_turns ? row("recon turns", s.recon_turns) : "") +
       `<div class="sgroup">MODELS</div>` +
       Object.entries(m).map(([k,v]) => row(k, v)).join("");
   }
 
-  // findings cards
-  const card = (x, nhFlag) => `<div class="fcard ${nhFlag?'nh':''}" data-k='${esc(JSON.stringify(x))}'>`
-    + `<span class="fsev">${esc(x.severity||(nhFlag?'NEEDS-HUMAN':'CRITICAL'))}</span>`
-    + `<div class="ft">${esc(clip(x.title,120))}</div><div class="floc">${esc(x.location||"")}</div></div>`;
-  $("confirmed").innerHTML = (f.confirmed_criticals||[]).map(x => card(x,false)).join("") || '<div class="muted">none confirmed</div>';
-  $("needshuman").innerHTML = (f.needs_human_review||[]).map(x => card(x,true)).join("") || '<div class="muted">none</div>';
+  // model status (observed availability: rate-limited vs available, per engine/model)
+  const mk = Object.keys(S.models);
+  if (mk.length) {
+    mk.sort();
+    $("modelStatus").innerHTML = mk.map(name => {
+      const x = S.models[name];
+      const ok = x.state === "available";
+      const cd = (!ok && x.cooldown) ? ` ${fmtDur(x.cooldown)}` : "";
+      const label = name === "" || name === "codex-default" ? "codex (default)" : name;
+      return `<div class="mrow"><span class="meng">${esc(x.engine||"")}</span>`
+        + `<span class="mname" title="${esc(label)}">${esc(label)}</span>`
+        + `<span class="pill ${ok ? "on" : "off"}">${ok ? "ready" : "limited"+cd}</span></div>`;
+    }).join("");
+    if ($("modelMeta")) $("modelMeta").textContent = mk.length;
+  }
+
+  // findings cards (variant: ''=critical | 'nh' | 'cand')
+  const card = (x, variant) => {
+    const sev = x.severity || (variant === "nh" ? "NEEDS-HUMAN" : variant === "cand" ? "candidate" : "CRITICAL");
+    const loc = x.location || x.file || "";
+    return `<div class="fcard ${variant}" data-k='${esc(JSON.stringify(x))}'>`
+      + `<span class="fsev">${esc(sev)}</span>`
+      + `<div class="ft">${esc(clip(x.title || x.hyp || "", 120))}</div><div class="floc">${esc(loc)}</div></div>`;
+  };
+  const cands = f.candidates || [];
+  $("confirmed").innerHTML = (f.confirmed_criticals||[]).map(x => card(x,"")).join("") || '<div class="muted">none confirmed</div>';
+  $("candidates").innerHTML = cands.map(x => card(x,"cand")).join("") || '<div class="muted">none yet</div>';
+  $("needshuman").innerHTML = (f.needs_human_review||[]).map(x => card(x,"nh")).join("") || '<div class="muted">none</div>';
+  $("candCount").textContent = (f.counts ? f.counts.candidates : cands.length) || 0;
   document.querySelectorAll(".fcard").forEach(el => el.onclick = () => openModal(JSON.parse(el.dataset.k)));
 
   // debate + dedup mini logs
   $("debate").innerHTML = S.debate.map(x => `<div class="mln ${x.cls}">${esc(x.t)}</div>`).join("") || '<div class="muted">no debates yet</div>';
   $("dedup").innerHTML = S.dedup.map(x => `<div class="mln">${esc(x.t)}</div>`).join("") || '<div class="muted">no duplicates dropped</div>';
   if (view !== "unified") renderPanes();
+}
+
+// Roster updated IN PLACE: rows are created once and only their status class / age text mutate.
+// No innerHTML rebuild => no flicker, and the click target persists so selecting an agent is reliable.
+function renderRoster() {
+  const box = $("roster");
+  const now = Date.now() / 1000;
+  const names = Object.keys(S.agents).sort();
+  $("agentCount").textContent = names.length;
+  if (!names.length) {
+    if (!box.querySelector(".muted")) box.innerHTML = '<div class="muted">no agents yet</div>';
+    return;
+  }
+  const ph = box.querySelector(".muted"); if (ph) ph.remove();
+  for (const n of names) {
+    const a = S.agents[n], age = now - a.last;
+    const cls = "agent " + (a.busy ? "busy" : age < 90 ? "active" : "")
+      + ((focusFilter === n || (view !== "unified" && panes.includes(n))) ? " focus" : "");
+    let row = rosterRows[n];
+    if (!row) {
+      const el = document.createElement("div");
+      el.dataset.agent = n;
+      el.title = "click to focus this agent's transcript";
+      el.innerHTML = `<span class="light"></span><span class="aname">${esc(n)}</span>`
+        + `<span class="arole"></span><span class="aage"></span>`;
+      el.onclick = () => focusAgent(n);
+      box.appendChild(el);
+      row = rosterRows[n] = { el, age: el.querySelector(".aage"), role: el.querySelector(".arole") };
+    }
+    if (row.el.className !== cls) row.el.className = cls;        // only mutate what changed
+    if (row.role.textContent !== a.role) row.role.textContent = a.role;
+    const ageTxt = a.last ? fmtDur(age) + " ago" : "";
+    if (row.age.textContent !== ageTxt) row.age.textContent = ageTxt;
+  }
 }
 
 // ---- view modes: unified feed | split panes -------------------------------
@@ -227,7 +300,7 @@ function renderStage() {
   if (view === "unified") {
     stage.className = "pbody stage";
     stage.innerHTML = '<div class="feed" id="feed"></div>';
-    feedRendered = 0; renderFeed(); return;
+    feedRendered = 0; renderFeed(); applyExpand(); return;
   }
   stage.className = "pbody stage grid g" + view;
   let html = "";
@@ -236,7 +309,7 @@ function renderStage() {
   stage.innerHTML = html;
   stage.querySelectorAll(".paneSel").forEach(sel =>
     sel.onchange = (e) => { panes[+e.target.dataset.i] = e.target.value; renderPanes(); });
-  renderPanes();
+  renderPanes(); applyExpand();
 }
 function renderPanes() {
   if (view === "unified") return;
@@ -252,22 +325,27 @@ function renderPanes() {
   }
 }
 
-// Incrementally append only the NEW feed lines (so it streams like a live wire, no full rebuild).
+// Incrementally append only the NEW feed lines that match the current filter/focus — so it streams
+// like a live wire with NO full rebuild, even when a single agent is focused (no flicker).
 function appendFeedDelta() {
+  const box = $("feed"); if (!box) return;
   const filt = $("feedFilter").value.toLowerCase();
-  if (filt || focusFilter) { renderFeed(); return; }   // a filter/focus is active: full rebuild
-  const box = $("feed");
   const near = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
   const frag = document.createDocumentFragment();
+  let appended = 0;
   for (let i = feedRendered; i < S.feed.length; i++) {
-    const l = S.feed[i], div = document.createElement("div");
+    const l = S.feed[i];
+    if (focusFilter && l.ag !== focusFilter) continue;                       // focused on one agent
+    if (filt && !((l.ag + " " + l.text).toLowerCase().includes(filt))) continue;
+    const div = document.createElement("div");
     div.className = "feedline k-" + l.cls;
     const t = l.ts ? new Date(l.ts * 1000).toLocaleTimeString("en-GB") : "";
     div.innerHTML = `<span class="fts">${t}</span><span class="fag">${esc(l.ag)}</span><span class="ftx">${esc(l.text)}</span>`;
-    frag.appendChild(div);
+    frag.appendChild(div); appended++;
   }
-  box.appendChild(frag);
   feedRendered = S.feed.length;
+  if (!appended) return;                          // nothing matched → don't touch the DOM (no flicker)
+  box.appendChild(frag);
   while (box.children.length > 700) box.removeChild(box.firstChild);
   if ($("autoscroll").checked && near) box.scrollTop = box.scrollHeight;
 }
@@ -317,7 +395,7 @@ function connect() {
   es.onmessage = (m) => {
     let e; try { e = JSON.parse(m.data); } catch (_) { return; }
     if (m.lastEventId) { const o = parseInt(m.lastEventId); if (o) S.offset = o; }
-    ingest([e]); if (view === "unified") appendFeedDelta(); panelsDirty = true;
+    ingest([e]); if (view === "unified" && !hasSelection()) appendFeedDelta(); panelsDirty = true;
     evTimes.push(Date.now()); S.lastRx = Date.now();
   };
   es.addEventListener("findings", (m) => { try { S.findings = JSON.parse(m.data); panelsDirty = true; } catch (_) {} });
@@ -338,8 +416,10 @@ function setConn(live) {
 
 function switchEng(id) {
   S.eng = id; S.offset = 0; S.feed = []; feedRendered = 0; S.agents = {}; S.debate = []; S.dedup = [];
-  S.tokens = { total: 0, cost: 0 }; S.settings = {}; S.stats = {};
+  S.tokens = { total: 0, cost: 0 }; S.settings = {}; S.stats = {}; S.models = {};
   S.findings = { confirmed_criticals: [], needs_human_review: [], candidates: [] };
+  for (const k in rosterRows) delete rosterRows[k];   // drop cached rows from the prior engagement
+  $("roster").innerHTML = "";
   renderStage(); panelsDirty = true; render(); connect();
 }
 
@@ -348,9 +428,31 @@ $("engSelect").onchange = (e) => switchEng(e.target.value);
 $("feedFilter").oninput = renderFeed;   // rebuilds the feed for the filter + resyncs the append pointer
 $("modalClose").onclick = () => $("modal").classList.remove("open");
 $("modal").onclick = (e) => { if (e.target === $("modal")) $("modal").classList.remove("open"); };
+// EXPAND: global toggle (button) + per-line click to expand just one line.
+$("expandBtn").onclick = () => {
+  expandAll = !expandAll;
+  $("expandBtn").classList.toggle("on", expandAll);
+  $("expandBtn").textContent = expandAll ? "⤡ collapse" : "⤢ expand";
+  applyExpand();
+};
+$("centerStage").addEventListener("click", (e) => {
+  if (hasSelection()) return;                       // a click that's really a text selection — leave it
+  const ln = e.target.closest && e.target.closest(".feedline");
+  if (ln) ln.classList.toggle("expanded");          // expand/collapse just this line
+});
 setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString("en-GB"); }, 1000);
 // Throttle the heavy panels (metrics/roster/findings) to ~3 Hz while the feed streams freely.
-setInterval(() => { if (panelsDirty) { panelsDirty = false; render(); } setConn(S.running); }, 320);
+// True when the user has text highlighted — pause ALL re-rendering so a selection (for copy) survives.
+function hasSelection() {
+  const s = window.getSelection && window.getSelection();
+  return !!(s && !s.isCollapsed && String(s).length > 0);
+}
+setInterval(() => {
+  if (hasSelection()) return;                 // don't disturb the user mid-selection; resume on deselect
+  if (view === "unified") appendFeedDelta();  // flush any feed lines that queued while selecting
+  if (panelsDirty) { panelsDirty = false; render(); }
+  setConn(S.running);
+}, 320);
 
 (async function () {
   buildViewModes();

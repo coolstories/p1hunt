@@ -64,6 +64,10 @@
       <div class="phead"><span class="ptitle">▸ ENGAGEMENT SETTINGS</span></div>
       <div class="pbody settings" id="settings"><div class="muted">awaiting telemetry…</div></div>
     </section>
+    <section class="panel">
+      <div class="phead"><span class="ptitle">▸ MODEL STATUS</span><span class="pmeta" id="modelMeta"></span></div>
+      <div class="pbody mstatus" id="modelStatus"><div class="muted">awaiting telemetry…</div></div>
+    </section>
   </div>
 
   <!-- CENTER: live feed -->
@@ -73,6 +77,7 @@
         <span class="ptitle"><span class="rec" id="rec"></span> <span id="feedTitle">LIVE INTERCEPT FEED</span></span>
         <span class="pmeta">
           <span class="viewmodes" id="viewModes"></span>
+          <button id="expandBtn" class="expandbtn" title="expand all feed text (or click any line)">⤢ expand</button>
           <label class="chk"><input type="checkbox" id="autoscroll" checked> autoscroll</label>
           <input id="feedFilter" class="filter" placeholder="filter…">
         </span>
@@ -88,6 +93,10 @@
     <section class="panel">
       <div class="phead"><span class="ptitle">▸ CONFIRMED CRITICALS</span><span class="pmeta crit" id="critCount">0</span></div>
       <div class="pbody findings" id="confirmed"><div class="muted">none confirmed</div></div>
+    </section>
+    <section class="panel">
+      <div class="phead"><span class="ptitle">▸ CANDIDATES</span><span class="pmeta" id="candCount">0</span></div>
+      <div class="pbody findings" id="candidates"><div class="muted">none yet</div></div>
     </section>
     <section class="panel">
       <div class="phead"><span class="ptitle">▸ NEEDS HUMAN REVIEW</span><span class="pmeta warn" id="nhCount">0</span></div>

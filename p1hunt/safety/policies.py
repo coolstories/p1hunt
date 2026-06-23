@@ -16,7 +16,12 @@ from ..models import Scope, ScopeGuardPolicy, TargetClass
 
 # Environments that count as an authorized safe-harbor sandbox for LIVE testing. Production is
 # deliberately absent — a dynamic target declared "production" is never authorized for contact.
-_SANDBOX_ENVIRONMENTS = ("uat", "owned", "testnet", "local", "staging")
+# "bounty" = an authorized PUBLIC bug-bounty program whose published safe harbor permits in-scope
+# testing of the live (production) service — e.g. HackerOne/Bugcrowd programs like T-Mobile. The
+# operator opts into it explicitly (--live-env bounty); the bare label "production" is still REFUSED
+# so a misconfig can never silently authorize an unscoped prod target. The destructive floor
+# (no DELETE, no data destruction, no DoS) and the egress jail (in-scope hosts only) STILL apply.
+_SANDBOX_ENVIRONMENTS = ("uat", "owned", "testnet", "local", "staging", "bounty")
 # Write HTTP verbs unlocked for AUTHORIZED live testing. DELETE is intentionally excluded — it is
 # the one common verb whose accidental success is irreversible even on an owned/UAT object.
 _LIVE_WRITE_METHODS = ("POST", "PUT", "PATCH")
