@@ -10,7 +10,7 @@ Claude session with the opposite prior that tries to refute each candidate.
 
 from __future__ import annotations
 
-from .claude_session import ClaudeFinding, ClaudeSession, EventEmit, SessionResult, parse_ruled_out
+from .claude_session import ClaudeFinding, ClaudeSession, EventEmit, SessionResult, make_session, parse_ruled_out
 
 
 def hunt_prompt(
@@ -155,6 +155,19 @@ the attacker's control over the input was.) So never reason from "is this code c
      missing on another; ordering / reentrancy / precision / signedness / domain assumptions. Develop
      SEVERAL concrete, code-cited hypotheses and, for each, argue concretely whether the attacker can
      reach the win or is genuinely blocked — that argument is where the P1 lives.
+ (2b) BREAK A GUARANTEE — do NOT pattern-match known bug shapes (that only finds bugs you already
+     know; a real P1 is usually a class you didn't anticipate). Every component PROMISES something:
+     DERIVE what THIS one must guarantee from what it IS and what its callers/tests rely on — the
+     security properties an attacker must never break (you know the definitions: e.g. a proof must be
+     sound AND reveal nothing about its witness; a commitment must bind AND hide; a signature must be
+     unforgeable + non-malleable; a value meant to be unique/unpredictable must stay so; a secret/share
+     must never leak). Pick ONE guarantee, write the implicit argument for WHY it holds HERE, then find
+     the exact step in that argument that does NOT actually hold in the code — testing it under EVERY
+     condition the attacker controls: all input values, ordering, REPETITION/replay of the same call,
+     concurrency, partial/malicious participation, and the full value-domain of every field. The gap
+     between the promised property and the implementation is where the critical lives; the bug CLASS is
+     whatever that gap turns out to be. Read the TESTS too — they encode the contract (what's guarded vs
+     permitted) and reveal which guarantees the authors did and did not enforce.
  (3) For the strongest hypothesis, write a MINIMAL proof-of-concept in the target's own harness (a
      Foundry/forge test, pytest, go/cargo test, or an authenticated request) into ./{poc_reldir}/ and
      RUN it against the REAL code. The RUN is the JUDGE: it CONFIRMS the bug your reasoning found, or
@@ -477,11 +490,9 @@ class ClaudeHunter:
             allow_web=self.allow_web, web_budget=self.web_budget,
             perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None),
         )
-        if getattr(self, "discovery_engine", "claude") == "codex":
-            from .codex_session import CodexSession
-            return CodexSession(model=getattr(self, "codex_model", None),
-                                effort=getattr(self, "codex_effort", None), **common)
-        return ClaudeSession(model=self.model, **common)
+        return make_session(model=self.model, engine=getattr(self, "discovery_engine", None),
+                            effort=getattr(self, "codex_effort", None),
+                            codex_model=getattr(self, "codex_model", None), **common)
 
     async def _map(self, critical_means: str, repo_path: str, invariants, known_patterns,
                    subsystem: str) -> None:
@@ -581,7 +592,7 @@ class ClaudeVerifier:
         """Returns (status, severity, reason) where status is 'real' | 'refuted' | 'unverified'.
         A transient/unparseable verification is 'unverified' — NOT 'refuted' — so real
         candidates are never silently dropped when the verifier session fails."""
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
             perms=getattr(self, "perms", None),
@@ -733,7 +744,7 @@ class ClaudePoCProver:
         failure). The deterministic runner — not this session — decides reproduction."""
         self.on_event(self.agent_name, "message",
                       {"phase": "materialize", "title": finding.title, "file": finding.file})
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
             perms=getattr(self, "perms", None),
@@ -764,7 +775,7 @@ class ClaudePoCProver:
         proof into a run→read-failure→fix→rerun loop, converting reasoned bugs into confirmed ones."""
         self.on_event(self.agent_name, "message",
                       {"phase": "repair", "title": finding.title, "file": finding.file})
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
             perms=getattr(self, "perms", None),
@@ -787,7 +798,7 @@ class ClaudePoCProver:
         """Returns (verdict, summary, poc_path); verdict ∈ proven | not_reproduced | inconclusive."""
         self.on_event(self.agent_name, "message",
                       {"phase": "poc", "title": finding.title, "severity": finding.severity})
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
             perms=getattr(self, "perms", None),
@@ -902,6 +913,12 @@ THE BAR (score your result against THIS exactly):
 METHOD — close the chain end to end, against the REAL shipped code:
  1. MODEL THE FULL ATTACK PATH. From the primitive to the attacker-win: every step, every value the
     attacker controls, every thing they observe, every protocol round. Write it down before coding.
+    Frame the target as a SECURITY GUARANTEE to break (soundness/hiding/binding/unforgeability/secrecy/
+    uniqueness — whatever this component promises), and use WHATEVER technique breaks that property —
+    do not restrict yourself to bug shapes you already know. Generic primitives that surface novel
+    breaks: re-run/replay the same secret-dependent op and DIFF/COMBINE outputs; differential vs a
+    reference/spec; statistical/lattice recovery; multi-party adversarial simulation; driving every
+    field to its full value-domain. The exploit is the concrete violation of the promised property.
  2. BUILD THE REAL ENVIRONMENT. Deploy / drive the ACTUAL library (not a toy). If the protocol is
     multi-party, SIMULATE ALL parties and play the malicious one(s) yourself. Reach PAST the gates
     (real keygen, real signing) into the value-moving logic. Put harnesses under ./{poc_reldir}/.
@@ -961,7 +978,7 @@ class ClaudeExploitDeveloper:
         self.on_event(self.agent_name, "message",
                       {"phase": "exploit_dev", "title": getattr(finding, "title", ""), "file": _loc,
                        "attempt": len(prior_attempts or []) + 1})
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
             perms=getattr(self, "perms", None),
@@ -1005,7 +1022,7 @@ class ClaudeDeduplicator:
     async def is_duplicate(self, finding: ClaudeFinding, existing: list, repo_path: str) -> tuple[bool, int, str]:
         if not existing:
             return False, 0, "nothing to compare against"
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
             perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))
@@ -1081,7 +1098,7 @@ class ClaudeDebate:
         self.max_turns = max_turns
 
     async def _argue(self, finding: ClaudeFinding, role: str, repo_path: str) -> str:
-        session = ClaudeSession(
+        session = make_session(
             agent_name=f"{self.agent_name}:{role}", model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
             perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))
@@ -1092,7 +1109,7 @@ class ClaudeDebate:
         self.on_event(self.agent_name, "message", {"phase": "debate", "title": finding.title})
         prosecution = await self._argue(finding, "prosecutor", repo_path)
         defense = await self._argue(finding, "defender", repo_path)
-        judge = ClaudeSession(
+        judge = make_session(
             agent_name=f"{self.agent_name}:judge", model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
             perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))

@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import re
 
-from .claude_session import ClaudeFinding, ClaudeSession, EventEmit, SessionResult
+from .claude_session import ClaudeFinding, ClaudeSession, EventEmit, SessionResult, make_session
 
 
 # --- deterministic forge-output parsing (unit-testable, no Claude needed) ------------------
@@ -208,7 +208,7 @@ class ClaudeFuzzer:
             self.on_event(self.agent_name, "finding_reported",
                           {"title": cf.title, "severity": cf.severity, "file": cf.file, "line": cf.line})
 
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns, finding_sink=_sink,
             allow_web=False, perms=getattr(self, "perms", None),

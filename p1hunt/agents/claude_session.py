@@ -804,3 +804,36 @@ def parse_findings(text: str, lens_default: str = "") -> list[ClaudeFinding]:
         if out:
             return out
     return []
+
+
+def engine_available(engine: str) -> bool:
+    """Is the chosen AI engine runnable? 'codex' needs the codex CLI; 'claude' needs the SDK/CLI."""
+    if (engine or "").strip().lower() == "codex":
+        try:
+            from .codex_session import codex_available
+            return codex_available()
+        except Exception:
+            return False
+    return sdk_available()
+
+
+def make_session(*, model=None, engine: str | None = None, effort: str | None = None,
+                 codex_model: str | None = None, **kwargs):
+    """Engine-agnostic session factory used by EVERY role (orchestrator, hunters, falsifier, prover,
+    exploit-developer, debate, dedup, fuzz). With engine='codex' the whole swarm runs on Codex and
+    NOTHING depends on Claude Code. CodexSession is interface-compatible (run(prompt,cwd)->SessionResult).
+
+    engine resolves to: the explicit arg, else $P1HUNT_ENGINE, else 'claude'. The Claude-tier `model`
+    is ignored for Codex (Codex uses its account default / $P1HUNT_CODEX_MODEL + per-tier effort).
+    """
+    import os as _os
+    eng = (engine or _os.environ.get("P1HUNT_ENGINE", "claude")).strip().lower()
+    if eng == "codex":
+        from .codex_session import CodexSession
+        ck = dict(kwargs)
+        if effort:
+            ck["effort"] = effort
+        if codex_model is not None:
+            ck["model"] = codex_model
+        return CodexSession(**ck)
+    return ClaudeSession(model=model, **kwargs)

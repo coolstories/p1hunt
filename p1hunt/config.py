@@ -25,7 +25,8 @@ class Models:
     # runs the Claude hunters; "codex" runs OpenAI's Codex CLI (GPT-5.5-Codex) at xhigh reasoning
     # — a second strong model to widen what gets found (EVMbench model-alloy). Verification, PoC,
     # and the exploit-development depth phase ALWAYS stay on Claude regardless.
-    discovery_engine: str = "claude"        # "claude" | "codex"
+    engine: str = "claude"                  # GLOBAL engine for ALL roles ("claude" | "codex")
+    discovery_engine: str = "claude"        # discovery hunters only ("claude" | "codex"); follows engine
     codex_model: str = ""                   # "" = codex account default (ChatGPT auth rejects slugs)
     codex_effort: str = "xhigh"             # minimal | low | medium | high | xhigh
 
@@ -111,13 +112,21 @@ class Config:
         # The real detector is a Claude swarm — enabled whenever the Claude Agent SDK + CLI
         # are reachable (no API key needed; uses the local `claude` auth). Override with
         # P1HUNT_USE_CLAUDE=0/1. Falls back to the deterministic brain when unavailable.
-        from .agents.claude_session import sdk_available
+        from .agents.claude_session import engine_available
 
+        # GLOBAL ENGINE: P1HUNT_ENGINE=codex runs the ENTIRE swarm on Codex — orchestrator, hunters,
+        # falsifier, prover, exploit-developer, debate, dedup, fuzz — so NOTHING depends on Claude Code.
+        _global_eng = os.environ.get("P1HUNT_ENGINE", "claude").strip().lower()
+        if _global_eng not in ("claude", "codex"):
+            _global_eng = "claude"
+        os.environ["P1HUNT_ENGINE"] = _global_eng  # canonical value the make_session factory reads
+        cfg.models.engine = _global_eng
+        # DISCOVERY ENGINE: explicit override, else FOLLOWS the global engine (so codex-global => codex discovery).
+        _eng = os.environ.get("P1HUNT_DISCOVERY_ENGINE", _global_eng).strip().lower()
+        cfg.models.discovery_engine = _eng if _eng in ("claude", "codex") else _global_eng
+        # AI brain is ON iff the chosen engine is actually runnable (codex CLI / claude SDK+CLI).
         env_flag = os.environ.get("P1HUNT_USE_CLAUDE")
-        cfg.use_claude = (env_flag == "1") if env_flag is not None else sdk_available()
-        # DISCOVERY ENGINE selector (Claude hunters by default; Codex GPT-5.5-Codex xhigh opt-in).
-        _eng = os.environ.get("P1HUNT_DISCOVERY_ENGINE", cfg.models.discovery_engine).strip().lower()
-        cfg.models.discovery_engine = _eng if _eng in ("claude", "codex") else "claude"
+        cfg.use_claude = (env_flag == "1") if env_flag is not None else engine_available(_global_eng)
         cfg.models.codex_model = os.environ.get("P1HUNT_CODEX_MODEL", cfg.models.codex_model)
         cfg.models.codex_effort = os.environ.get("P1HUNT_CODEX_EFFORT", cfg.models.codex_effort)
         cfg.provision = os.environ.get("P1HUNT_PROVISION", "1") != "0"

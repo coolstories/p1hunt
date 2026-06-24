@@ -332,7 +332,7 @@ class ClaudeSwarm:
         diagnosis = f"silent {int(idle)}s; downgrade/limit signals={rl_hits}"
         if self.config.use_claude:
             try:
-                from .claude_session import ClaudeSession
+                from .claude_session import make_session
                 prompt = (
                     f"You are Parent A, lead of an autonomous security hunt. The swarm produced NO "
                     f"activity for {int(idle)} seconds — it stalled (a hunter session hung, or the "
@@ -341,7 +341,7 @@ class ClaudeSwarm:
                     f"stall — e.g. be decisive, write a small PoC and RUN it instead of reading "
                     f"endlessly, delegate big reads to sub-agents, don't spiral. Return ONLY JSON: "
                     f'{{"rate_limited": true|false, "diagnosis": "...", "notice": "<the directive>"}}')
-                sess = ClaudeSession(agent_name=self.name, model=self.config.models.orchestrator,
+                sess = make_session(agent_name=self.name, model=self.config.models.orchestrator,
                                      on_event=self._emit, guard_check=None, max_turns=3, allow_web=False,
                                      perms=self._perms, egress_hosts=self._egress_hosts)
                 res = await asyncio.wait_for(sess.run(prompt, self.repo_path), timeout=90)
@@ -573,26 +573,32 @@ class ClaudeSwarm:
         import json as _json
 
         return (
-            f"You are Parent A, the lead of this security audit, reviewing the team between rounds. "
-            f"Round {depth} just finished. 'Critical' for this target = {critical_means}\n\n"
-            f"Confirmed criticals so far: {crit_count}. Here is where each track stands (its findings "
-            f"this round and what it has investigated-and-ruled-out):\n\n"
-            f"{_json.dumps(digest, indent=2)}\n\n"
-            "Your job: for EACH track, write a short, SPECIFIC directive for its next round that gets "
-            "it somewhere — acknowledge what it did, then steer it: go deeper on a promising thread, "
-            "ABANDON an exhausted angle, cross-pollinate with another track's lead, or pivot it to "
-            "specific files (e.g. the in-scope deployed code). If a track is exhausted, repurpose it "
-            "to a fresh angle no one is covering. You may read the code to ground your steer.\n\n"
+            f"You are Parent A running a COVERAGE + NOVELTY review between rounds. Round {depth} finished. "
+            f"'Critical' for this target = {critical_means}. Confirmed criticals so far: {crit_count}.\n\n"
+            f"Per-track state (findings this round + what each ruled out):\n{_json.dumps(digest, indent=2)}\n\n"
+            "The failure mode after many rounds is REPETITION: tracks re-attacking the same components the "
+            "same way, so the team keeps re-covering its own blind spots and never reaches a bug CLASS it "
+            "hasn't tried. A real P1 almost always lives in an angle nobody has attacked yet. Your job is to "
+            "MAXIMIZE COVERAGE and FORCE NOVELTY:\n"
+            " 1. COVERAGE MAP: across ALL tracks, which security GUARANTEES / components / attack ANGLES have "
+            "already been seriously attacked (and exhausted), and — the high-value part — which guarantees "
+            "that components PROMISE has NOBODY tried to break yet? Derive the un-attacked guarantees.\n"
+            " 2. For EACH track, steer it to an UN-ATTACKED guarantee or a FUNDAMENTALLY DIFFERENT angle than "
+            "it and its peers have already used — do NOT let it repeat a frame already tried. Name the "
+            "specific guarantee to break and why it's unexplored; abandon exhausted threads.\n"
+            " 3. The goal is a NOVEL critical — steer AWAY from anything already found or ruled out, toward "
+            "the unexplored. Re-deriving a known/obvious issue is not progress.\n"
+            "You may read the code/tests to ground the steer.\n\n"
             "Return ONLY JSON:\n"
-            '{"directives": [{"track": <1-based index>, "directive": "<your steer, 1-3 sentences>", '
-            '"focus_files": ["optional","new","relative/paths","to","redirect","this","track"]}]}'
+            '{"directives": [{"track": <1-based index>, "directive": "<steer to an unexplored guarantee/angle, '
+            '1-3 sentences>", "focus_files": ["optional","new","relative/paths"]}]}'
         )
 
     async def _resteer(self, hunters, per_hunter_findings, depth, critical_means, findings, guard) -> None:
         """Parent A synthesizes the round and personalizes each hunter's next-round prompt."""
         if not self.config.use_claude or not hunters:
             return
-        from .claude_session import ClaudeSession
+        from .claude_session import make_session
 
         digest = []
         for i, (h, finds) in enumerate(zip(hunters, per_hunter_findings), start=1):
@@ -615,7 +621,7 @@ class ClaudeSwarm:
             digest.append(entry)
         crit_count = sum(f.severity == "critical" for f in findings)
         self._emit(self.name, "message", {"phase": "resteer", "round": depth, "detail": "reviewing the team"})
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
             guard_check=self._guard_check(guard, self.name), max_turns=12,
             perms=self._perms, egress_hosts=self._egress_hosts,
@@ -1108,7 +1114,7 @@ class ClaudeSwarm:
             "deep_discovery": self._deep_discovery,
             "no_model_downgrade": os.environ.get("P1HUNT_NO_MODEL_DOWNGRADE", "0") == "1",
             "run_mode": self.config.run_mode, "cost_cap_usd": self._cost_cap,
-            "discovery_engine": m.discovery_engine,
+            "engine": m.engine, "discovery_engine": m.discovery_engine,
             "claude_account": self.config.claude_account,
             "models": {"orchestrator": m.orchestrator,
                        "worker": (f"codex:{m.codex_model}/{m.codex_effort}"
@@ -1962,7 +1968,18 @@ class ClaudeSwarm:
             "one path or trust a client-supplied field; implicit assumptions a check RELIES ON that an "
             "attacker can break; the most complex / optimized / assembly / hand-rolled-crypto code; "
             "upgrade/migration/init paths; anything that looks recently changed or uniquely intricate. "
-            "These are WHERE to point the team.\n\n"
+            "These are WHERE to point the team.\n"
+            "   DERIVE THE GUARANTEES (this is the engine of finding a class you didn't anticipate — NOT a "
+            "bug checklist). For each crown-jewel component, state what it PROMISES from what it IS and what "
+            "its callers/tests rely on: the security properties an attacker must NEVER be able to break "
+            "(derive them — e.g. a proof: sound + reveals nothing; a commitment: binding + hiding; a "
+            "signature: unforgeable + non-malleable; a value meant unique/unpredictable: stays so; a "
+            "secret/share: never leaks; an invariant the accounting must preserve). Phrase each as 'an "
+            "attacker must NEVER be able to <violate property>'. The team's job is to BREAK these derived "
+            "guarantees — the bug class is whatever the break turns out to be — not to scan for known shapes.\n"
+            "   MINE THE TESTS: the tests encode the contract — which operations are guarded (throw on "
+            "re-call/misuse) vs permitted, and which properties the authors did and did NOT enforce. A "
+            "guarantee the tests show is NOT defended is a high-value lead.\n\n"
             "5) FIND A DIFFERENTIAL ORACLE (high-yield). Is there a SECOND implementation of the same "
             "logic to compare against — a reference/spec impl, an older/alternative version, a known "
             "library implementing the same primitive, or the documented spec itself? If so, say where "
@@ -2042,7 +2059,7 @@ class ClaudeSwarm:
     async def _scope(self, guard: ScopeGuard) -> dict:
         if not self.config.use_claude:
             return {"tracks": self._fallback_tracks()}
-        from .claude_session import ClaudeSession
+        from .claude_session import make_session
 
         self._emit(self.name, "message",
                    {"phase": "scoping", "detail": "cold reconnaissance — no prior knowledge of the target"})
@@ -2050,7 +2067,7 @@ class ClaudeSwarm:
             _recon_turns = max(20, int(os.environ.get("P1HUNT_RECON_TURNS", "45")))
         except ValueError:
             _recon_turns = 45
-        session = ClaudeSession(
+        session = make_session(
             agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
             guard_check=self._guard_check(guard, self.name), max_turns=_recon_turns,
             perms=self._perms, egress_hosts=self._egress_hosts,
