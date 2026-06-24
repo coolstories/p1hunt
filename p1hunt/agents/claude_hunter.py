@@ -946,6 +946,9 @@ Reply ONLY with JSON:
   "harness_path": "<relative path under {poc_reldir} to the runnable exploit, or ''>",
   "evidence": "the real run output that proves the win (or the precise step that blocks it)",
   "shipped_code": true|false,
+  "shipped_function": "the exact shipped function + file:line where the BUG lives (the real defect, not your harness)",
+  "relies_on_abstract_interface": true|false,
+  "//attribution": "set relies_on_abstract_interface=TRUE if the win depends on the behavior or the ABSENCE of a guarantee from a pure-virtual (=0) interface the LIBRARY does not implement (the integrator does) — e.g. single-use/consumption of presigned data via the persistency interface, authorization hooks, storage. If your harness supplies its own impl of a =0 method and the 'bug' is that impl's behavior or a missing guarantee that is the integrator's job, it is INVALID (you exploited your own mock, not shipped code) — say true.",
   "strategy": "the SPECIFIC angle you tried THIS attempt (one line — so the next attempt won't repeat it)",
   "why_failed": "if not achieved: the exact step that blocked THIS angle",
   "next_angle": "if not achieved and NOT impossible: a different, concrete angle worth trying next",
@@ -994,12 +997,24 @@ class ClaudeExploitDeveloper:
         v = _parse_verdict(result.text)
         if not v:
             return None
-        achieved = bool(v.get("achieved")) and bool(v.get("shipped_code", True))
+        # ATTRIBUTION GATE: a win that leans on a pure-virtual (=0) interface the LIBRARY doesn't
+        # implement (single-use/consumption, auth hooks, storage — the integrator's job) is INVALID,
+        # even if the harness "demonstrates" it with its own mock. This stops the recurring
+        # over-confirmation of the presig-reuse / persistency class.
+        abstract = bool(v.get("relies_on_abstract_interface", False))
+        achieved = bool(v.get("achieved")) and bool(v.get("shipped_code", True)) and not abstract
+        if abstract and bool(v.get("achieved")):
+            self.on_event(self.agent_name, "lifecycle",
+                          {"event": "exploit_rejected_attribution", "title": finding.title,
+                           "detail": "win relies on a self-supplied impl of a pure-virtual (=0) interface — "
+                                     "integrator responsibility, not shipped-code bug; not confirmed"})
         self.on_event(self.agent_name, "lifecycle",
                       {"event": "exploit_developed" if achieved else "exploit_not_closed",
                        "title": finding.title, "tier": v.get("tier", "none"),
                        "win": str(v.get("win", ""))[:160], "aborts": str(v.get("aborts", "")),
                        "shipped_code": bool(v.get("shipped_code", True)),
+                       "shipped_function": str(v.get("shipped_function", ""))[:160],
+                       "relies_on_abstract_interface": abstract,
                        "strategy": str(v.get("strategy", ""))[:160],
                        "exhausted": bool(v.get("exhausted")),
                        "next_angle": str(v.get("next_angle", ""))[:160],

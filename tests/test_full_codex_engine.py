@@ -99,6 +99,26 @@ class TestGuaranteeBreakingLens(unittest.TestCase):
         self.assertIn("SECURITY GUARANTEE", exploit_dev_prompt(f, ""))
 
 
+class TestAttributionGate(unittest.TestCase):
+    """Gate hardening: a 'critical' whose exploit relies on a self-supplied impl of a pure-virtual
+    (=0) interface (integrator responsibility) must NOT be confirmed — stops the recurring
+    over-confirmation of the presig-reuse / persistency class."""
+    def test_prompt_requires_attribution(self):
+        from p1hunt.agents.claude_hunter import exploit_dev_prompt, ClaudeFinding
+        f = ClaudeFinding(title="t", severity="high", file="f", line=1, lens="x",
+                          root_cause="r", reproduction="r", counterfactual="c", confidence="m")
+        p = exploit_dev_prompt(f, "")
+        self.assertIn("relies_on_abstract_interface", p)
+        self.assertIn("pure-virtual", p)
+
+    def test_develop_enforces_attribution_gate(self):
+        import inspect
+        from p1hunt.agents.claude_hunter import ClaudeExploitDeveloper
+        src = inspect.getsource(ClaudeExploitDeveloper.develop)
+        self.assertIn("relies_on_abstract_interface", src)
+        self.assertIn("not abstract", src)  # achieved = ... and not abstract
+
+
 def ClaudeSwarm_scope_prompt_text() -> str:
     """Render _scope_prompt without constructing a full swarm (bind the method to a tiny shim)."""
     import inspect
