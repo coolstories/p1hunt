@@ -48,6 +48,11 @@ class Config:
     permission_mode: str = "deny"  # most restrictive default; never "ask" unattended (§3, §9)
     unattended: bool = True
     use_claude: bool = False  # the AI is the detector: real Claude swarm when available (§3)
+    # Which Claude account the swarm authenticates as, via CLAUDE_CONFIG_DIR (mirrors the shell
+    # aliases: c5 -> ~/.claude-5x [Max 5x], c20 -> ~/.claude-20x [Max 20x]). Lets a run use a
+    # fresh-quota account instead of an exhausted one. "" leaves CLAUDE_CONFIG_DIR untouched.
+    claude_account: str = "c5"
+    claude_config_dir: str = ""  # resolved CLAUDE_CONFIG_DIR actually applied (for visibility)
     engagements_root: str = "engagements"
     program_registry: str = ""  # how to fetch program brief, rules, taxonomy (§13)
     # Controlled build-environment bootstrap of the audit target (fetch submodules, install
@@ -76,12 +81,33 @@ class Config:
     live_gql_url: str = ""         # P1HUNT_GQL_URL   (GraphQL)
     live_environment: str = "uat"  # P1HUNT_LIVE_ENV  (uat | owned | testnet | staging | local)
 
+    def apply_claude_account(self) -> None:
+        """Resolve ``claude_account`` -> ``CLAUDE_CONFIG_DIR`` so the Claude CLI/SDK authenticates as
+        the chosen account (c5 -> ~/.claude-5x, c20 -> ~/.claude-20x; or P1HUNT_CLAUDE_CONFIG_DIR for
+        a direct path). Only applied when the dir exists, so it never breaks a host lacking it. Set
+        in os.environ so every Claude subprocess the swarm spawns inherits it."""
+        acct = (self.claude_account or "").strip().lower()
+        cfgdir = os.environ.get("P1HUNT_CLAUDE_CONFIG_DIR", "").strip()
+        if not cfgdir:
+            if acct in ("c5", "5x"):
+                cfgdir = os.path.expanduser("~/.claude-5x")
+            elif acct in ("c20", "20x"):
+                cfgdir = os.path.expanduser("~/.claude-20x")
+        if cfgdir and os.path.isdir(cfgdir):
+            os.environ["CLAUDE_CONFIG_DIR"] = cfgdir
+            self.claude_config_dir = cfgdir
+        else:
+            self.claude_config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+
     @classmethod
     def from_env(cls) -> "Config":
         cfg = cls()
         cfg.run_mode = os.environ.get("P1HUNT_RUN_MODE", cfg.run_mode)
         cfg.engagements_root = os.environ.get("P1HUNT_ENGAGEMENTS", cfg.engagements_root)
         cfg.unattended = os.environ.get("P1HUNT_UNATTENDED", "1") != "0"
+        # CLAUDE ACCOUNT: select which logged-in account the swarm uses (fresh quota vs exhausted).
+        cfg.claude_account = os.environ.get("P1HUNT_CLAUDE_ACCOUNT", cfg.claude_account)
+        cfg.apply_claude_account()
         # The real detector is a Claude swarm — enabled whenever the Claude Agent SDK + CLI
         # are reachable (no API key needed; uses the local `claude` auth). Override with
         # P1HUNT_USE_CLAUDE=0/1. Falls back to the deterministic brain when unavailable.

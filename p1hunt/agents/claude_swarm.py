@@ -1109,6 +1109,7 @@ class ClaudeSwarm:
             "no_model_downgrade": os.environ.get("P1HUNT_NO_MODEL_DOWNGRADE", "0") == "1",
             "run_mode": self.config.run_mode, "cost_cap_usd": self._cost_cap,
             "discovery_engine": m.discovery_engine,
+            "claude_account": self.config.claude_account,
             "models": {"orchestrator": m.orchestrator,
                        "worker": (f"codex:{m.codex_model}/{m.codex_effort}"
                                   if m.discovery_engine == "codex" else m.worker),

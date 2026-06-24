@@ -300,6 +300,10 @@ def _hunt(args: argparse.Namespace) -> int:
     config = Config.from_env()
     if args.no_claude:
         config.use_claude = False
+    if getattr(args, "claude_account", None):
+        config.claude_account = args.claude_account
+        config.apply_claude_account()
+        print(f"◈ Claude account: {config.claude_account}  (CLAUDE_CONFIG_DIR={config.claude_config_dir or 'default'})")
     if getattr(args, "web", False):
         return _web_hunt(config, args)
     if getattr(args, "auto_install_toolchain", False):
@@ -789,6 +793,9 @@ def main(argv: list[str] | None = None) -> int:
     hunt.add_argument("--scope-note", dest="scope_note",
                       help="Rules-of-engagement note surfaced to Parent A and the hunters.")
     hunt.add_argument("--no-claude", action="store_true", help="Force the deterministic offline brain.")
+    hunt.add_argument("--claude-account", dest="claude_account", choices=("c5", "c20"), default=None,
+                      help="Which logged-in Claude account to use (CLAUDE_CONFIG_DIR): c5=Max 5x "
+                           "(~/.claude-5x), c20=Max 20x (~/.claude-20x). Use a fresh-quota account.")
     hunt.add_argument("--discovery-engine", dest="discovery_engine", choices=("claude", "codex"), default=None,
                       help="Which model drives the HUNTERS (discovery). 'claude' (default) or 'codex' "
                            "(GPT-5.5-Codex at xhigh reasoning — a second strong model to widen what gets "

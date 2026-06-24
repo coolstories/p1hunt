@@ -35,6 +35,9 @@ CODEX_TIMEOUT = float(os.environ.get("P1HUNT_CODEX_TIMEOUT", "900"))
 # explicit slugs like gpt-5.5-codex). Set P1HUNT_CODEX_MODEL to pin a slug (e.g. with an API key).
 DEFAULT_CODEX_MODEL = os.environ.get("P1HUNT_CODEX_MODEL", "")
 DEFAULT_CODEX_EFFORT = os.environ.get("P1HUNT_CODEX_EFFORT", "xhigh")
+# Fallback models (e.g. Spark) may not accept xhigh, so they get their own (lower) effort. The
+# PRIMARY (GPT-5.5) keeps xhigh — that's the deep-reasoning pass that actually finds P1s.
+DEFAULT_CODEX_FALLBACK_EFFORT = os.environ.get("P1HUNT_CODEX_FALLBACK_EFFORT", "high")
 
 
 # Rate-limit handling. On a usage/rate limit we wait this long then retry, repeatedly, until it
@@ -102,11 +105,13 @@ class CodexSession:
         web_budget: int | None = None,
         effort: str | None = None,
         fallback_models: list | None = None,
+        fallback_effort: str | None = None,
     ) -> None:
         self.agent_name = agent_name
         # Preserve an explicit "" (means "account default — omit --model"); None falls back to default.
         self.model = model if model is not None else DEFAULT_CODEX_MODEL
-        self.effort = effort or DEFAULT_CODEX_EFFORT
+        self.effort = effort or DEFAULT_CODEX_EFFORT                       # primary (GPT-5.5) -> xhigh
+        self.fallback_effort = fallback_effort or DEFAULT_CODEX_FALLBACK_EFFORT  # Spark etc. -> high
         # Failover chain: tried in order when the primary is rate-limited. Default: GPT-5.3-Codex-Spark.
         if fallback_models is None:
             _env = os.environ.get("P1HUNT_CODEX_FALLBACKS", "gpt-5.3-codex-spark")
@@ -144,6 +149,11 @@ class CodexSession:
                 return m
         return None
 
+    def _effort_for(self, model) -> str:
+        """Per-model reasoning effort: the primary (GPT-5.5) gets the full xhigh deep-reasoning pass;
+        fallbacks (Spark) get a lower effort they actually support."""
+        return self.effort if model == self.model else self.fallback_effort
+
     def _build_cmd(self, cwd: str, last_msg_file: str, model=None) -> list[str]:
         """The codex argv (no shell). Pinned to the workspace, configured reasoning, JSONL events.
         Factored out so it's unit-testable without spawning Codex."""
@@ -156,7 +166,7 @@ class CodexSession:
             "--cd", cwd,                    # workspace jail (working dir)
             "--sandbox", "workspace-write", # OS sandbox: writes confined to cwd + tmp
             "--output-last-message", last_msg_file,
-            "-c", f'model_reasoning_effort="{self.effort}"',
+            "-c", f'model_reasoning_effort="{self._effort_for(model)}"',
         ]
         # Only pin a model when one is configured. ChatGPT-account auth rejects explicit slugs
         # (e.g. gpt-5.5-codex) and runs the account default — so an empty model => omit --model.
@@ -283,7 +293,7 @@ class CodexSession:
                 "live. Still return your full final JSON too.")
         cmd = self._build_cmd(cwd, last_msg_file, model)
         self.on_event(self.agent_name, "lifecycle",
-                      {"event": "codex_start", "model": model or "codex-default", "effort": self.effort})
+                      {"event": "codex_start", "model": model or "codex-default", "effort": self._effort_for(model)})
         acc: list[str] = []
         try:
             proc = await asyncio.create_subprocess_exec(
