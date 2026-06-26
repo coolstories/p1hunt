@@ -3250,6 +3250,7 @@ class ClaudeSwarm:
             engine=self.config.models.engine,
             effort=self.config.models.codex_effort,
             codex_model=self.config.models.codex_model,
+            allow_web=self._has_live_web_targets(),
             perms=self._perms, egress_hosts=self._egress_hosts,
         )
         result = await session.run(self._scope_prompt(), self.repo_path)
@@ -3265,6 +3266,7 @@ class ClaudeSwarm:
                 engine=self.config.models.engine,
                 effort=self.config.models.codex_effort,
                 codex_model=self.config.models.codex_model,
+                allow_web=self._has_live_web_targets(),
                 perms=self._perms, egress_hosts=self._egress_hosts,
             )
             retry_result = await retry.run(self._scope_retry_prompt(result.text), self.repo_path)

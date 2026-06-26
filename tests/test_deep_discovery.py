@@ -109,6 +109,11 @@ class TestParentAReconMode(unittest.TestCase):
         self.assertIn("subdomain enumeration is not applicable", prompt)
         self.assertIn("192.0.2.10", prompt)
 
+    def test_parent_scope_session_allows_web_for_live_targets(self):
+        import inspect
+        src = inspect.getsource(ClaudeSwarm._scope)
+        self.assertIn("allow_web=self._has_live_web_targets()", src)
+
 
 class TestRuntimeKnobs(unittest.TestCase):
     def tearDown(self):
