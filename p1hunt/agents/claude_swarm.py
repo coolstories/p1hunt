@@ -1177,9 +1177,21 @@ class ClaudeSwarm:
         except (OSError, ValueError):
             return None
 
-    def _resteer_prompt(self, digest: list[dict], depth: int, critical_means: str, crit_count: int) -> str:
+    def _resteer_prompt(
+        self,
+        digest: list[dict],
+        depth: int,
+        critical_means: str,
+        crit_count: int,
+        notices: list[str] | None = None,
+    ) -> str:
         import json as _json
 
+        notice_text = (
+            "\n\nOPERATOR / RUNTIME NOTICES TO HONOR IN THIS RESTEER:\n- "
+            + "\n- ".join([str(n) for n in (notices or [])[-8:]])
+            if notices else ""
+        )
         return (
             f"You are Parent A running a COVERAGE + NOVELTY review between rounds. Round {depth} finished. "
             f"'Critical' for this target = {critical_means}. Confirmed criticals so far: {crit_count}.\n\n"
@@ -1197,6 +1209,7 @@ class ClaudeSwarm:
             " 3. The goal is a NOVEL critical — steer AWAY from anything already found or ruled out, toward "
             "the unexplored. Re-deriving a known/obvious issue is not progress.\n"
             "You may read the code/tests to ground the steer.\n\n"
+            f"{notice_text}\n\n"
             "Return ONLY JSON:\n"
             '{"directives": [{"track": <1-based index>, "directive": "<steer to an unexplored guarantee/angle, '
             '1-3 sentences>", "focus_files": ["optional","new","relative/paths"]}]}'
@@ -1208,6 +1221,7 @@ class ClaudeSwarm:
             return
         from .claude_session import make_session
 
+        self._drain_control()
         digest = []
         for i, (h, finds) in enumerate(zip(hunters, per_hunter_findings), start=1):
             entry = {
@@ -1238,7 +1252,10 @@ class ClaudeSwarm:
             perms=self._perms, egress_hosts=self._egress_hosts,
         )
         try:
-            res = await session.run(self._resteer_prompt(digest, depth, critical_means, crit_count), self.repo_path)
+            res = await session.run(
+                self._resteer_prompt(digest, depth, critical_means, crit_count, list(self._notices)),
+                self.repo_path,
+            )
         except Exception as exc:
             self._emit(self.name, "lifecycle", {"event": "resteer_failed", "detail": str(exc)})
             return
@@ -1320,6 +1337,7 @@ class ClaudeSwarm:
                 continue
             if d.get("kind") in ("reload", "hot_reload"):
                 mods = [str(m).strip() for m in (d.get("modules") or []) if str(m).strip()]
+                msg = str(d.get("message", "")).strip()
                 try:
                     from ..runtime_reload import apply_runtime_reload
 
@@ -1336,10 +1354,14 @@ class ClaudeSwarm:
                         "Runtime hot reload applied at round boundary: future role calls use refreshed "
                         "prompt/session/helper modules; main hunt-loop bytecode changes may still need resume.",
                     )
+                    if msg:
+                        self._notices.insert(0, msg)
                 except Exception as exc:
                     self._emit(self.name, "lifecycle",
                                {"event": "runtime_reload", "status": "failed",
                                 "detail": str(exc)[:500]})
+                    if msg:
+                        self._notices.insert(0, msg)
                 continue
             if d.get("kind") == "triage":
                 key = str(d.get("finding_key") or "").strip()

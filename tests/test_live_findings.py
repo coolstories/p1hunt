@@ -93,7 +93,11 @@ class LiveFindingPersistenceTests(unittest.TestCase):
             s = _swarm(d)
             eng = Path(d) / "eng"
             (eng / "control.jsonl").write_text(
-                json.dumps({"kind": "reload", "modules": ["p1hunt.agents.claude_hunter"]}) + "\n",
+                json.dumps({
+                    "kind": "reload",
+                    "modules": ["p1hunt.agents.claude_hunter"],
+                    "message": "use refreshed live-web closure gate",
+                }) + "\n",
                 encoding="utf-8",
             )
             with mock.patch("p1hunt.runtime_reload.apply_runtime_reload", return_value={
@@ -108,6 +112,20 @@ class LiveFindingPersistenceTests(unittest.TestCase):
             events = (eng / "events.jsonl").read_text(encoding="utf-8")
             self.assertIn("runtime_reload", events)
             self.assertIn("p1hunt.agents.claude_hunter", events)
+            self.assertIn("use refreshed live-web closure gate", s._notices)
+
+    def test_resteer_prompt_includes_operator_notices(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = _swarm(d)
+            prompt = s._resteer_prompt(
+                [{"track": 1, "theme": "web", "findings_this_round": [], "ruled_out": []}],
+                1,
+                "critical means protected data loss",
+                0,
+                ["go deeper before ruling out transport-blocked tracks"],
+            )
+            self.assertIn("OPERATOR / RUNTIME NOTICES", prompt)
+            self.assertIn("go deeper before ruling out", prompt)
 
     def test_control_pause_resume_stop_updates_runtime_state(self):
         with tempfile.TemporaryDirectory() as d:
