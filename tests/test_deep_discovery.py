@@ -11,6 +11,7 @@ from unittest import mock
 from p1hunt.agents.claude_swarm import ClaudeSwarm, _env_float, _env_int, _parse_json_object
 from p1hunt.agents.claude_session import SessionResult
 from p1hunt.config import Config
+from p1hunt.models import DynamicTarget, Scope
 from p1hunt.runtime_reload import _refresh_swarm_knobs
 
 
@@ -24,11 +25,16 @@ class _TurnsShim:
 class _ReconShim:
     _recon_mode = ClaudeSwarm._recon_mode
     _recon_policy_text = ClaudeSwarm._recon_policy_text
+    _has_live_web_targets = ClaudeSwarm._has_live_web_targets
+    _dynamic_target_payload = ClaudeSwarm._dynamic_target_payload
+    _live_web_scope_prompt = ClaudeSwarm._live_web_scope_prompt
     _scope_prompt = ClaudeSwarm._scope_prompt
     _scope_guidance = lambda self: ""
 
     def __init__(self, run_mode="dry_run"):
         self.config = types.SimpleNamespace(run_mode=run_mode)
+        self._target_class = "OTHER"
+        self.scope = Scope(program="test")
 
 
 class TestDeepDiscoveryTurns(unittest.TestCase):
@@ -71,6 +77,37 @@ class TestParentAReconMode(unittest.TestCase):
         prompt = _ReconShim("dry_run")._scope_prompt()
         self.assertIn("RECON EXECUTION MODE: SOLO", prompt)
         self.assertIn("Do the deep reconnaissance yourself", prompt)
+
+    def test_live_web_targets_get_dynamic_recon_not_repo_recon(self):
+        shim = _ReconShim("active")
+        shim._target_class = "WEB_API"
+        shim.scope = Scope(
+            program="web",
+            dynamic_targets=[DynamicTarget("https://app.example.test/api", "uat", "rest")],
+            scope_note="Only the listed live target is authorized.",
+        )
+
+        prompt = shim._scope_prompt()
+        self.assertIn("AUTHORIZED LIVE TARGETS JSON", prompt)
+        self.assertIn("subfinder -silent", prompt)
+        self.assertIn("robots.txt", prompt)
+        self.assertIn("curl -i", prompt)
+        self.assertIn('"target_class":"WEB_API"', prompt)
+        self.assertIn("app.example.test", prompt)
+        self.assertNotIn("source in the current working directory", prompt)
+
+    def test_live_web_recon_handles_ip_targets_without_subdomain_expansion(self):
+        shim = _ReconShim("active")
+        shim._target_class = "WEB_API"
+        shim.scope = Scope(
+            program="web",
+            dynamic_targets=[DynamicTarget("http://192.0.2.10/flag.txt", "uat", "generic")],
+        )
+
+        prompt = shim._scope_prompt()
+        self.assertIn("If the target is an IP address or exact URL-only host", prompt)
+        self.assertIn("subdomain enumeration is not applicable", prompt)
+        self.assertIn("192.0.2.10", prompt)
 
 
 class TestRuntimeKnobs(unittest.TestCase):

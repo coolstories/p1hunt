@@ -10,6 +10,7 @@ operator stops. Codex is the default runtime engine for every role.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -3000,7 +3001,101 @@ class ClaudeSwarm:
             "return the same structured attacker map before children start."
         )
 
+    def _has_live_web_targets(self) -> bool:
+        return (
+            str(getattr(self, "_target_class", "") or "").upper() == "WEB_API"
+            and bool(getattr(getattr(self, "scope", None), "dynamic_targets", None) or [])
+        )
+
+    def _dynamic_target_payload(self) -> str:
+        targets = []
+        for t in getattr(self.scope, "dynamic_targets", None) or []:
+            targets.append({
+                "base_url": getattr(t, "base_url", ""),
+                "environment": getattr(t, "environment", ""),
+                "kind": getattr(t, "kind", ""),
+                "note": getattr(t, "note", ""),
+            })
+        return json.dumps(targets, separators=(",", ":"))
+
+    def _live_web_scope_prompt(self) -> str:
+        return (
+            "You are Parent A, the LEAD of this live web/API security audit. This target was "
+            "classified from authorized dynamic targets, not from a local source repository. Do NOT "
+            "waste cold reconnaissance mapping nonexistent repo files. Use the workspace only for "
+            "notes, request scripts, and PoCs; derive the attack surface from the live targets and "
+            "scope rules below.\n\n"
+            "NO PRESET LEADS: do not import a canned bug list or target-specific knowledge. Derive "
+            "every hypothesis from observed responses, documented scope objectives, and concrete "
+            "trust boundaries. A scanner finding alone is never enough; only attacker-win evidence "
+            "matters.\n\n"
+            f"AUTHORIZED LIVE TARGETS JSON: {self._dynamic_target_payload()}\n"
+            f"{self._recon_policy_text()}\n\n"
+            "LIVE WEB COLD RECON PLAN:\n"
+            "1) Parse the authorized targets exactly. Treat exact URLs/paths as the default scope. "
+            "Do not expand to a discovered host unless the scope text explicitly authorizes that "
+            "host pattern. Respect every out-of-scope path/domain/method rule.\n"
+            "2) Passive host discovery: if an authorized host is a domain and passive tooling is "
+            "installed, run a bounded command such as `subfinder -silent -d <registrable-domain> "
+            "-all` (or an equivalent passive enumerator). If the target is an IP address or exact "
+            "URL-only host, say subdomain enumeration is not applicable. Discovered hosts are "
+            "context until proven in-scope; do not touch them otherwise.\n"
+            "3) Low-impact baseline only against in-scope targets: bounded `curl -i`, `curl -I`, "
+            "`robots.txt`, `security.txt`, API docs/openapi/swagger links if advertised, and "
+            "small hand-written requests that test one concrete authorization or state-transition "
+            "claim. No brute force, no high-rate crawling, no DoS, no scanner-only reports.\n"
+            "4) Identify actors and secrets from observed flows: unauthenticated visitor, test "
+            "account, privileged endpoint, network-origin assumption, token/session boundary, "
+            "server-side resource, or any special proof objective named by scope. For each actor, "
+            "state what the attacker controls and what must remain protected.\n"
+            "5) Derive crown jewels from the scope and observations: protected account state, "
+            "privileged network/resource access, sensitive data, payment/account authority, or "
+            "any concrete proof artifact the engagement says would demonstrate impact. Do not "
+            "inflate severity without a victim-state delta or protected-resource proof.\n"
+            "6) Build tracks from the observed web surface, ordered most-dangerous-first. Each "
+            "track owns a full attacker flow, not a generic bug category. Include one composition "
+            "track for seams across identity, routing, redirects/proxies, mobile/web, and backend "
+            "resource access if observations show those seams exist.\n\n"
+            "EVIDENCE RULES: source file citations are not required for a live web target with no "
+            "local source. Instead cite concrete observations compactly: URL, method, status, key "
+            "headers, response marker, redirect target, authenticated principal, and timestamp. "
+            "Never fabricate file:line claims.\n\n"
+            "SEVERITY HONESTY: a reproduced HTTP behavior is not a P1 by itself. Before labeling "
+            "critical/high, name the honest victim/protected resource, the pre-committed valuable "
+            "target, the attacker action, and the clean-vs-buggy state delta. If those cannot be "
+            "named, keep the lead as candidate/medium-or-lower until proven.\n"
+            + self._scope_guidance() + "\n\n"
+            "WORKSPACE GUARDRAIL: use \".\" as the workspace root unless you create a narrower "
+            "notes/PoC folder inside it. Network requests must stay within the authorized live "
+            "target policy and the scope rules.\n\n"
+            "OUTPUT BUDGET: return ONE compact JSON object under 16000 characters. No markdown, "
+            "no prose before or after it. Use 4-6 tracks. Cap crown_jewels at 8, attack_surface "
+            "at 12, invariants per track at 5, and investigate items per track at 5.\n\n"
+            "Return ONLY JSON:\n"
+            '{"summary":"...",'
+            '"recon_strategy":"solo|hybrid|parallel",'
+            '"target_class":"WEB_API",'
+            '"threat_model":"...",'
+            '"target_subclass":"<one-word category derived from observed target behavior, or \"\">",'
+            '"workspace_root":".",'
+            '"permissions":{"allow_network":true,"allow_install":true|false,'
+            '"deny_commands":["<substring of commands/paths blocked by scope>",...],'
+            '"note":"<why this posture fits the live engagement>"},'
+            '"critical_means":"<maximum attacker win from the provided scope rules>",'
+            '"crown_jewels":["<protected resource/authority + observed URL/status/header evidence>",...],'
+            '"attack_surface":["<method URL actor-control observation>",...],'
+            '"differential_oracle":{"exists":true|false,"description":"second implementation/spec/docs/alternate client observed, or none"},'
+            '"top_hypothesis":"<single highest-value attacker flow to test next, grounded in observations>",'
+            '"tracks":[{"theme":"...","subsystem":"...","fuzz_mode":"invariant|differential",'
+            '"expected_severity":"critical|high|medium","attacker_reachability":"high|medium|low",'
+            '"focus_files":["<URL or local PoC note path>",...],'
+            '"invariants":["attacker must never <force protected web outcome>",...],'
+            '"investigate":["specific low-impact request sequence or proof script to run"]}]}'
+        )
+
     def _scope_prompt(self) -> str:
+        if self._has_live_web_targets():
+            return self._live_web_scope_prompt()
         return (
             "You are Parent A, the LEAD of this security audit and the BRAIN of the whole hunt. Your "
             "recon decides everything downstream — which subsystems are owned, which invariants are "
