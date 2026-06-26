@@ -105,19 +105,47 @@ class TestCodexStreamMapping(unittest.TestCase):
         self.assertIn("final answer", "".join(acc))
 
     def test_command_events_emit_operator_progress(self):
+        os.environ["P1HUNT_VERBOSE_PROGRESS"] = "1"
+        s = self._session()
+        acc = []
+        try:
+            line = json.dumps({
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "nl -ba src/common/cosigner/mta.cpp | sed -n '1125,1285p'",
+                },
+            })
+            s._handle_line(line, acc)
+            messages = [d for k, d in self.events if k == "message"]
+            self.assertTrue(any(d.get("phase") == "progress" for d in messages))
+            self.assertTrue(any("mta.cpp" in d.get("detail", "") for d in messages))
+        finally:
+            os.environ.pop("P1HUNT_VERBOSE_PROGRESS", None)
+
+    def test_command_progress_is_quiet_by_default(self):
         s = self._session()
         acc = []
         line = json.dumps({
             "type": "item.completed",
-            "item": {
-                "type": "command_execution",
-                "command": "nl -ba src/common/cosigner/mta.cpp | sed -n '1125,1285p'",
-            },
+            "item": {"type": "command_execution", "command": "curl -i https://example.test/"},
         })
         s._handle_line(line, acc)
-        messages = [d for k, d in self.events if k == "message"]
-        self.assertTrue(any(d.get("phase") == "progress" for d in messages))
-        self.assertTrue(any("mta.cpp" in d.get("detail", "") for d in messages))
+        kinds = [k for k, _ in self.events]
+        self.assertIn("tool_call", kinds)
+        self.assertNotIn("message", kinds)
+
+    def test_duplicate_command_events_are_dropped(self):
+        s = self._session()
+        acc = []
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {"type": "command_execution", "command": "pwd"},
+        })
+        s._handle_line(line, acc)
+        s._handle_line(line, acc)
+        self.assertEqual([k for k, _ in self.events].count("tool_call"), 1)
+        self.assertEqual(s.tool_calls, 1)
 
     def test_progress_helpers_describe_observable_work(self):
         self.assertIn("searching", _progress_for_command("rg -n 'verify' src/common"))

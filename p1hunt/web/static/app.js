@@ -677,7 +677,10 @@ function toolProgressText(d) {
   if (lower.includes("git status")) return "checking workspace state";
   if (lower.includes("forge test") || /\bforge\b/.test(lower)) return "running Foundry validation";
   if (lower.includes("pytest") || lower.includes("ctest") || /\bmake\b/.test(lower) || lower.includes("cmake")) return "building or running tests";
-  if (lower.includes("curl ")) return "checking endpoint";
+  if (lower.includes("curl ")) {
+    const u = cmd.match(/https?:\/\/[^\s'"\\)]+/);
+    return u ? `curl ${clip(u[0], 120)}` : "curl";
+  }
   return `${d?.tool || ""}  ${clip(d?.target, 600)}`;
 }
 
@@ -710,7 +713,7 @@ function fmtEvent(e) {
     if (p === "poc") return L("system", `PoC: ${clip(d.title,70)}`);
     if (p === "materialize") return L("system", `materialize harness: ${clip(d.title,60)}`);
     if (p === "repair") return L("system", `repair harness: ${clip(d.title,60)}`);
-    if (p === "progress") return L("system", clip(d.detail || d.target || "working", 140));
+    if (p === "progress") return null;
     if (p === "intervention") return L("assign", `Parent A to ${d.to || "service"}: ${clip(d.title || d.directive || "", 90)}${d.blocked_by ? " · blocked by " + clip(d.blocked_by, 50) : ""}`);
     if (p === "resteer") return L("system", "re-steering the team");
     if (p === "notice") return L("round", `notice: ${clip(d.notice,90)}`);
@@ -769,7 +772,12 @@ function ingest(events) {
         t: `${ev==="debate_upheld"?"✓ upheld":ev==="debate_downgraded"?"↓ "+e.data.to:"✗ rejected"}: ${clip(e.data.title,55)}` });
     }
     const line = fmtEvent(e);
-    if (line) S.feed.push(line);
+    if (line) {
+      const dup = S.feed.slice(-8).some(prev =>
+        prev.ag === line.ag && prev.cls === line.cls && prev.text === line.text
+        && Math.abs((prev.ts || 0) - (line.ts || 0)) < 3);
+      if (!dup) S.feed.push(line);
+    }
   }
   if (S.feed.length > 800) { const rm = S.feed.length - 800; S.feed.splice(0, rm); feedRendered = Math.max(0, feedRendered - rm); }
   if (S.debate.length > 40) S.debate.length = 40;

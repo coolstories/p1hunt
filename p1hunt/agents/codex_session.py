@@ -195,6 +195,7 @@ class CodexSession:
         self.tool_calls = 0
         self._stream_error = ""   # set if Codex streams an error event (auth/401/rate-limit/etc.)
         self._last_progress_sig = ""
+        self._last_tool_sig = ("", 0.0)
 
     def _network_allowed(self) -> bool:
         """Network only if the engagement posture allows it AND web is granted to this agent."""
@@ -288,9 +289,15 @@ class CodexSession:
                 self.on_event(self.agent_name, "thinking", {"text": txt[:6000], "extended": True})
         elif itype in ("command_execution", "command", "exec", "local_shell_call"):
             cmd = str(item.get("command") or item.get("cmd") or item.get("input") or "")
+            sig = f"Bash|{cmd}"
+            now = time.monotonic()
+            if sig == self._last_tool_sig[0] and now - self._last_tool_sig[1] < 2.0:
+                return
+            self._last_tool_sig = (sig, now)
             self.tool_calls += 1
             self.on_event(self.agent_name, "tool_call", {"tool": "Bash", "target": cmd[:600]})
-            self._emit_progress_for_command(cmd)
+            if os.environ.get("P1HUNT_VERBOSE_PROGRESS", "").strip() in ("1", "true", "yes"):
+                self._emit_progress_for_command(cmd)
         elif itype in ("file_change", "patch", "apply_patch"):
             tgt = str(item.get("path") or item.get("files") or item.get("summary") or "")
             self.tool_calls += 1
