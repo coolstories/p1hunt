@@ -149,6 +149,21 @@ class TestGuaranteeBreakingLens(unittest.TestCase):
         self.assertNotIn("external call before state update", p)
         self.assertNotIn("preset scanner hit", p)
 
+    def test_web_map_prompt_is_black_box_not_repo_mapping(self):
+        p = claude_hunter.web_map_prompt(
+            "exact flag endpoint",
+            "retrieve protected proof artifact",
+            base_urls=["http://192.0.2.10/flag.txt"],
+            egress_hosts=["192.0.2.10"],
+            investigate=["determine baseline status"],
+            scope_note="Special live target only.",
+        )
+        self.assertIn("black-box WEB/API", p)
+        self.assertIn("Do NOT map a repository", p)
+        self.assertIn("subdomain enumeration is not", p)
+        self.assertIn("URL, method, timestamp/status/header/body", p)
+        self.assertIn("Source file:line citations are not required", p)
+
     def test_resteer_is_coverage_and_novelty_driven(self):
         import inspect
         from p1hunt.agents import claude_swarm

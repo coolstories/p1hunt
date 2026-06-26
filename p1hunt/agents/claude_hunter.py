@@ -308,6 +308,11 @@ before a packet leaves): {hosts}
 Test identities available: {ids}
 {oob}{note}{steer}{notice}{prior}{rl}
 
+BLACK-BOX MODE: this is not a source repository audit. Do not spend turns on `git ls-files`,
+`git remote`, broad `rg --files`, or backend source mapping unless you have first harvested a real
+source artifact such as JS/OpenAPI/docs from the live target. The durable evidence is request/response
+behavior and repeatable PoC scripts under ./{poc_reldir}/.
+
 SAFE HARBOR — NON-NEGOTIABLE (you are a guest on a real system):
  - Touch ONLY in-scope hosts. Never an out-of-scope host, never a third party.
  - NON-DESTRUCTIVE ONLY: no DELETE of others' data, no account takeover beyond minimal proof, no
@@ -426,6 +431,62 @@ Report ONLY JSON:
           "entrypoints, state, trust boundaries, attacker inputs, protected quantities, flows, "
           "invariants, and the few highest-value open threads. No pasted source/output.>",
  "threads": ["<ranked, concrete attack thread to pursue, citing where>", "..."]}}"""
+
+
+def web_map_prompt(
+    subsystem: str,
+    critical_means: str,
+    *,
+    base_urls: list[str] | None = None,
+    egress_hosts: list[str] | None = None,
+    identities: list[str] | None = None,
+    investigate: list[str] | None = None,
+    invariants: list[str] | None = None,
+    scope_note: str = "",
+    poc_reldir: str = ".p1hunt-poc",
+) -> str:
+    """Live WEB_API MAP phase. Unlike map_prompt(), this must not assume backend source exists."""
+    urls = "\n  - ".join(base_urls or []) or "(see the authorized target environment)"
+    hosts = ", ".join(egress_hosts or []) or "(authorized host allowlist from environment)"
+    ids = ", ".join(identities or []) or "none supplied"
+    todo = ("\nParent A flagged these live checks/threads:\n  - " + "\n  - ".join(investigate or [])
+            if investigate else "")
+    inv = ("\nScope-derived guarantees to model:\n  - " + "\n  - ".join((invariants or [])[:8])
+           if invariants else "")
+    note = ("\nRules of engagement:\n" + scope_note.strip()) if scope_note and scope_note.strip() else ""
+    return f"""You are a live-web security researcher mapping the '{subsystem}' flow for an AUTHORIZED
+black-box WEB/API engagement. This is the MAP phase: build a durable attack model from live
+observations. Do NOT map a repository, do NOT run git discovery, and do NOT search for backend
+source unless Parent A explicitly listed source artifacts. The current directory is an evidence
+workspace only.
+
+AUTHORIZED TARGETS:
+  - {urls}
+Authorized egress hosts: {hosts}
+Test identities: {ids}
+Scope client: ./{poc_reldir}/p1hunt_dyn.py (prefer it for any repeatable proof harness).{note}{todo}{inv}
+
+What "critical" means here: {critical_means}
+
+Web MAP rules:
+ - Start with low-impact observations only: exact authorized URL(s), HEAD/GET, redirect chain,
+   status, headers that change behavior, authentication challenges, response markers, and advertised
+   docs. Keep requests bounded and non-destructive.
+ - If the authorized host is an IP address or exact URL-only target, subdomain enumeration is not
+   applicable. If it is a domain and passive tooling is installed, passive discovery is context only;
+   do not touch discovered hosts unless scope explicitly authorizes them.
+ - Model actors and protected resources from observed behavior and scope: unauthenticated caller,
+   supplied test identities, account/resource owner, internal network gate, proof artifact, or
+   special objective. Do not inflate severity without a protected-resource or victim-state delta.
+ - For every command/result you rely on, cite the concrete URL, method, timestamp/status/header/body
+   marker. Source file:line citations are not required for black-box web.
+ - If networking is blocked or times out, state that as a blocker and propose the smallest next
+   request to resolve it. Do not invent target behavior.
+
+Return ONLY JSON:
+{{"model": "<compact live-web model, max ~5000 chars: observed endpoints, statuses/headers/body markers,
+            actors, protected resources, trust boundaries, blocked checks, and open attacker-win threads>",
+ "threads": ["<ranked concrete next request sequence or proof harness to pursue>", "..."]}}"""
 
 
 def _json_object_candidates(text: str):
@@ -706,8 +767,20 @@ class ClaudeHunter:
         session = self._make_session(self.map_turns)
         self.on_event(self.agent_name, "message",
                       {"phase": "map", "lens": self.theme, "subsystem": subsystem})
-        prompt = map_prompt(subsystem, critical_means, self.focus_files, self.investigate,
-                            invariants=invariants, known_patterns=known_patterns, allow_web=self._net())
+        if getattr(self, "web_mode", False):
+            prompt = web_map_prompt(
+                subsystem, critical_means,
+                base_urls=list(getattr(self, "base_urls", []) or []),
+                egress_hosts=list(getattr(self, "egress_hosts", []) or []),
+                identities=list(getattr(self, "identities", []) or []),
+                investigate=self.investigate,
+                invariants=invariants,
+                scope_note=getattr(self, "scope_note", ""),
+                poc_reldir=getattr(self, "poc_reldir", ".p1hunt-poc"),
+            )
+        else:
+            prompt = map_prompt(subsystem, critical_means, self.focus_files, self.investigate,
+                                invariants=invariants, known_patterns=known_patterns, allow_web=self._net())
         res = await session.run(prompt, repo_path, lens=self.theme)
         parsed_model = parse_model_update(res.text)
         if parsed_model:

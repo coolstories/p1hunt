@@ -6,10 +6,10 @@ instead of the Claude Agent SDK. It streams Codex's ``--json`` event log into th
 model the cockpit renders (thinking / tool_call / output / usage), and parses the final message
 with the shared ``parse_findings`` so existing prompt-role wrappers can run unchanged.
 
-SAFETY: Codex enforces its OWN OS-level sandbox. We pin it to the workspace via ``--cd`` +
-``--sandbox workspace-write`` (writes confined to cwd + tmp) and keep network OFF unless the
-engagement's permission posture explicitly allows it — the same workspace-jail intent as the
-Claude session's per-tool guard.
+SAFETY: Codex enforces its OWN OS-level sandbox. We pin it to the workspace via ``--cd`` and keep
+network OFF unless the engagement's permission posture explicitly allows it. Most sessions use
+``workspace-write``. Active live-web sessions need real socket support, so they use Codex's
+network-capable sandbox while P1HUNT's egress policy and prompts keep requests in scope.
 """
 
 from __future__ import annotations
@@ -258,12 +258,14 @@ class CodexSession:
         Factored out so it's unit-testable without spawning Codex."""
         if model is None:
             model = self.model
+        network_allowed = self._network_allowed()
+        sandbox = "danger-full-access" if network_allowed else "workspace-write"
         cmd = [
             "codex", "exec",
             "--json",                       # structured event stream we map to cockpit events
             "--skip-git-repo-check",        # the target may not be a git repo
             "--cd", str(Path(cwd).resolve()), # workspace jail (absolute; subprocess cwd is also set)
-            "--sandbox", "workspace-write", # OS sandbox: writes confined to cwd + tmp
+            "--sandbox", sandbox,           # active live web needs socket support
             "--output-last-message", last_msg_file,
             "-c", f'model_reasoning_effort="{self._effort_for(model)}"',
         ]
@@ -273,7 +275,7 @@ class CodexSession:
         # (e.g. gpt-5.5-codex) and runs the account default — so an empty model => omit --model.
         if model and str(model).strip():
             cmd += ["--model", str(model)]
-        if self._network_allowed():
+        if network_allowed and sandbox == "workspace-write":
             cmd += ["-c", "sandbox_workspace_write.network_access=true"]
         return cmd
 

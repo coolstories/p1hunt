@@ -58,7 +58,7 @@ class TestCodexCommand(unittest.TestCase):
         self.assertIn("--model", cmd)
         self.assertIn("gpt-5.5-codex", cmd)
         self.assertIn('model_reasoning_effort="xhigh"', cmd)
-        self.assertIn("workspace-write", cmd)              # OS sandbox jail
+        self.assertIn("workspace-write", cmd)              # default OS sandbox jail
         self.assertIn("--add-dir", cmd)                    # user-local tooling roots for safe installs
         self.assertIn("/work/repo", cmd)                   # --cd workspace
         self.assertIn("/tmp/last.txt", cmd)
@@ -75,7 +75,8 @@ class TestCodexCommand(unittest.TestCase):
         class _Perms:
             allow_network = True
         on = CodexSession(agent_name="a", allow_web=True, perms=_Perms())._build_cmd("/r", "/t")
-        self.assertIn("sandbox_workspace_write.network_access=true", on)
+        self.assertIn("danger-full-access", on)
+        self.assertNotIn("sandbox_workspace_write.network_access=true", on)
 
     def test_install_off_omits_user_local_write_roots(self):
         class _Perms:
