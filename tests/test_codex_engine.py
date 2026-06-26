@@ -13,6 +13,7 @@ from p1hunt.agents.codex_session import (
     CodexSession,
     codex_available,
     _looks_output_overflow,
+    _command_output,
     _progress_for_command,
     _progress_target,
     _with_io_discipline,
@@ -146,6 +147,30 @@ class TestCodexStreamMapping(unittest.TestCase):
         s._handle_line(line, acc)
         self.assertEqual([k for k, _ in self.events].count("tool_call"), 1)
         self.assertEqual(s.tool_calls, 1)
+
+    def test_command_output_event_is_emitted_when_available(self):
+        s = self._session()
+        acc = []
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "pwd",
+                "stdout": "/tmp/work\n",
+                "exit_code": 0,
+            },
+        })
+        s._handle_line(line, acc)
+        outputs = [d for k, d in self.events if k == "tool_output"]
+        self.assertEqual(len(outputs), 1)
+        self.assertIn("/tmp/work", outputs[0]["text"])
+        self.assertIn("exit=0", outputs[0]["text"])
+
+    def test_command_output_extracts_nested_result(self):
+        out = _command_output({"result": {"stdout": "ok\n", "stderr": "warn\n", "exit_code": 7}})
+        self.assertIn("ok", out)
+        self.assertIn("stderr: warn", out)
+        self.assertIn("exit=7", out)
 
     def test_progress_helpers_describe_observable_work(self):
         self.assertIn("searching", _progress_for_command("rg -n 'verify' src/common"))

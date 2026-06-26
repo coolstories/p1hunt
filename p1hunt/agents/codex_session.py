@@ -296,6 +296,9 @@ class CodexSession:
             self._last_tool_sig = (sig, now)
             self.tool_calls += 1
             self.on_event(self.agent_name, "tool_call", {"tool": "Bash", "target": cmd[:600]})
+            out = _command_output(item)
+            if out:
+                self.on_event(self.agent_name, "tool_output", {"text": out[:6000]})
             if os.environ.get("P1HUNT_VERBOSE_PROGRESS", "").strip() in ("1", "true", "yes"):
                 self._emit_progress_for_command(cmd)
         elif itype in ("file_change", "patch", "apply_patch"):
@@ -617,6 +620,42 @@ def _read_and_unlink(path: str) -> str:
     except OSError:
         pass
     return data
+
+
+def _stringify_output(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except TypeError:
+        return str(value)
+
+
+def _command_output(item: dict) -> str:
+    """Extract capped shell output from Codex command events when the stream includes it."""
+    chunks: list[str] = []
+    for key in ("output", "stdout", "stderr"):
+        txt = _stringify_output(item.get(key)).strip()
+        if txt:
+            chunks.append(f"{key}: {txt}" if key == "stderr" else txt)
+    result = item.get("result")
+    if isinstance(result, dict):
+        for key in ("output", "stdout", "stderr"):
+            txt = _stringify_output(result.get(key)).strip()
+            if txt:
+                chunks.append(f"{key}: {txt}" if key == "stderr" else txt)
+        code = result.get("exit_code", result.get("returncode"))
+        if code not in (None, ""):
+            chunks.append(f"exit={code}")
+    code = item.get("exit_code", item.get("returncode"))
+    if code not in (None, ""):
+        chunks.append(f"exit={code}")
+    out = "\n".join(chunks).strip()
+    return out[:6000]
 
 
 def _progress_target(cmd: str) -> str:

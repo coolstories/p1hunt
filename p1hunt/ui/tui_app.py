@@ -199,6 +199,10 @@ class TuiState:
             if kind == "tool_call":
                 # store tool + target split by a unit-separator so the renderer can style them
                 self._add(agent, "tool", f"{data.get('tool','')}\x1f{str(data.get('target',''))[:120]}")
+            elif kind == "tool_output":
+                txt = str(data.get("text", "")).strip()
+                if txt:
+                    self._add(agent, "output", "↳ " + txt[:4000])
             elif kind == "guard_decision":
                 if not data.get("allow"):
                     who = data.get("agent", agent)

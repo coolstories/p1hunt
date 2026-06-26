@@ -677,9 +677,9 @@ function toolProgressText(d) {
   if (lower.includes("git status")) return "checking workspace state";
   if (lower.includes("forge test") || /\bforge\b/.test(lower)) return "running Foundry validation";
   if (lower.includes("pytest") || lower.includes("ctest") || /\bmake\b/.test(lower) || lower.includes("cmake")) return "building or running tests";
-  if (lower.includes("curl ")) {
+  if (/\bcurl\s/.test(lower)) {
     const u = cmd.match(/https?:\/\/[^\s'"\\)]+/);
-    return u ? `curl ${clip(u[0], 120)}` : "curl";
+    if (u) return `curl ${clip(u[0], 120)}`;
   }
   return `${d?.tool || ""}  ${clip(d?.target, 600)}`;
 }
@@ -690,6 +690,7 @@ function fmtEvent(e) {
   const L = (cls, text) => ({ ts: e.ts, ag, cls, text });
   if (k === "thinking") return L("thinking", clip(d.text, 4000));
   if (k === "output") return L("output", clip(d.text, 4000));
+  if (k === "tool_output") return L("output", "↳ " + clip(d.text, 4000));
   if (k === "tool_call") return L("tool", toolProgressText(d));
   if (k === "finding_reported") return L("finding", `posted: ${clip(d.title,90)} [${d.severity||"?"}]`);
   if (k === "finding") return L("finding", d.event === "critical_confirmed"
