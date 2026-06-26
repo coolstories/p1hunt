@@ -308,6 +308,19 @@ def _norm_url(host: str) -> str:
     return h
 
 
+def _split_live_targets(raw: str) -> list[str]:
+    """Split a CLI live-target argument into distinct URL/domain entries.
+
+    Web engagements often have a small exact target set. Let operators pass those
+    targets as a comma/newline/space separated argument so the scope guard,
+    shipped client, Parent A, and children all receive the same first-class list.
+    """
+    import re
+
+    parts = [p.strip() for p in re.split(r"[\s,]+", raw or "") if p.strip()]
+    return list(dict.fromkeys(parts))
+
+
 def _web_hunt(config: Config, args: argparse.Namespace) -> int:
     """Black-box WEB-APP pentest of a LIVE authorized target (XBOW-style). Resolves the in-scope
     hosts (explicit target URL, or auto-scoped program domains), arms the live egress jail, and runs
@@ -319,8 +332,12 @@ def _web_hunt(config: Config, args: argparse.Namespace) -> int:
     config.live_environment = args.live_env or (config.live_environment if config.live_environment != "uat" else "bounty")
 
     hosts: list[str] = []
-    if args.target and (looks_like_repo(args.target) is False) and ("." in args.target or args.target.startswith("http")):
-        hosts = [args.target]
+    explicit_targets = _split_live_targets(args.target)
+    if explicit_targets and all(
+        (looks_like_repo(t) is False) and ("." in t or t.startswith(("http://", "https://")))
+        for t in explicit_targets
+    ):
+        hosts = explicit_targets
     elif args.program:
         auto = _auto_scope(config, args.program, args.platform, getattr(args, "only", "") or "", getattr(args, "url", "") or "")
         if auto is None:
@@ -915,9 +932,10 @@ def main(argv: list[str] | None = None) -> int:
 
     hunt = sub.add_parser("hunt", help="Hunt a REAL target (local path or repo URL) with the Codex swarm.")
     hunt.add_argument("target", nargs="?", default="",
-                      help="Local path to a repo, or a git/GitHub URL to clone. OPTIONAL when you pass "
-                           "--program (+ --platform): the swarm then auto-discovers the engagement scope "
-                           "and pulls the in-scope source itself.")
+                      help="Local path to a repo, a git/GitHub URL to clone, or with --web one or more "
+                           "comma/space separated live URLs/domains. OPTIONAL when you pass --program "
+                           "(+ --platform): the swarm then auto-discovers the engagement scope and pulls "
+                           "the in-scope source itself.")
     hunt.add_argument("--program", help="Program/engagement name (e.g. 'example-program'). With no target, this "
                                         "triggers live auto-scoping from the bounty platform.")
     hunt.add_argument("--platform", default="local",
