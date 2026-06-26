@@ -353,6 +353,19 @@ METHOD — RECON → MODEL → ATTACK-TO-WIN → PROVE (spend most effort on att
  5. DO NOT SELF-DISMISS. A real-impact hypothesis you could not DISPROVE with a run is INCONCLUSIVE,
     not safe — report it (the verifier + runner judge). Record genuine disproofs in ruled_out.
 
+LIVE-WEB CLOSURE GATE:
+ - A timeout, refused TCP connection, blocked route, missing token, or absent concrete app URL is a
+   BLOCKER, not a disproof of the vulnerability class. Do not write "ruled out" as if target
+   behavior was proven safe when no HTTP response or authenticated flow was observed.
+ - Before closing an exact-URL HTTP track, perform a bounded deep pass against ONLY the authorized
+   URL(s): baseline GET/HEAD, safe OPTIONS where allowed, method comparison, Host-preserved request,
+   Connection: close, Accept-Encoding: identity, a single Range or conditional request if safe,
+   HTTP/1.0 vs HTTP/1.1 when useful, explicit port/scheme comparison, route/proxy evidence, and
+   paired-endpoint comparison when multiple exact URLs are in scope.
+ - If that pass still produces no application response, put it in model_update as a transport or
+   vantage blocker with the exact next evidence needed. Do not post low findings for "no response"
+   and do not spend the rest of the run congratulating a timeout.
+
 You may POST a strong finding mid-pass via the blackboard tool after a focused depth check or the
 moment a PoC demonstrates the win. Include the request/PoC evidence, attempted escalation, and any
 blocker that prevents confirmed-critical status.
@@ -377,7 +390,8 @@ Reply ONLY with JSON (same shape the pipeline expects):
  "ruled_out": ["<endpoint/class checked and why it is NOT exploitable>", "..."],
  "model_update": "<your DEEPENED attack-surface map + open threads + best current hypothesis to carry "
                  "into the next round (endpoints, params, roles, IDs, what you tried + outcomes)>"}}
-"findings" may be []. ALWAYS fill ruled_out and model_update so the next round goes deeper."""
+"findings" may be []. Fill ruled_out only for real disproofs; put unresolved blockers and next
+tests in model_update so the next round goes deeper."""
 
 
 def map_prompt(
