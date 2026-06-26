@@ -27,6 +27,8 @@ def classify_artifacts(artifact_dir: str | Path, scope: Scope | None = None) -> 
     root = Path(artifact_dir)
 
     if scope is not None:
+        if scope.dynamic_targets:
+            return TargetClass.WEB_API
         by_asset = _from_assets(scope.in_scope)
         if by_asset is not None:
             return by_asset

@@ -2,8 +2,11 @@
 out-of-scope path globs to enforce. No network/Claude; exercises the deterministic helpers only."""
 
 import unittest
+import tempfile
 
+from p1hunt.classify.classifier import classify_artifacts
 from p1hunt.main import out_of_scope_globs, select_in_scope_repo
+from p1hunt.models import DynamicTarget, Scope, TargetClass
 
 
 class TestSelectInScopeRepo(unittest.TestCase):
@@ -51,6 +54,16 @@ class TestOutOfScopeGlobs(unittest.TestCase):
 
     def test_empty(self):
         self.assertEqual(out_of_scope_globs({}), [])
+
+
+class TestLiveWebClassification(unittest.TestCase):
+    def test_dynamic_target_forces_web_api_even_with_empty_scratch_workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            scope = Scope(
+                program="live web",
+                dynamic_targets=[DynamicTarget(base_url="https://app.example.test", environment="bounty")],
+            )
+            self.assertEqual(classify_artifacts(d, scope), TargetClass.WEB_API)
 
 
 if __name__ == "__main__":
