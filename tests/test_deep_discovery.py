@@ -32,6 +32,8 @@ class _ReconShim:
     _live_web_recon_blocker = ClaudeSwarm._live_web_recon_blocker
     _scope_prompt = ClaudeSwarm._scope_prompt
     _scope_guidance = lambda self: ""
+    _fallback_tracks = ClaudeSwarm._fallback_tracks
+    _web_fallback_tracks = ClaudeSwarm._web_fallback_tracks
 
     def __init__(self, run_mode="dry_run"):
         self.config = types.SimpleNamespace(run_mode=run_mode)
@@ -166,6 +168,20 @@ class TestParentAReconMode(unittest.TestCase):
             "attack_surface": ["GET exact URL timeout", "POST /import accepts attacker URL"],
             "tracks": [{"investigate": ["Test server-side fetch callback safely."]}],
         }), "")
+
+    def test_live_web_fallback_tracks_are_not_repo_tracks(self):
+        shim = _ReconShim("active")
+        shim._target_class = "WEB_API"
+        shim.scope = Scope(
+            program="web",
+            dynamic_targets=[DynamicTarget("https://app.example.test", "bounty", "rest")],
+        )
+        tracks = shim._fallback_tracks()
+        themes = [t["theme"] for t in tracks]
+        self.assertIn("live surface and client contracts", themes)
+        self.assertIn("authorization and object boundaries", themes)
+        self.assertNotIn("repo", themes)
+        self.assertTrue(all("https://app.example.test" in t["focus_files"] for t in tracks))
 
 
 class TestRuntimeKnobs(unittest.TestCase):

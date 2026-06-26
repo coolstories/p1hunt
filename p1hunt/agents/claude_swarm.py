@@ -3535,7 +3535,89 @@ class ClaudeSwarm:
         JSON is unusable, do not insert domain lanes, failure taxonomies, or invariants. Keep the process
         alive with file clusters that force the child to derive its own threat model from code.
         """
+        has_live_web_targets = getattr(self, "_has_live_web_targets", lambda: False)
+        if has_live_web_targets():
+            return self._web_fallback_tracks()
         return self._repo_component_tracks()
+
+    def _web_fallback_tracks(self) -> list[dict]:
+        """Last-resort live-web tracks derived from the authorized dynamic target shape.
+
+        These are not bug classes or target-specific presets. They are the minimum attacker-flow
+        ownership lanes a black-box web hunt needs when Parent A's JSON is unusable: discover the
+        reachable surface, map authority, test state transitions, compose trusted-origin behavior,
+        and compare advertised client/API contracts.
+        """
+        urls = [str(getattr(t, "base_url", "") or "").strip()
+                for t in (getattr(self.scope, "dynamic_targets", None) or [])]
+        urls = [u for u in urls if u]
+        focus = urls[:6]
+        return [
+            {
+                "theme": "live surface and client contracts",
+                "subsystem": "reachable web surface",
+                "fuzz_mode": "invariant",
+                "expected_severity": "critical",
+                "attacker_reachability": "high",
+                "focus_files": focus,
+                "invariants": [
+                    "attacker must never discover a public client/API contract that exposes protected data or privileged operations without the intended authority",
+                    "attacker must never use advertised routes, bundled client code, or docs to reach a protected workflow outside its intended actor boundary",
+                ],
+                "investigate": [
+                    "Harvest only in-scope HTML, JS, robots/security metadata, redirects, forms, and advertised API contracts; extract concrete endpoints and actors.",
+                    "Prioritize endpoints that move account state, return user data, create tokens, import URLs, run code, or bridge to a privileged backend.",
+                ],
+            },
+            {
+                "theme": "authorization and object boundaries",
+                "subsystem": "principal-to-resource authorization",
+                "fuzz_mode": "invariant",
+                "expected_severity": "critical",
+                "attacker_reachability": "medium",
+                "focus_files": focus,
+                "invariants": [
+                    "attacker must never access or mutate another principal's resources by changing identifiers, tenants, sessions, or request context",
+                    "attacker must never convert unauthenticated or low-authority state into privileged account control",
+                ],
+                "investigate": [
+                    "If authorized test identities exist, compare same endpoint/object actions across identities using the scope-enforced client.",
+                    "If no identities exist, map login, registration, token, tenant, and object-id surfaces without submitting destructive writes.",
+                ],
+            },
+            {
+                "theme": "trusted-origin and server-side composition",
+                "subsystem": "server-side request and integration seams",
+                "fuzz_mode": "invariant",
+                "expected_severity": "critical",
+                "attacker_reachability": "medium",
+                "focus_files": focus,
+                "invariants": [
+                    "attacker must never cause an in-scope trusted server to fetch or act on attacker-chosen internal or protected resources",
+                    "attacker must never receive sensitive response data, callbacks, or status oracles from privileged backend-origin actions",
+                ],
+                "investigate": [
+                    "Look for concrete in-scope URL/import/webhook/preview/proxy/integration inputs before testing OOB or internal-resource composition.",
+                    "Prove composition only with harmless canaries first; use protected resources only if the sink and scope are concrete.",
+                ],
+            },
+            {
+                "theme": "state-changing workflow integrity",
+                "subsystem": "business actions and trust transitions",
+                "fuzz_mode": "invariant",
+                "expected_severity": "high",
+                "attacker_reachability": "medium",
+                "focus_files": focus,
+                "invariants": [
+                    "attacker must never complete a protected workflow by replaying, reordering, or omitting required proof steps",
+                    "attacker must never make the server trust client-controlled state for security decisions",
+                ],
+                "investigate": [
+                    "Map forms, redirects, callbacks, tokens, cookies, local storage, and API calls that advance account or data-access state.",
+                    "Test only low-impact state changes on owned/synthetic accounts when credentials are supplied.",
+                ],
+            },
+        ]
 
     def _repo_component_tracks(self, *, limit: int = 6) -> list[dict]:
         import re
