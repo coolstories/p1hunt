@@ -330,7 +330,7 @@ def _remap_into_repo(path: str, cwd: str) -> str | None:
 def _remap_poc_path(path: str, cwd: str) -> str | None:
     """Route a PoC write that targets a hallucinated ``.p1hunt-poc`` location into the REAL
     sandbox (``cwd/.p1hunt-poc``). Models often build a wrong absolute prefix
-    (e.g. /Users/you/Documents/seaport/.p1hunt-poc/X) — without this the write is denied even
+    (e.g. /Users/you/Documents/target/.p1hunt-poc/X) — without this the write is denied even
     though it intended the sandbox. New PoC files don't exist yet, so ``_remap_into_repo`` (which
     requires the target to exist) can't help here."""
     if not path or ".p1hunt-poc" not in path:
@@ -386,9 +386,20 @@ class ClaudeFinding:
     # the deterministic severity gate (concrete_loss) and the report (remediation).
     concrete_loss: str = ""   # funds | data | control | availability | none
     remediation: str = ""
+    target_code_attribution: str = ""
+    non_target_attribution: str = ""
+    relies_on_non_target_behavior: bool = False
+    attribution_notes: str = ""
 
     @staticmethod
     def from_dict(d: dict, lens_default: str) -> "ClaudeFinding":
+        def _truthy(v: object) -> bool:
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return bool(v)
+            return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
         return ClaudeFinding(
             title=str(d.get("title", "untitled")).strip(),
             severity=str(d.get("severity", "medium")).lower().strip(),
@@ -402,6 +413,10 @@ class ClaudeFinding:
             evidence=str(d.get("evidence", "")).strip(),
             concrete_loss=str(d.get("concrete_loss", d.get("loss", ""))).lower().strip(),
             remediation=str(d.get("remediation", d.get("fix", ""))).strip(),
+            target_code_attribution=str(d.get("target_code_attribution", d.get("target_attribution", ""))).strip(),
+            non_target_attribution=str(d.get("non_target_attribution", d.get("harness_attribution", ""))).strip(),
+            relies_on_non_target_behavior=_truthy(d.get("relies_on_non_target_behavior", False)),
+            attribution_notes=str(d.get("attribution_notes", d.get("attribution", ""))).strip(),
         )
 
 
@@ -483,7 +498,7 @@ class ClaudeSession:
                 if not self.allow_web:
                     return False, "web disabled for this agent — focus on the code", None
                 # Budget cap: a few searches for technique/spec, then back to the code. Prevents the
-                # "gave up and kept searching for the product's known bugs" failure mode.
+                # "gave up and kept searching for the product's prior disclosures" failure mode.
                 if self.web_budget is not None and self._web_calls >= self.web_budget:
                     return False, (f"web research budget exhausted ({self.web_budget} searches) — "
                                    "the answer is in the CODE, not the web; analyze it"), None
@@ -500,6 +515,12 @@ class ClaudeSession:
                 return True, "sub-agent dispatch", None
             if tool_name.startswith("mcp__p1hunt__"):
                 return True, "blackboard write (write-only)", None
+            if tool_name in ("AskUserQuestion", "ask_user_question"):
+                return (
+                    False,
+                    "operator is unavailable; proceed autonomously with best judgment unless a safety/scope stop condition is reached",
+                    None,
+                )
             if tool_name in _FILE_TOOLS:
                 if self.guard_check is not None:
                     a, r = self.guard_check(tool_name, tool_input)
@@ -583,12 +604,18 @@ class ClaudeSession:
 
                 @_sdk_tool(
                     "post_finding",
-                    "Post a real, code-substantiated finding to the shared blackboard the MOMENT "
-                    "you are confident — WRITE-ONLY (you cannot read the board back). Call this as "
-                    "soon as you have one, then keep hunting for more. Still include every finding "
-                    "in your final JSON too.",
+                    "Post a code/request-substantiated finding to the shared blackboard after a focused "
+                    "depth check — WRITE-ONLY (you cannot read the board back). Include what evidence "
+                    "you checked, what escalation/proof you attempted, and what still blocks confirmed "
+                    "critical status. Also separate the target-owned defect from anything supplied "
+                    "by your harness, mocks, fixtures, accounts, local setup, external services, or "
+                    "integrator-only implementations; set relies_on_non_target_behavior=true if the "
+                    "win depends on those. Parent A will route it through verifier/prover/deep-dive.",
                     {"title": str, "severity": str, "file": str, "line": int,
-                     "root_cause": str, "counterfactual": str, "evidence": str, "reproduction": str},
+                     "root_cause": str, "counterfactual": str, "evidence": str, "reproduction": str,
+                     "attempted_escalation": str, "verification_depth": str, "blocked_by": str,
+                     "target_code_attribution": str, "non_target_attribution": str,
+                     "relies_on_non_target_behavior": bool, "attribution_notes": str},
                 )
                 async def post_finding(args: dict) -> dict:
                     # The finding is actually captured when we observe this tool call in the
@@ -823,11 +850,13 @@ def make_session(*, model=None, engine: str | None = None, effort: str | None = 
     exploit-developer, debate, dedup, fuzz). With engine='codex' the whole swarm runs on Codex and
     NOTHING depends on Claude Code. CodexSession is interface-compatible (run(prompt,cwd)->SessionResult).
 
-    engine resolves to: the explicit arg, else $P1HUNT_ENGINE, else 'claude'. The Claude-tier `model`
+    engine resolves to: the explicit arg, else $P1HUNT_ENGINE, else 'codex'. The Claude-tier `model`
     is ignored for Codex (Codex uses its account default / $P1HUNT_CODEX_MODEL + per-tier effort).
     """
     import os as _os
-    eng = (engine or _os.environ.get("P1HUNT_ENGINE", "claude")).strip().lower()
+    eng = (engine or _os.environ.get("P1HUNT_ENGINE", "codex")).strip().lower()
+    if eng not in ("codex", "claude"):
+        eng = "codex"
     if eng == "codex":
         from .codex_session import CodexSession
         ck = dict(kwargs)

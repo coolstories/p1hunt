@@ -61,8 +61,8 @@ class Asset:
 class DynamicTarget:
     """An authorized, RUNNING instance the swarm may interact with for live dynamic testing
     (§2.3). Never production — only the safe-harbor sandbox environments. Captured at intake; it
-    is what turns the system from a static reviewer into a request-driven hunter for the bulk of
-    bug-bounty criticals (IDOR/BOLA, auth bypass, SSRF, injection, business logic)."""
+    is what turns the system from a static reviewer into a request-driven hunter for critical
+    outcomes derived from the live application's actors, resources, and workflows."""
 
     base_url: str
     environment: str = "uat"   # uat | owned | testnet | local — never production
@@ -73,7 +73,7 @@ class DynamicTarget:
 @dataclass
 class TestIdentity:
     """A test principal the swarm authenticates as during live testing (§2.5). Two distinct
-    identities are the core of IDOR/BOLA testing (A owns a resource; B must be refused). The
+    identities let harnesses prove that one principal cannot reach another principal's resources. The
     secret itself is supplied at runtime via ``token`` or an env var named by ``token_env`` —
     persisted scope records redact the literal token (see engagement.scope_to_dict)."""
 

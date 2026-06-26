@@ -1,7 +1,7 @@
 """The interaction-engine client + OOB listener (spec §10, §12).
 
 Exercises the harness-facing client against a LOOPBACK test server (no external network): scope
-enforcement, identity/token resolution, the IDOR ``assert_forbidden`` helper, and the OOB
+enforcement, identity/token resolution, the refusal ``assert_forbidden`` helper, and the OOB
 round-trip that turns a blind callback into a deterministic pass/fail.
 """
 
@@ -103,7 +103,7 @@ class TestOOB(unittest.TestCase):
             c = Client(base_url="https://api.example.com")
             url, token = c.oob_url()
             self.assertIn(token, url)
-            # Simulate the TARGET dereferencing the OOB URL (blind SSRF callback).
+            # Simulate the TARGET dereferencing the OOB URL.
             urllib.request.urlopen(url, timeout=3).read()
             self.assertTrue(c.oob_received(token, wait=2))
             self.assertFalse(c.oob_received("never_fired_token", wait=0.2))

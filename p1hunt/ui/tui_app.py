@@ -250,7 +250,7 @@ class TuiState:
                 elif ev == "reference_detected":
                     self._add("parent_a", "round", f"🔬 differential oracle available: {str(data.get('detail',''))[:90]}")
                 elif ev == "patterns_loaded":
-                    self._add("parent_a", "round", f"🧬 {data.get('count',0)} known bug patterns loaded — hunting new variants")
+                    self._add("parent_a", "round", f"🧬 legacy pattern event ignored ({data.get('count',0)} records)")
                 elif ev in ("model_downgrade", "scope_fallback", "stop", "safety_event", "cap_reached", "findings_written"):
                     self._add(agent, "system", f"⚙ {ev}: {data.get('reason') or data.get('detail') or data.get('path','')}")
             elif kind == "message":

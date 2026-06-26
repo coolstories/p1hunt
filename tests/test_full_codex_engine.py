@@ -1,9 +1,10 @@
 """Full-swarm engine selection: with P1HUNT_ENGINE=codex EVERY role runs on Codex (nothing depends
-on Claude Code), via the make_session factory; plus the cross-invocation/replay reasoning lens that
-was the gap behind the missed Paillier-Blum re-randomization P1."""
+on Claude Code), via the make_session factory; plus the generic guarantee-breaking lens."""
 
 import os
+import types
 import unittest
+from unittest import mock
 
 from p1hunt.agents.claude_session import make_session, ClaudeSession, engine_available
 from p1hunt.agents.codex_session import CodexSession
@@ -19,9 +20,9 @@ class TestEngineFactory(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("P1HUNT_ENGINE", None)
 
-    def test_default_is_claude(self):
+    def test_default_is_codex(self):
         os.environ.pop("P1HUNT_ENGINE", None)
-        self.assertIsInstance(make_session(model="claude-opus-4-8", **_COMMON), ClaudeSession)
+        self.assertIsInstance(make_session(model="claude-opus-4-8", **_COMMON), CodexSession)
 
     def test_global_codex_routes_all_roles(self):
         os.environ["P1HUNT_ENGINE"] = "codex"
@@ -43,7 +44,9 @@ class TestNoClaudeSessionLeftInConstructors(unittest.TestCase):
     """Every role must build sessions through the factory, so codex-global swaps them all."""
     def test_no_direct_ClaudeSession_constructor_calls(self):
         import inspect
-        for mod in (claude_hunter, claude_swarm):
+        from p1hunt import intake_agent
+        from p1hunt.agents import fuzz_engine
+        for mod in (claude_hunter, claude_swarm, fuzz_engine, intake_agent):
             src = inspect.getsource(mod)
             self.assertNotIn("ClaudeSession(", src,
                              f"{mod.__name__} still constructs ClaudeSession directly (must use make_session)")
@@ -51,11 +54,11 @@ class TestNoClaudeSessionLeftInConstructors(unittest.TestCase):
 
 class TestConfigGlobalEngine(unittest.TestCase):
     def tearDown(self):
-        for k in ("P1HUNT_ENGINE", "P1HUNT_DISCOVERY_ENGINE", "P1HUNT_USE_CLAUDE"):
+        for k in ("P1HUNT_ENGINE", "P1HUNT_DISCOVERY_ENGINE", "P1HUNT_USE_AGENT",
+                  "P1HUNT_USE_CLAUDE", "P1HUNT_RUN_MODE"):
             os.environ.pop(k, None)
 
     def test_global_codex_makes_discovery_follow(self):
-        os.environ["P1HUNT_ENGINE"] = "codex"
         os.environ.pop("P1HUNT_DISCOVERY_ENGINE", None)
         m = Config.from_env().models
         self.assertEqual(m.engine, "codex")
@@ -67,6 +70,56 @@ class TestConfigGlobalEngine(unittest.TestCase):
         m = Config.from_env().models
         self.assertEqual(m.engine, "claude")
         self.assertEqual(m.discovery_engine, "codex")
+
+    def test_active_mode_kept_when_selected_engine_is_runnable(self):
+        os.environ["P1HUNT_ENGINE"] = "codex"
+        os.environ["P1HUNT_RUN_MODE"] = "active"
+        with mock.patch("p1hunt.agents.claude_session.engine_available", return_value=True):
+            cfg = Config.from_env()
+        self.assertTrue(cfg.use_claude)
+        self.assertEqual(cfg.run_mode, "active")
+
+    def test_active_mode_downgrades_only_when_no_agent_brain_runs(self):
+        os.environ["P1HUNT_ENGINE"] = "codex"
+        os.environ["P1HUNT_RUN_MODE"] = "active"
+        with mock.patch("p1hunt.agents.claude_session.engine_available", return_value=False):
+            cfg = Config.from_env()
+        self.assertFalse(cfg.use_claude)
+        self.assertEqual(cfg.run_mode, "dry_run")
+
+    def test_legacy_discovery_codex_promotes_whole_cli_run(self):
+        from p1hunt.main import _configure_cli_engine
+        cfg = Config()
+        cfg.models.engine = "claude"
+        cfg.models.discovery_engine = "claude"
+        args = types.SimpleNamespace(engine=None, discovery_engine="codex",
+                                     offline=False, no_claude=False)
+        with mock.patch("p1hunt.agents.claude_session.engine_available", return_value=True):
+            _configure_cli_engine(cfg, args)
+        self.assertEqual(cfg.models.engine, "codex")
+        self.assertEqual(cfg.models.discovery_engine, "codex")
+        self.assertTrue(cfg.use_claude)
+
+    def test_cli_engine_override_downgrades_active_when_engine_unavailable(self):
+        from p1hunt.main import _configure_cli_engine
+        cfg = Config()
+        cfg.run_mode = "active"
+        args = types.SimpleNamespace(engine="codex", discovery_engine=None,
+                                     offline=False, no_claude=False)
+        with mock.patch("p1hunt.agents.claude_session.engine_available", return_value=False):
+            _configure_cli_engine(cfg, args)
+        self.assertFalse(cfg.use_claude)
+        self.assertEqual(cfg.run_mode, "dry_run")
+
+    def test_offline_cli_switch_downgrades_active_mode(self):
+        from p1hunt.main import _configure_cli_engine
+        cfg = Config()
+        cfg.run_mode = "active"
+        args = types.SimpleNamespace(engine=None, discovery_engine=None,
+                                     offline=True, no_claude=False)
+        _configure_cli_engine(cfg, args)
+        self.assertFalse(cfg.use_claude)
+        self.assertEqual(cfg.run_mode, "dry_run")
 
 
 class TestGuaranteeBreakingLens(unittest.TestCase):
@@ -83,6 +136,18 @@ class TestGuaranteeBreakingLens(unittest.TestCase):
         s = ClaudeSwarm_scope_prompt_text()
         self.assertIn("DERIVE THE GUARANTEES", s)
         self.assertIn("MINE THE TESTS", s)
+        self.assertIn("recon_strategy", s)
+        self.assertNotIn("RESEARCH HISTORICAL PATTERNS", s)
+        self.assertNotIn("known critical bug", s.lower())
+
+    def test_hunt_prompt_does_not_render_known_pattern_feed(self):
+        p = claude_hunter.hunt_prompt(
+            "component", "top impact", 1, [], None, None,
+            known_patterns=["external call before state update"],
+            static_leads=["preset scanner hit"],
+        )
+        self.assertNotIn("external call before state update", p)
+        self.assertNotIn("preset scanner hit", p)
 
     def test_resteer_is_coverage_and_novelty_driven(self):
         import inspect
@@ -91,6 +156,18 @@ class TestGuaranteeBreakingLens(unittest.TestCase):
         self.assertIn("COVERAGE", src)
         self.assertIn("NOVELTY", src)
         self.assertIn("UN-ATTACKED", src)
+
+    def test_live_blackboard_has_high_severity_fastlane(self):
+        import inspect
+        from p1hunt.agents import claude_swarm
+        src = inspect.getsource(claude_swarm.ClaudeSwarm.hunt)
+        self.assertIn("P1HUNT_LIVE_FASTLANE", src)
+        self.assertIn("live_fastlane", src)
+        self.assertIn("high/critical blackboard post", src)
+
+    def test_fallback_file_ranker_has_no_protocol_presets(self):
+        banned = {"mta", "paillier", "ring_pedersen", "ecdsa", "eddsa", "schnorr", "cosigner"}
+        self.assertFalse(banned & set(claude_swarm.ClaudeSwarm._SEC_KEYWORDS))
 
     def test_exploit_dev_breaks_a_property(self):
         from p1hunt.agents.claude_hunter import exploit_dev_prompt, ClaudeFinding
@@ -115,6 +192,8 @@ class TestAttributionGate(unittest.TestCase):
         import inspect
         from p1hunt.agents.claude_hunter import ClaudeExploitDeveloper
         src = inspect.getsource(ClaudeExploitDeveloper.develop)
+        if "relies_on_abstract_interface" not in src:
+            src = inspect.getsource(inspect.getmodule(ClaudeExploitDeveloper))
         self.assertIn("relies_on_abstract_interface", src)
         self.assertIn("not abstract", src)  # achieved = ... and not abstract
 

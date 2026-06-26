@@ -186,7 +186,7 @@ def authorize_dynamic(policy: ScopeGuardPolicy, scope: Scope) -> dict:
 
     When it does fire it: seeds the egress allowlist with the authorized hosts (the live jail),
     adds their environment to the sandbox set, and unlocks the non-destructive write methods
-    (POST/PUT/PATCH) needed to demonstrate IDOR/business-logic — DELETE stays denied."""
+    (POST/PUT/PATCH) needed to demonstrate authorized workflow properties — DELETE stays denied."""
     enabled_hosts: list[str] = []
     enabled_envs: set[str] = set()
     rejected: list[str] = []

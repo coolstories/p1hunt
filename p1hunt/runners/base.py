@@ -23,6 +23,7 @@ never promoted to a confirmed critical. Every subprocess is bounded by a timeout
 from __future__ import annotations
 
 import importlib
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -46,12 +47,22 @@ class ReproResult:
     coverage: dict = field(default_factory=dict)        # REAL coverage parsed from the tool
     detail: str = ""                                    # why reproduced / not (parsed evidence)
     runner: str = ""                                    # which runner produced this
+    target_code_attribution: str = ""
+    non_target_attribution: str = ""
+    attribution_notes: str = ""
+    counterfactual_gate: dict = field(default_factory=dict)
+    impact_blocker: str = ""
 
     def to_dict(self) -> dict:
         return {
             "ran": self.ran, "reproduced": self.reproduced, "command": self.command,
             "artifact_paths": list(self.artifact_paths), "stdout_excerpt": self.stdout_excerpt,
             "coverage": dict(self.coverage), "detail": self.detail, "runner": self.runner,
+            "target_code_attribution": self.target_code_attribution,
+            "non_target_attribution": self.non_target_attribution,
+            "attribution_notes": self.attribution_notes,
+            "counterfactual_gate": dict(self.counterfactual_gate),
+            "impact_blocker": self.impact_blocker,
         }
 
 
@@ -66,22 +77,60 @@ class ReproSpec:
     expect: str = "fail"          # outcome that DEMONSTRATES the bug: 'fail' = invariant/assert broken
     #                               (the default, property/invariant style); 'pass' = exploit assertion held
     test_name: str = ""           # specific test/function to target, if any
+    target_code_attribution: str = ""     # exact in-scope target behavior/file:line that owns the defect
+    non_target_attribution: str = ""      # harness/mock/scaffold behavior used only to drive the target
+    relies_on_non_target_behavior: bool = False  # true => not a target-owned confirmed finding
+    attribution_notes: str = ""
+    finding_claim: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
 
     @staticmethod
     def from_dict(d: dict | None) -> "ReproSpec":
         d = d or {}
+        extra = d.get("extra") if isinstance(d.get("extra"), dict) else {}
+
+        def _field(name: str, default: object = "") -> object:
+            return d.get(name, extra.get(name, default))
+
+        def _truthy(v: object) -> bool:
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return bool(v)
+            return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
         return ReproSpec(
             harness_path=str(d.get("harness_path", d.get("poc_path", ""))).strip(),
             command=str(d.get("command", "")).strip(),
             kind=str(d.get("kind", "")).strip().lower(),
             expect=(str(d.get("expect", "fail")).strip().lower() or "fail"),
             test_name=str(d.get("test_name", "")).strip(),
-            extra=d.get("extra") if isinstance(d.get("extra"), dict) else {},
+            target_code_attribution=str(_field("target_code_attribution", "") or "").strip(),
+            non_target_attribution=str(_field("non_target_attribution", "") or "").strip(),
+            relies_on_non_target_behavior=_truthy(_field("relies_on_non_target_behavior", False)),
+            attribution_notes=str(_field("attribution_notes", "") or "").strip(),
+            finding_claim=dict(_field("finding_claim", {}) or {}) if isinstance(_field("finding_claim", {}), dict) else {},
+            extra=extra,
         )
 
     def expects_fail(self) -> bool:
         return self.expect != "pass"
+
+    def attribution_blocker(self) -> str:
+        """Return a reason this spec cannot promote a confirmed target finding.
+
+        Low-level runners intentionally remain dumb executors so their unit tests can exercise parser
+        mechanics. The autonomous promotion boundary calls this method before a harness result counts:
+        every reproduced bug must attribute the defective behavior to the in-scope target, not to a
+        harness, mock, fixture, local scaffold, external service, or integrator-only implementation.
+        """
+        if self.relies_on_non_target_behavior:
+            return self.attribution_notes or self.non_target_attribution or (
+                "proof depends on behavior outside the in-scope target"
+            )
+        if not self.target_code_attribution:
+            return "missing target_code_attribution; cannot tell whether the defect is target-owned"
+        return ""
 
 
 @runtime_checkable
@@ -154,8 +203,15 @@ def run_command(
     if on_event:
         _emit(on_event, runner, {"event": "exec", "command": " ".join(argv)})
     try:
+        tmpdir = Path(cwd) / ".p1hunt-tmp"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["TMPDIR"] = str(tmpdir)
+        env["TEMP"] = str(tmpdir)
+        env["TMP"] = str(tmpdir)
         proc = subprocess.run(  # noqa: S603 — fixed argv (runner-derived), shell=False
             argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, check=False,
+            env=env,
         )
         out = (proc.stdout or "") + (proc.stderr or "")
         if on_event:

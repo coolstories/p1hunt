@@ -1,18 +1,8 @@
-"""Cross-engagement memory — learning from THIS TOOL'S OWN confirmed findings.
+"""Optional cross-engagement operational memory.
 
-This is NOT a preset and NOT hand-authored bug knowledge. The store accumulates ONLY findings the
-swarm itself CONFIRMED (deterministically reproduced) on past engagements, generalizes each to a
-one-line bug-class pattern, and offers them back at recon as FALLIBLE PRIORS: "we confirmed a bug
-like this in similar code before — hunt a NEW variant here (the old instance is likely patched)."
-
-Why this respects NOTHING-PRESET: the content is derived entirely from the system's own verified
-wins, not from a baked-in catalog; it is retrieved by relevance to the target class; and it feeds
-the SAME ``known_patterns`` channel recon already uses (which Parent A treats as fallible hints to
-hunt variants of, never a checklist). Parent A still derives everything. Disable with
-``P1HUNT_MEMORY=0``; relocate the store with ``P1HUNT_MEMORY_DIR``.
-
-The store is a plain append-only JSONL file, fully offline-graceful — any IO failure degrades to
-"no memory" and never affects a hunt.
+Preset-free hunts keep this disabled by default. When explicitly enabled, memory stores only
+sanitized run metadata such as target class, subclass, runner kind, and outcome. It must never store
+or recall root causes, titles, exploit narratives, lenses, or reusable failure patterns.
 """
 
 from __future__ import annotations
@@ -24,7 +14,7 @@ from pathlib import Path
 
 
 def memory_enabled() -> bool:
-    return os.environ.get("P1HUNT_MEMORY", "1") != "0"
+    return os.environ.get("P1HUNT_MEMORY", "0") == "1"
 
 
 def default_memory_path(engagements_root: str) -> Path:
@@ -34,25 +24,14 @@ def default_memory_path(engagements_root: str) -> Path:
     return root / "confirmed.jsonl"
 
 
-def _generalize(finding: dict) -> str:
-    """Turn a confirmed finding into a one-line, target-AGNOSTIC bug-class pattern (the reusable
-    prior). Uses the root cause + what the attacker gained + the lens — never the program's name or
-    full file path, so it reads as a class-level 'watch for this shape', not a per-target playbook."""
-    lens = str(finding.get("lens", "")).strip()
-    root = " ".join(str(finding.get("root_cause", "")).split())[:240]
-    cf = " ".join(str(finding.get("counterfactual", "")).split())[:160]
-    parts = []
-    if lens:
-        parts.append(f"[{lens}]")
-    if root:
-        parts.append(root)
-    if cf:
-        parts.append(f"→ attacker gains: {cf}")
-    return " ".join(parts).strip()
+def _clean(value: object, limit: int = 80) -> str:
+    """Small bounded field sanitizer for operational metadata."""
+    text = " ".join(str(value or "").split())
+    return text[:limit]
 
 
 class MemoryStore:
-    """Append-only store of confirmed findings, with class-scoped recall. Never raises."""
+    """Append-only store of sanitized run metadata. Never raises."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -63,25 +42,24 @@ class MemoryStore:
 
     # --- write ------------------------------------------------------------
     def record(self, *, target_class: str, subclass: str, finding: dict) -> None:
-        """Persist one CONFIRMED finding as a reusable prior. Caller passes a dict with at least
-        title/root_cause/counterfactual/lens/severity (+ optional program, harness_kind)."""
-        pattern = _generalize(finding)
-        if not pattern:
-            return
+        """Persist operational metadata for one confirmed run.
+
+        The caller may pass the full finding object for compatibility, but only non-vulnerability
+        fields are retained. This prevents memory from becoming a hidden preset failure-pattern feed.
+        """
+        harness = _clean(finding.get("harness_kind") or finding.get("runner"), 60)
+        outcome = _clean(finding.get("outcome") or "confirmed_reproduced", 60)
         rec = {
             "ts": int(time.time()),
-            "program": str(finding.get("program", ""))[:120],
-            "target_class": (target_class or "").upper(),
-            "subclass": (subclass or "").lower(),
-            "lens": str(finding.get("lens", "")),
-            "severity": str(finding.get("severity", "")),
-            "title": str(finding.get("title", ""))[:200],
-            "pattern": pattern,
-            "harness_kind": str(finding.get("harness_kind", "")),
+            "target_class": _clean(target_class, 48).upper(),
+            "subclass": _clean(subclass, 48).lower(),
+            "severity_tier": _clean(finding.get("severity"), 24).lower(),
+            "harness_kind": harness,
+            "outcome": outcome,
         }
         try:
             with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(rec) + "\n")
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
         except OSError:
             pass
 
@@ -94,9 +72,12 @@ class MemoryStore:
             return []
 
     def recall(self, target_class: str, subclass: str = "", *, limit: int = 8) -> list[str]:
-        """Return up to ``limit`` distinct prior-confirmed patterns relevant to this target,
-        ranked: same class AND subclass first, then same class, most-recent first. Returns the
-        generalized pattern strings (ready to drop into ``known_patterns``)."""
+        """Return up to ``limit`` distinct operational notes for matching target classes.
+
+        The returned strings intentionally contain no root cause, exploit shape, target title, file,
+        or failure pattern. They are safe for UI/operator context, but active Codex hunts do not
+        inject them into hunter prompts.
+        """
         tc = (target_class or "").upper()
         sc = (subclass or "").lower()
         recs = self._load()
@@ -107,11 +88,18 @@ class MemoryStore:
         out: list[str] = []
         seen: set[str] = set()
         for r in same_class:
-            p = str(r.get("pattern", "")).strip()
-            key = p.lower()[:80]
-            if p and key not in seen:
+            parts = [f"class={r.get('target_class', '')}"]
+            if r.get("subclass"):
+                parts.append(f"subclass={r.get('subclass')}")
+            if r.get("harness_kind"):
+                parts.append(f"runner={r.get('harness_kind')}")
+            if r.get("outcome"):
+                parts.append(f"outcome={r.get('outcome')}")
+            note = "prior operational run: " + ", ".join(parts)
+            key = note.lower()[:120]
+            if key not in seen:
                 seen.add(key)
-                out.append(p)
+                out.append(note)
             if len(out) >= limit:
                 break
         return out

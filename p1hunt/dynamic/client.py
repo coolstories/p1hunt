@@ -6,15 +6,15 @@ the swarm can copy this one file into the PoC sandbox and a separate pytest proc
 
 What it gives a harness:
   * Multi-identity sessions — authenticate as principal A, B, a low-role user, etc., from tokens
-    supplied via the environment (never hardcoded). Two identities are the core of IDOR/BOLA.
+    supplied via the environment (never hardcoded).
   * A scope-ENFORCED transport — every request host must be in the authorized egress allowlist (or
     loopback); a request to anything else raises ``ScopeError`` before a packet leaves. This makes
     the harness itself safe-harbor-correct, independent of the agent's bash jail.
-  * Differential authz helpers — ``assert_forbidden`` / ``idor_probe`` express "B must not reach
-    A's object" directly, so an IDOR PoC is a few lines.
-  * Injection oracles — timing, boolean, and reflection helpers for SQLi/command-injection.
-  * Out-of-band confirmation — ``oob_url(token)`` + ``oob_received(token)`` turn a BLIND SSRF/
-    injection into a deterministic pass/fail via the loopback OOB listener.
+  * Differential refusal helpers — ``assert_forbidden`` / ``idor_probe`` express "this principal
+    must not reach that principal's object" directly.
+  * Input-behavior oracles — timing, boolean, and reflection helpers.
+  * Out-of-band confirmation — ``oob_url(token)`` + ``oob_received(token)`` turn callback-based
+    behavior into a deterministic pass/fail via the loopback OOB listener.
 
 All config comes from the environment (set by the swarm at arming time):
   P1HUNT_BASE_URL, P1HUNT_GQL_URL, P1HUNT_OOB_URL, P1HUNT_OOB_HITS,
@@ -167,19 +167,18 @@ class Client:
     def patch(self, p, **kw):   return self.request("PATCH", p, **kw)
     def head(self, p, **kw):    return self.request("HEAD", p, **kw)
 
-    # --- authorization / IDOR-BOLA helpers --------------------------------
+    # --- authorization / cross-principal refusal helpers -------------------
     def is_authorized(self, resp: Response) -> bool:
-        """True if the server PERMITTED the action (2xx). An IDOR/BOLA bug is a 2xx where a refusal
-        (401/403/404) was required for the requesting principal."""
+        """True if the server PERMITTED the action (2xx)."""
         return 200 <= resp.status < 300
 
     def assert_forbidden(self, method: str, path_or_url: str, *, identity: str, **kw) -> Response:
         """Assert ``identity`` is REFUSED (401/403/404) on ``path``. Raises AssertionError (an
-        authz bypass — the PoC) if the action was permitted instead."""
+        unexpected permitted action — the PoC signal) if the action was permitted instead."""
         resp = self.request(method, path_or_url, identity=identity, **kw)
         assert resp.status in (401, 403, 404), (
-            f"AUTHZ BYPASS: {identity} {method} {path_or_url} -> {resp.status} "
-            f"(a refusal was required) — IDOR/BOLA/auth-bypass")
+            f"UNEXPECTED PERMIT: {identity} {method} {path_or_url} -> {resp.status} "
+            f"(a refusal was required)")
         return resp
 
     def idor_probe(self, method: str, path_template: str, *, owner: str, attacker: str,
@@ -211,7 +210,7 @@ class Client:
     # --- out-of-band (blind) confirmation ---------------------------------
     def oob_url(self, token: str | None = None) -> tuple[str, str]:
         """Return ``(url, token)`` pointing at the loopback OOB listener. Embed ``url`` where the
-        target may dereference it (SSRF sink, webhook, XML entity); later assert ``oob_received``."""
+        target may call back or fetch it; later assert ``oob_received``."""
         base = os.environ.get("P1HUNT_OOB_URL", "").rstrip("/")
         tok = token or uuid.uuid4().hex[:16]
         return (f"{base}/{tok}" if base else f"/{tok}"), tok

@@ -10,6 +10,7 @@ bash enforcement, and the swarm's apply hook. Pure-logic; no SDK, no network.
 
 from __future__ import annotations
 
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -100,6 +101,15 @@ class BashEnforcement(unittest.TestCase):
     def test_jail_escape_still_denied_regardless(self) -> None:
         # The invariant floor (jail-escape) is independent of the posture.
         self.assertFalse(bash_safety("sudo rm -rf /", policy=PermissionPolicy())[0])
+
+
+class AutonomyGuard(unittest.TestCase):
+    def test_claude_sessions_deny_headless_user_questions(self) -> None:
+        from p1hunt.agents.claude_session import ClaudeSession
+
+        src = inspect.getsource(ClaudeSession.run)
+        self.assertIn("AskUserQuestion", src)
+        self.assertIn("operator is unavailable; proceed autonomously", src)
 
 
 class ToolInstall(unittest.TestCase):

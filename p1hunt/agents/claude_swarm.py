@@ -1,11 +1,10 @@
-"""Claude swarm orchestrator — Parent A driving real Claude agents (spec §6-§10).
+"""AI swarm orchestrator — Parent A driving prompt-role agents (spec §6-§10).
 
-The AI is the detector. Parent A derives the plan, assigns each ranked lens to a Child B
-(a real Claude hunting session), and runs the never-quit loop: every round each Child B
-hunts its lens with a fresh creative angle; the Falsifier (a real Claude session with the
-opposite prior) tries to refute each candidate; only a confirmed, reachable critical is
-promoted. On a dry round it reframes and digs deeper — it does not give up until a critical
-is confirmed or the operator stops.
+The AI is the detector. Parent A derives the plan, assigns each ranked lens to a Child B, and runs
+the never-quit loop: every round each Child B hunts its lens with a fresh creative angle; the
+Falsifier tries to refute each candidate; only a confirmed, reachable critical is promoted. On a
+dry round it reframes and digs deeper — it does not give up until a critical is confirmed or the
+operator stops. Codex is the default runtime engine for every role.
 """
 
 from __future__ import annotations
@@ -43,19 +42,37 @@ from .derive import derive_plan
 from .harness_scaffold import detect_evm_entrypoints
 from .parent_a import HuntResult
 from ..corpus import CorpusStore
-from ..classify.evm_signals import evm_assembly_density, scan_combined
+from ..classify.evm_signals import evm_assembly_density
+from ..counterfactual_gate import assess_counterfactual_proof
 from ..runners.base import ReproSpec, select_runner
 from ..severity import ImpactAssessment, SeverityMapper
 from ..tools.build_env import BuildReport, bootstrap_environment, ensure_foundry, toolchain_available
 from ..tools.evm_fork import fork_available, start_anvil_fork, stop_anvil_fork
 
-_LENSES = [
-    "authorization-boundary",
-    "asset-custody",
-    "trusted-execution",
-    "confidentiality",
-    "business-logic",
-]
+def normalize_exploit_tier(tier: str) -> str:
+    """Normalize exploit-depth verdict tiers without inflating lower severity to critical."""
+    tier = str(tier or "").strip().lower()
+    return tier if tier in ("critical", "high", "medium", "low") else "high"
+
+
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float | None = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
 
 
 def _poc_reldir(repo_path) -> str:
@@ -64,7 +81,7 @@ def _poc_reldir(repo_path) -> str:
 
     For a Foundry project this MUST sit inside the project's configured ``test`` tree: files outside
     ``src``/``test`` are not compiled, so ``forge test --match-path`` reports "No tests found" and
-    remappings (e.g. ``seaport-core/``) fail to resolve. This was the single biggest reason real PoCs
+            project-local remappings fail to resolve. This was the single biggest reason real PoCs
     never executed (every harness was written to ``.p1hunt-poc/``, which Foundry ignores). We nest
     under ``<test_dir>/p1hunt`` so the harnesses are discovered, compile, and resolve imports, while
     staying clearly separated from the project's own tests. Non-Foundry targets keep ``.p1hunt-poc``.
@@ -97,6 +114,7 @@ class ClaudeSwarm:
         self.scope = scope
         self.repo_path = repo_path
         self.config = config
+        self._configure_engine()
         self.bus = bus
         self.bb = blackboard
         self.log = event_log
@@ -105,17 +123,20 @@ class ClaudeSwarm:
         # compounding reasoning a hardened-target critical needs (instead of many short shallow
         # passes). Also reduces parallel API load -> less rate-limit downgrade (see Fix #3).
         self._deep_discovery = os.environ.get("P1HUNT_DEEP_DISCOVERY", "0") == "1"
-        try:
-            _mc_env = int(os.environ.get("P1HUNT_MAX_CONCURRENCY", "0") or 0)
-        except ValueError:
-            _mc_env = 0
+        _mc_env = _env_int("P1HUNT_MAX_CONCURRENCY", 0)
         if _mc_env > 0:
             max_concurrency = _mc_env
         elif self._deep_discovery:
-            max_concurrency = min(max_concurrency, 2)  # fewer, deeper hunters -> full quota each
+            _deep_conc = _env_int("P1HUNT_DEEP_DISCOVERY_CONCURRENCY", 3, minimum=1)
+            max_concurrency = min(max_concurrency, _deep_conc)  # fewer, deeper hunters -> full quota each
+        self._max_concurrency = max_concurrency
         self.sem = asyncio.Semaphore(max_concurrency)
+        _side_conc = _env_int("P1HUNT_SIDE_LANE_CONCURRENCY", 1, minimum=1)
+        self._side_lane_concurrency = _side_conc
+        self.side_sem = asyncio.Semaphore(_side_conc)
         self.name = "parent_a"
         self._safety_event = False
+        self._paused = False
         self._reframes = 0
         self._hyp_by_finding: dict[int, Hypothesis] = {}
         self._focus_by_lens: dict[str, list[str]] = {}
@@ -123,20 +144,22 @@ class ClaudeSwarm:
         # each round boundary and injected into the next round's hunter prompts — e.g. "new code
         # is now available, keep hunting" — so a running hunt absorbs updates without a restart.
         self._notices: list[str] = []
-        self._known_patterns: list[str] = []  # historical bug patterns (Pillar 3) for fuzzers/hunters
+        self._known_patterns: list[str] = []  # retained only for old resume files; not injected
         self._control_offset = 0
         # Self-healing watchdog: if the whole swarm goes silent (a hung session blocking the
         # round, or an API rate-limit) for STALL_SECONDS, Parent A diagnoses and fixes it.
         import time as _t
         self._last_activity = _t.monotonic()
         self._round_tasks: list = []
+        self._fuzz_tasks: dict[str, asyncio.Task] = {}
         self._active_guard = None
         self._healing = False
+
         self._heals = 0
         # PoC sandbox: the ONLY place agents may write (proof-of-concept files), never source.
         # For a Foundry target this MUST live inside the project's configured `test` tree — otherwise
         # `forge test` cannot compile/discover the harness and remappings break (the #1 reason every
-        # PoC silently never ran in the Seaport engagement). See _poc_reldir.
+        # PoC silently never ran on Foundry-style targets). See _poc_reldir.
         self.poc_reldir = _poc_reldir(repo_path)
         self.poc_dir = Path(repo_path) / self.poc_reldir
         self.poc_dir.mkdir(parents=True, exist_ok=True)
@@ -154,9 +177,7 @@ class ClaudeSwarm:
         self._corpus: CorpusStore | None = None  # cross-round fuzz corpus + coverage memory
         self._subclass: str = ""                # protocol category, only if Parent A names one in recon
         self._entrypoints_by_subsystem: dict[str, list[str]] = {}
-        # DERIVED static leads (Solidity-aware scan of the ACTUAL code) — concrete suspect
-        # primitives handed to each hunter so the live AI starts from "here is a P1, prove it"
-        # rather than a cold read. Populated in _arm_environment; never a preset playbook.
+        # Preset-free guard: no deterministic scanner hits are handed to hunters as leads.
         self._scan_hits: list = []
         # --- live dynamic-testing state (armed in hunt()/_arm_environment when authorized) ---
         # None = static mode (no live target / dry-run); a list = the authorized egress allowlist
@@ -170,25 +191,16 @@ class ClaudeSwarm:
         # (None) so behavior is unchanged unless P1HUNT_MAX_COST_USD is set, but the running total
         # is always emitted so spend is never invisible.
         self._spend_usd: float = 0.0
-        try:
-            _cap = float(os.environ.get("P1HUNT_MAX_COST_USD", "0") or 0)
-        except ValueError:
-            _cap = 0.0
+        _cap = _env_float("P1HUNT_MAX_COST_USD", 0.0)
         self._cost_cap: float | None = _cap if _cap > 0 else None
         # STOP-AFTER-N-CRITICALS: once this many criticals are CONFIRMED, stop gracefully. Blank/
         # unset/0 = never-quit (the default). No LLM cost — a simple round-boundary check.
-        try:
-            _mc = int(os.environ.get("P1HUNT_MAX_CRITICALS", "0") or 0)
-        except ValueError:
-            _mc = 0
+        _mc = _env_int("P1HUNT_MAX_CRITICALS", 0)
         self._max_criticals: int | None = _mc if _mc > 0 else None
         # Confirmation-time dedup (on by default; cheap, only fires when prior confirmed exist) and
         # the round-end debate panel on confirmed criticals (capped for token cost; 0 disables).
         self._dedup_on = os.environ.get("P1HUNT_DEDUP", "1") != "0"
-        try:
-            self._debate_max = max(0, int(os.environ.get("P1HUNT_DEBATE_MAX", "3")))
-        except ValueError:
-            self._debate_max = 3
+        self._debate_max = _env_int("P1HUNT_DEBATE_MAX", 3, minimum=0)
         # Debate-panel ledgers, keyed by a STABLE finding key (not the ephemeral id) so a finding
         # that is re-found in a later round inherits its prior debate verdict. A critical is only
         # ever written as a CONFIRMED critical if debate UPHELD it (when debate is enabled); a
@@ -197,19 +209,16 @@ class ClaudeSwarm:
         self._debate_rejected: set[str] = set()   # keys debate rejected -> never confirmed
         self._debate_upheld: set[str] = set()     # keys debate upheld -> eligible to be confirmed
         self._debate_downgraded: dict[str, str] = {}  # key -> downgraded severity
+        self._debate_errors: dict[str, int] = {}
+        self._debate_error_max = _env_int("P1HUNT_DEBATE_ERROR_MAX", 2, minimum=1)
         # EXPLOIT-DEVELOPMENT DEPTH PHASE: the organ that turns a believed primitive into a PROVEN
         # attacker-win. When enabled, a critical is confirmed ONLY if this phase demonstrated the
         # rubric's attacker-win in shipped code (primitive != critical). Bounded by top-N per round.
         self._deepdive_on = os.environ.get("P1HUNT_DEEPDIVE", "1") != "0"
-        try:
-            self._deepdive_top_n = max(1, int(os.environ.get("P1HUNT_DEEPDIVE_TOP_N", "2")))
-        except ValueError:
-            self._deepdive_top_n = 2
-        try:
-            self._deepdive_turns = max(20, int(os.environ.get("P1HUNT_DEEPDIVE_TURNS", "60")))
-        except ValueError:
-            self._deepdive_turns = 60
+        self._deepdive_top_n = _env_int("P1HUNT_DEEPDIVE_TOP_N", 4, minimum=1)
+        self._deepdive_turns = _env_int("P1HUNT_DEEPDIVE_TURNS", 60, minimum=20)
         self._exploit_proven: set[str] = set()    # keys with a DEMONSTRATED attacker-win (shipped code)
+        self._exploit_tasks: dict[str, asyncio.Task] = {}  # non-blocking exploit-depth tasks by finding key
         self._deepdived: set[str] = set()         # legacy; pursuit now tracked in _lead_log
         # PERSISTENT LEAD PURSUIT (tenacity): a promising lead is RE-attacked with a DIFFERENT angle
         # across rounds instead of being abandoned after one failed PoC. Each key maps to
@@ -218,13 +227,18 @@ class ClaudeSwarm:
         # cap it is PARKED (needs_human), never silently dropped. Failed attempts decay its priority
         # so the engine rotates to fresher leads but keeps cycling back.
         self._lead_log: dict[str, dict] = {}
-        try:
-            self._lead_max_attempts = max(1, int(os.environ.get("P1HUNT_LEAD_MAX_ATTEMPTS", "5")))
-        except ValueError:
-            self._lead_max_attempts = 5
-        # CROSS-ENGAGEMENT MEMORY: learn from our OWN confirmed findings across engagements. Records
-        # on promote; recalled at arm time as fallible "hunt a new variant" priors (NOTHING PRESET —
-        # derived from past wins, not a baked-in catalog). Disable with P1HUNT_MEMORY=0.
+        self._lead_max_attempts = _env_int("P1HUNT_LEAD_MAX_ATTEMPTS", 10, minimum=1)
+        # Parent A intervention ledger: every serious candidate gets an explicit pipeline state
+        # ("blackboard posted" -> "falsifier real" -> "repro blocked" -> "deep-dive queued" ->
+        # "debate upheld"/"confirmed"). This prevents the bad UX where a verifier says "real" and
+        # the operator cannot tell why it is not in confirmed criticals yet.
+        self._candidate_status: dict[str, dict] = {}
+        self._operator_triage: list[dict] = []
+        self._agent_directives: dict[str, list[str]] = {}
+        self._live_hunters: list = []
+        self._live_roles: dict[str, object] = {}
+        # Cross-engagement memory is disabled by default in preset-free mode. Operators can still
+        # explicitly enable the store for experiments, but live hunts never need it.
         self._memory = None
         try:
             from ..memory import MemoryStore, default_memory_path, memory_enabled
@@ -240,8 +254,31 @@ class ClaudeSwarm:
         # Deterministic severity mapper bound to THIS program's own taxonomy (no preset tiers).
         self._severity = SeverityMapper(getattr(scope, "severity_taxonomy", {}) or {})
 
+    def _configure_engine(self) -> None:
+        eng = (getattr(self.config.models, "engine", "") or "codex").strip().lower()
+        if eng not in ("codex", "claude"):
+            eng = "codex"
+        disc = (getattr(self.config.models, "discovery_engine", "") or eng).strip().lower()
+        if disc not in ("codex", "claude"):
+            disc = eng
+        self.config.models.engine = eng
+        self.config.models.discovery_engine = disc
+        os.environ["P1HUNT_ENGINE"] = eng
+        os.environ["P1HUNT_DISCOVERY_ENGINE"] = disc
+
+    def _role_engine_kwargs(self) -> dict:
+        return {
+            "engine": self.config.models.engine,
+            "codex_model": self.config.models.codex_model,
+            "codex_effort": self.config.models.codex_effort,
+        }
+
+    def _apply_role_engine(self, role) -> None:
+        for key, value in self._role_engine_kwargs().items():
+            setattr(role, key, value)
+
     def _cpu_pct(self) -> float:
-        """Process+children CPU% since the last call (covers the swarm AND its claude subprocesses).
+        """Process+children CPU% since the last call (covers the swarm and agent subprocesses).
         Best-effort: 0.0 if unavailable. Used for the UI status panel."""
         import os as _os
         import time as _t
@@ -267,7 +304,464 @@ class ClaudeSwarm:
                 self._spend_usd += float(data.get("cost", 0) or 0)
             except (TypeError, ValueError):
                 pass
-        self.log.emit(agent, kind, data)
+        event = self.log.emit(agent, kind, data)
+        if kind == "finding_reported":
+            self._record_live_finding(agent, data, event_id=event.id, ts=event.ts)
+
+    def _engagement_dir(self) -> Path | None:
+        path = getattr(self.log, "path", None)
+        return Path(path).parent if path is not None else None
+
+    def _artifact_path(self, raw: str) -> Path | None:
+        if not raw:
+            return None
+        p = Path(str(raw))
+        if not p.is_absolute():
+            p = Path(self.repo_path) / p
+        try:
+            rp = p.resolve()
+            rp.relative_to(Path(self.repo_path).resolve())
+        except (OSError, ValueError):
+            return None
+        return rp if rp.exists() else None
+
+    def _candidate_doc(self, item) -> dict:
+        """JSON-safe finding/candidate shape used by live ledger, findings.json, and artifact packs."""
+        import dataclasses as _dc
+
+        if isinstance(item, dict):
+            raw = dict(item)
+        elif _dc.is_dataclass(item):
+            raw = _dc.asdict(item)
+        elif hasattr(item, "__dict__"):
+            raw = dict(item.__dict__)
+        else:
+            raw = {"title": str(item)}
+
+        poc = raw.get("poc")
+        if _dc.is_dataclass(poc):
+            raw["poc"] = _dc.asdict(poc)
+        elif hasattr(poc, "__dict__"):
+            raw["poc"] = dict(poc.__dict__)
+        elif poc is None:
+            raw.pop("poc", None)
+
+        if "location" not in raw or not raw.get("location"):
+            loc = raw.get("file") or ""
+            if raw.get("line") not in (None, "", 0):
+                loc = f"{loc}:{raw.get('line')}" if loc else str(raw.get("line"))
+            if not loc and isinstance(raw.get("poc"), dict):
+                loc = raw["poc"].get("path", "")
+            raw["location"] = loc
+        raw["title"] = str(raw.get("title") or raw.get("hyp") or "").strip()
+        raw["severity"] = str(raw.get("severity") or "candidate").strip().lower()
+        return raw
+
+    def _finding_key_from_doc(self, doc: dict) -> str:
+        import hashlib as _hashlib
+        import re as _re
+
+        def _norm(v: object) -> str:
+            return _re.sub(r"\s+", " ", str(v or "").strip().lower())
+
+        loc = _norm(doc.get("location") or doc.get("file") or doc.get("endpoint") or doc.get("url"))
+        root = _norm(doc.get("root_cause"))
+        if loc and root:
+            basis = "\x1f".join((loc, root[:500]))
+        elif loc:
+            basis = "\x1f".join((loc, _norm(doc.get("title"))[:240]))
+        else:
+            basis = "\x1f".join((_norm(doc.get("title"))[:240], root[:500]))
+        return _hashlib.sha256(basis.encode("utf-8", "replace")).hexdigest()[:16]
+
+    def _pipeline_status_for_doc(self, key: str, doc: dict) -> dict | None:
+        """Find exact or location-equivalent pipeline state for UI rows.
+
+        Live blackboard titles often evolve as Parent A/deep-dive rewrites a lead. The UI should not
+        show the original wording as stuck at POST if an equivalent file:line lead is already being
+        verified or exploited.
+        """
+        candidates: list[dict] = []
+        status = self._candidate_status.get(key)
+        if status:
+            candidates.append(status)
+        loc = str(doc.get("location") or doc.get("file") or "").strip()
+        if loc:
+            candidates.extend(
+                s for s in self._candidate_status.values()
+                if str(s.get("location") or "").strip() == loc
+            )
+        if not candidates:
+            return None
+        return max(candidates, key=lambda s: float(s.get("updated_ts") or 0))
+
+    def _read_live_findings(self) -> list[dict]:
+        eng = self._engagement_dir()
+        if eng is None:
+            return []
+        path = eng / "live_findings.json"
+        try:
+            import json as _json
+            doc = _json.loads(path.read_text(encoding="utf-8"))
+            cands = doc.get("candidates", [])
+            return cands if isinstance(cands, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _live_findings_as_candidates(self) -> list[ClaudeFinding]:
+        """Convert live blackboard posts into normal verifier candidates.
+
+        Live posts are valuable precisely because they arrive before a long model turn finishes. They
+        must not remain dashboard-only records; Parent A should pull them into the same
+        falsifier/prover/deep-dive queue as final JSON findings.
+        """
+        import re as _re
+
+        out: list[ClaudeFinding] = []
+        for raw in self._read_live_findings():
+            if not isinstance(raw, dict) or not raw.get("title"):
+                continue
+            d = dict(raw)
+            loc = str(d.get("location") or d.get("path") or d.get("endpoint") or d.get("url") or "")
+            if not d.get("file") and loc:
+                m = _re.match(r"^(.+?):(\d+)$", loc)
+                if m:
+                    d["file"] = m.group(1)
+                    d.setdefault("line", int(m.group(2)))
+                else:
+                    d["file"] = loc
+            if not d.get("line"):
+                d["line"] = 0
+            d.setdefault("lens", str(d.get("agent") or "blackboard"))
+            d.setdefault("confidence", "medium")
+            d.setdefault("root_cause", str(d.get("evidence") or d.get("why") or ""))
+            d.setdefault("reproduction", str(d.get("attempted_escalation")
+                                             or d.get("verification_depth") or ""))
+            d.setdefault("counterfactual", str(d.get("impact") or d.get("counterfactual") or ""))
+            try:
+                out.append(ClaudeFinding.from_dict(d, str(d.get("lens") or "blackboard")))
+            except Exception:
+                continue
+        return out
+
+    def _write_json_atomic(self, path: Path, doc: dict) -> None:
+        import json as _json
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(_json.dumps(doc, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        tmp.replace(path)
+
+    def _rubric_text(self) -> str:
+        import json as _json
+        taxonomy = getattr(self.scope, "severity_taxonomy", {}) or {}
+        scope_note = getattr(self.scope, "scope_note", "") or getattr(self.scope, "safe_harbor_text", "") or ""
+        parts = [f"# Program Rubric\n\nProgram: {self.scope.program}\n"]
+        if taxonomy:
+            parts.append("Severity taxonomy:\n\n```json\n" + _json.dumps(taxonomy, indent=2, sort_keys=True) + "\n```\n")
+        if scope_note:
+            parts.append("Scope / reward note:\n\n" + scope_note.strip() + "\n")
+        if not taxonomy and not scope_note:
+            parts.append("No engagement-specific severity taxonomy was captured.\n")
+        return "\n".join(parts)
+
+    def _write_artifact_pack(self, doc: dict) -> None:
+        eng = self._engagement_dir()
+        if eng is None:
+            return
+        key = doc.get("dedup_key") or self._finding_key_from_doc(doc)
+        out = eng / "report_artifacts" / str(key)
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            self._write_json_atomic(out / "finding.json", doc)
+            (out / "rubric.md").write_text(self._rubric_text(), encoding="utf-8")
+            raw_path = doc.get("file") or doc.get("path") or ""
+            src = self._artifact_path(str(raw_path))
+            if src is not None and src.is_file():
+                try:
+                    line = int(doc.get("line") or 0)
+                except (TypeError, ValueError):
+                    line = 0
+                lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line > 0:
+                    lo, hi = max(1, line - 30), min(len(lines), line + 30)
+                else:
+                    lo, hi = 1, min(len(lines), 120)
+                excerpt = "\n".join(f"{i}: {lines[i-1]}" for i in range(lo, hi + 1))
+                (out / "source_excerpt.txt").write_text(excerpt, encoding="utf-8")
+            poc = doc.get("poc") if isinstance(doc.get("poc"), dict) else {}
+            poc_src = self._artifact_path(str(poc.get("path", ""))) if poc else None
+            if poc_src is not None and poc_src.is_file():
+                import shutil as _shutil
+                _shutil.copy2(poc_src, out / ("poc_" + poc_src.name))
+        except OSError:
+            return
+
+    def _record_live_finding(self, agent: str, data: dict, *, event_id: str, ts: float) -> None:
+        """Immediately persist a posted finding before the model session returns.
+
+        This is the crash-resilience path for long scans: live findings are no longer only visible in
+        events.jsonl until the round boundary writes findings.json.
+        """
+        import time as _time
+
+        eng = self._engagement_dir()
+        if eng is None:
+            return
+        payload = data.get("finding") if isinstance(data.get("finding"), dict) else data
+        doc = self._candidate_doc(payload)
+        if not doc.get("title"):
+            return
+        doc["agent"] = agent
+        doc["status"] = doc.get("status") or "live_candidate"
+        doc.setdefault("verification_depth", "posted by finder; Parent A verification/proof pending")
+        doc["first_seen_ts"] = float(ts)
+        doc["last_seen_ts"] = float(ts)
+        doc["event_ids"] = [event_id]
+        doc["event_count"] = 1
+        doc["dedup_key"] = self._finding_key_from_doc(doc)
+        reported_status = str(doc.get("status") or "").strip().lower()
+        verified = bool(doc.get("verified")) or "confirmed" in reported_status or "reproduced" in reported_status
+        self._record_candidate_status(
+            doc,
+            stage="operator_verified" if verified else "blackboard",
+            status=(reported_status or "confirmed_critical_reproduced") if verified else "posted",
+            target_agent="parent_a" if verified else agent,
+            next_action=(
+                "Parent A should preserve confirmed-critical status, polish the report, and continue only for a cleaner or second P1."
+                if verified else
+                "Parent A will verify, materialize proof, run reproduction, then deep-dive if needed."
+            ),
+            blocked_by="" if verified else "awaiting_parent_pipeline",
+            reason=str(doc.get("verification_depth") or doc.get("evidence") or doc.get("root_cause") or "")[:240],
+        )
+
+        existing = self._read_live_findings()
+        merged: dict[str, dict] = {}
+        for old in existing:
+            if not isinstance(old, dict):
+                continue
+            key = old.get("dedup_key") or self._finding_key_from_doc(old)
+            old["dedup_key"] = key
+            merged[key] = old
+        cur = merged.get(doc["dedup_key"])
+        if cur:
+            cur.update({k: v for k, v in doc.items() if v not in (None, "", [])})
+            cur["first_seen_ts"] = min(float(cur.get("first_seen_ts") or ts), float(ts))
+            cur["last_seen_ts"] = float(ts)
+            ids = list(dict.fromkeys([*(cur.get("event_ids") or []), event_id]))
+            cur["event_ids"] = ids[-20:]
+            cur["event_count"] = int(cur.get("event_count") or 1) + 1
+            doc = cur
+        merged[doc["dedup_key"]] = doc
+        cands = sorted(
+            (self._apply_pipeline_status(v) for v in merged.values()),
+            key=lambda x: float(x.get("last_seen_ts") or 0),
+            reverse=True,
+        )
+        live_doc = {
+            "program": self.scope.program,
+            "updated": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+            "counts": {"candidates": len(cands)},
+            "candidates": cands,
+        }
+        try:
+            self._write_json_atomic(eng / "live_findings.json", live_doc)
+            self._write_findings_snapshot_from_live(cands)
+            self._write_artifact_pack(doc)
+        except OSError:
+            return
+
+    def _merge_live_candidates(self, candidates) -> list[dict]:
+        merged: dict[str, dict] = {}
+        for c in candidates:
+            doc = self._candidate_doc(c)
+            if not doc.get("title"):
+                continue
+            key = doc.get("dedup_key") or self._finding_key_from_doc(doc)
+            doc["dedup_key"] = key
+            merged[key] = self._apply_pipeline_status(doc)
+        for doc in self._read_live_findings():
+            if not isinstance(doc, dict) or not doc.get("title"):
+                continue
+            key = doc.get("dedup_key") or self._finding_key_from_doc(doc)
+            doc["dedup_key"] = key
+            merged.setdefault(key, self._apply_pipeline_status(doc))
+        return list(merged.values())
+
+    def _write_findings_snapshot_from_live(self, live_candidates: list[dict]) -> None:
+        eng = self._engagement_dir()
+        if eng is None:
+            return
+        path = eng / "findings.json"
+        try:
+            import json as _json
+            doc = _json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError):
+            doc = {}
+        doc.setdefault("program", self.scope.program)
+        doc["updated"] = __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())
+        doc.setdefault("confirmed_criticals", [])
+        doc.setdefault("needs_human_review", [])
+        existing = doc.get("candidates", []) if isinstance(doc.get("candidates"), list) else []
+        merged: dict[str, dict] = {}
+        for cand in [*existing, *live_candidates]:
+            if not isinstance(cand, dict):
+                continue
+            key = cand.get("dedup_key") or self._finding_key_from_doc(cand)
+            cand["dedup_key"] = key
+            merged[key] = self._apply_pipeline_status(cand)
+        doc["candidates"] = list(merged.values())
+        doc["counts"] = {
+            "confirmed_critical": len(doc.get("confirmed_criticals") or []),
+            "needs_human_review": len(doc.get("needs_human_review") or []),
+            "candidates": len(doc["candidates"]),
+        }
+        self._write_json_atomic(path, doc)
+
+    def _candidate_key_doc(self, item) -> tuple[str, dict]:
+        doc = self._candidate_doc(item)
+        key = str(doc.get("dedup_key") or self._finding_key_from_doc(doc))
+        doc["dedup_key"] = key
+        return key, doc
+
+    def _record_candidate_status(self, item, *, stage: str, status: str,
+                                 next_action: str = "", blocked_by: str = "",
+                                 reason: str = "", target_agent: str = "parent_a") -> str:
+        """Parent-A-owned state machine for one candidate's promotion path."""
+        import time as _time
+
+        key, doc = self._candidate_key_doc(item)
+        rec = dict(self._candidate_status.get(key) or {})
+        history = list(rec.get("history") or [])
+        entry = {
+            "ts": _time.time(),
+            "stage": stage,
+            "status": status,
+            "agent": self.name,
+            "target_agent": target_agent,
+            "next_action": next_action,
+            "blocked_by": blocked_by,
+            "reason": reason[:500],
+        }
+        history.append(entry)
+        rec.update({
+            "dedup_key": key,
+            "title": doc.get("title", ""),
+            "severity": doc.get("severity", ""),
+            "location": doc.get("location") or doc.get("file", ""),
+            "stage": stage,
+            "status": status,
+            "agent": self.name,
+            "target_agent": target_agent,
+            "next_action": next_action,
+            "blocked_by": blocked_by,
+            "reason": reason[:500],
+            "updated_ts": entry["ts"],
+            "history": history[-12:],
+        })
+        self._candidate_status[key] = rec
+        self._emit(self.name, "lifecycle", {
+            "event": "candidate_status",
+            "dedup_key": key,
+            "title": rec["title"],
+            "severity": rec["severity"],
+            "stage": stage,
+            "status": status,
+            "target_agent": target_agent,
+            "next_action": next_action,
+            "blocked_by": blocked_by,
+            "reason": reason[:240],
+        })
+        return key
+
+    def _parent_intervene(self, item, *, target_agent: str, directive: str,
+                          reason: str, blocked_by: str = "") -> None:
+        """Parent A explicitly tells the next service what to do with a stalled/high-value lead."""
+        key = self._record_candidate_status(
+            item,
+            stage="parent_a",
+            status="intervened",
+            target_agent=target_agent,
+            next_action=directive,
+            blocked_by=blocked_by,
+            reason=reason,
+        )
+        note = f"[{key}] {directive}"
+        self._agent_directives.setdefault(target_agent, []).insert(0, note)
+        self._emit(self.name, "message", {
+            "phase": "intervention",
+            "to": target_agent,
+            "title": self._candidate_doc(item).get("title", ""),
+            "dedup_key": key,
+            "blocked_by": blocked_by,
+            "reason": reason[:240],
+            "directive": directive,
+        })
+
+    def _mark_fastlane_pending(self, item, *, cut_discovery: bool) -> None:
+        """Show that Parent A has seen a hot blackboard lead before the round ends."""
+        pipe = self._pipeline_for(item)
+        current = str(pipe.get("status") or "").strip().lower()
+        if current and current not in {
+            "posted",
+            "live_candidate",
+            "candidate",
+            "selected_for_verification",
+            "fastlane_pending_verification",
+        }:
+            return
+        self._record_candidate_status(
+            item,
+            stage="VERIFY",
+            status="selected_for_verification" if cut_discovery else "fastlane_pending_verification",
+            target_agent="falsifier",
+            next_action=(
+                "Child discovery was cut short; verify, materialize proof, then deep-dive."
+                if cut_discovery else
+                "Queued for verifier/proof at round close; child discovery is still running."
+            ),
+            blocked_by="" if cut_discovery else "round_in_progress",
+            reason="high/critical blackboard post observed by live fastlane",
+        )
+
+    def _pipeline_for(self, item) -> dict:
+        key, _doc = self._candidate_key_doc(item)
+        return dict(self._candidate_status.get(key) or {})
+
+    def _apply_pipeline_status(self, doc: dict) -> dict:
+        key = str(doc.get("dedup_key") or self._finding_key_from_doc(doc))
+        status = self._pipeline_status_for_doc(key, doc)
+        if status:
+            doc["pipeline"] = {
+                k: v for k, v in status.items()
+                if k in ("stage", "status", "target_agent", "next_action", "blocked_by",
+                         "agent", "reason", "updated_ts", "history")
+            }
+        return doc
+
+    def _matches_triage(self, item, triage: dict) -> bool:
+        key, doc = self._candidate_key_doc(item)
+        wanted_key = str(triage.get("finding_key") or "").strip()
+        wanted_title = str(triage.get("title") or "").strip().lower()
+        title = str(doc.get("title") or "").lower()
+        return bool((wanted_key and wanted_key == key)
+                    or (wanted_title and (wanted_title == title or wanted_title in title)))
+
+    def _is_operator_priority(self, item) -> bool:
+        return any(self._matches_triage(item, t) for t in self._operator_triage)
+
+    def _operator_notes_for(self, agent: str, item=None) -> str:
+        notes = list(self._agent_directives.get(agent, []) or [])
+        notes += list(self._agent_directives.get("*", []) or [])
+        if item is not None:
+            for t in self._operator_triage:
+                if self._matches_triage(item, t):
+                    msg = str(t.get("message") or "").strip()
+                    action = str(t.get("action") or "").strip()
+                    notes.insert(0, f"Operator triage: {action or 'prioritize this finding now'}"
+                                    + (f". Note: {msg}" if msg else ""))
+        if not notes:
+            return ""
+        return "\n".join(f"- {n}" for n in notes[:8])
 
     # --- self-healing watchdog (§8 never-quit) ----------------------------
     STALL_SECONDS = 300  # 5 min of TOTAL silence = a hung session or a rate-limit stall
@@ -342,7 +836,11 @@ class ClaudeSwarm:
                     f"endlessly, delegate big reads to sub-agents, don't spiral. Return ONLY JSON: "
                     f'{{"rate_limited": true|false, "diagnosis": "...", "notice": "<the directive>"}}')
                 sess = make_session(agent_name=self.name, model=self.config.models.orchestrator,
-                                     on_event=self._emit, guard_check=None, max_turns=3, allow_web=False,
+                                     on_event=self._emit, guard_check=None, max_turns=3,
+                                     engine=self.config.models.engine,
+                                     effort=self.config.models.codex_effort,
+                                     codex_model=self.config.models.codex_model,
+                                     allow_web=False,
                                      perms=self._perms, egress_hosts=self._egress_hosts)
                 res = await asyncio.wait_for(sess.run(prompt, self.repo_path), timeout=90)
                 parsed = _parse_json_object(res.text)
@@ -400,7 +898,8 @@ class ClaudeSwarm:
     def _finding_key(self, f) -> str:
         """A STABLE identity for a finding across rounds (title + file), so debate verdicts persist
         even when the finding is re-discovered with a fresh ephemeral id."""
-        return f"{(getattr(f, 'title', '') or '').strip().lower()[:140]}|{getattr(f, 'file', '') or ''}"
+        loc = getattr(f, "file", "") or getattr(getattr(f, "poc", None), "path", "") or ""
+        return f"{(getattr(f, 'title', '') or '').strip().lower()[:140]}|{loc}"
 
     def _lead_attempts(self, key: str) -> int:
         return len(self._lead_log.get(key, {}).get("attempts", []))
@@ -416,6 +915,41 @@ class ClaudeSwarm:
         if self._lead_status(key) in ("proven", "exhausted", "maxed"):
             return False
         return self._lead_attempts(key) < self._lead_max_attempts
+
+    def _harvest_exploit_tasks(self) -> None:
+        """Surface failed background exploit tasks and clear completed task handles."""
+        for key, task in list(self._exploit_tasks.items()):
+            if not task.done():
+                continue
+            self._exploit_tasks.pop(key, None)
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._emit(
+                    self.name,
+                    "lifecycle",
+                    {"event": "exploit_background_error", "key": key, "detail": str(exc)[:200]},
+                )
+
+    async def _cancel_exploit_tasks(self) -> None:
+        """Cancel exploit-depth tasks on shutdown so no agent lane survives the hunt."""
+        tasks = [task for task in self._exploit_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._exploit_tasks.clear()
+
+    async def _cancel_fuzz_tasks(self) -> None:
+        """Cancel non-blocking fuzz campaigns on shutdown."""
+        tasks = [task for task in self._fuzz_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._fuzz_tasks.clear()
 
     def _record_lead_attempt(self, key: str, verdict: dict | None) -> str:
         """Log one failed attempt and decide the lead's next state: 'exhausted' (rigorous
@@ -435,6 +969,67 @@ class ClaudeSwarm:
         else:
             rec["status"] = "open"
         return rec["status"]
+
+    def _rubric_priority_terms(self) -> set[str]:
+        """Program-derived terms that describe what this engagement pays as serious impact.
+
+        The exploit-depth queue used to contain crypto-specific keywords. That made one target class
+        better served than others and violated the spec's "nothing preset" rule. This derives terms
+        from the captured severity taxonomy and scope text for the current program instead.
+        """
+        import re as _re
+
+        taxonomy = getattr(self.scope, "severity_taxonomy", {}) or {}
+        parts: list[str] = []
+        if isinstance(taxonomy, dict):
+            for k, v in taxonomy.items():
+                parts.append(str(k))
+                parts.append(str(v))
+        parts.append(str(getattr(self.scope, "scope_note", "") or ""))
+        parts.append(str(getattr(self.scope, "safe_harbor_text", "") or ""))
+        text = " ".join(parts).lower()
+        stop = {
+            "about", "above", "after", "against", "also", "attack", "attacker", "before",
+            "being", "below", "between", "could", "from", "have", "into", "less", "more",
+            "only", "other", "program", "scope", "severity", "than", "that", "their", "this",
+            "through", "triggering", "under", "without", "with", "would",
+        }
+        terms: set[str] = set()
+        for tok in _re.findall(r"[a-z][a-z0-9_-]{3,}", text):
+            tok = tok.strip("_-")
+            if len(tok) < 4 or tok in stop or tok.isdigit():
+                continue
+            terms.add(tok)
+            if len(terms) >= 80:
+                break
+        return terms
+
+    def _candidate_priority_text(self, f) -> str:
+        vals: list[str] = []
+        for attr in (
+            "title", "severity", "root_cause", "counterfactual", "reproduction",
+            "remediation", "severity_rationale", "confidence", "lens", "file",
+        ):
+            vals.append(str(getattr(f, attr, "") or ""))
+        poc = getattr(f, "poc", None)
+        if poc is not None:
+            vals.append(str(getattr(poc, "description", "") or ""))
+            vals.append(str(getattr(poc, "path", "") or ""))
+        return " ".join(vals).lower()
+
+    def _rubric_lead_score(self, f, terms: set[str] | None = None) -> float:
+        """Rank leads for scarce exploit-depth time using engagement-derived rubric signals."""
+        terms = terms if terms is not None else self._rubric_priority_terms()
+        text = self._candidate_priority_text(f)
+        sev = str(getattr(f, "severity", "") or "").lower()
+        score = {"critical": 8.0, "high": 5.0, "medium": 2.0}.get(sev, 0.5)
+        if getattr(f, "verified", False):
+            score += 1.5
+        if str(getattr(f, "counterfactual", "") or "").strip():
+            score += 1.0
+        matches = [t for t in terms if t and t in text]
+        score += min(12.0, 2.0 * len(matches))
+        return score
 
     def _confirmed_crits(self, findings) -> list:
         """The findings that count as CONFIRMED CRITICALS — the single source of truth, enforcing the
@@ -464,8 +1059,9 @@ class ClaudeSwarm:
     def _write_findings_json(self, findings, candidates, needs_human=None) -> None:
         """Persist the current findings to ``findings.json`` in the engagement folder. Called at
         every round boundary (so it's always fresh) and on stop/cap — when the scan is stopped,
-        the latest findings are already on disk. ``needs_human`` is the prominent tier of believed-
-        real, high-confidence P1s that could not be auto-reproduced (surfaced, not buried)."""
+        the latest findings are already on disk. ``needs_human`` is kept as the compatibility field
+        name for the prominent autonomous-follow-up tier: believed-real, high-confidence P1s that
+        could not be auto-reproduced yet (surfaced and kept in the bot pipeline, not buried)."""
         import json as _json
         import time as _time
         from pathlib import Path
@@ -476,32 +1072,43 @@ class ClaudeSwarm:
         out = Path(path).with_name("findings.json")
         crits = self._confirmed_crits(findings)  # debate-gated: only criticals that survived the panel
         nh = needs_human or []
+
+        def _finding_doc(f, *, human: bool = False) -> dict:
+            poc = getattr(f, "poc", None)
+            loc = getattr(poc, "path", "") if poc is not None else getattr(f, "file", "")
+            doc = {
+                "title": getattr(f, "title", ""),
+                "severity": getattr(f, "severity", ""),
+                "verified": getattr(f, "verified", not human),
+                "location": loc,
+                "root_cause": getattr(f, "root_cause", ""),
+                "counterfactual": getattr(f, "counterfactual", ""),
+                "remediation": getattr(f, "remediation", ""),
+            }
+            if human:
+                doc["why_unproven"] = getattr(poc, "description", "") if poc is not None else ""
+            doc["dedup_key"] = self._finding_key_from_doc(doc)
+            return self._apply_pipeline_status(doc)
+
+        candidate_docs = self._merge_live_candidates(candidates)
         doc = {
             "program": self.scope.program,
             "updated": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
             "counts": {"confirmed_critical": len(crits), "needs_human_review": len(nh),
-                       "candidates": len(candidates)},
-            "confirmed_criticals": [
-                {"title": f.title, "severity": f.severity, "verified": getattr(f, "verified", True),
-                 "location": getattr(f.poc, "path", ""), "root_cause": f.root_cause,
-                 "counterfactual": f.counterfactual, "remediation": f.remediation}
-                for f in crits
-            ],
-            # Reasoned P1s a human should look at FIRST — strong reasoning, only the mechanical
-            # proof is missing. Listed prominently above the raw candidate dump.
-            "needs_human_review": [
-                {"title": f.title, "severity": f.severity, "location": getattr(f.poc, "path", ""),
-                 "root_cause": f.root_cause, "counterfactual": f.counterfactual,
-                 "why_unproven": getattr(f.poc, "description", ""), "remediation": f.remediation}
-                for f in nh
-            ],
-            "candidates": [c.__dict__ for c in candidates],
+                       "candidates": len(candidate_docs)},
+            "confirmed_criticals": [_finding_doc(f) for f in crits],
+            # Reasoned P1s the autonomous pipeline should keep attacking FIRST — strong reasoning,
+            # only the mechanical proof is missing. Listed prominently above the raw candidate dump.
+            "needs_human_review": [_finding_doc(f, human=True) for f in nh],
+            "candidates": candidate_docs,
         }
         try:
-            out.write_text(_json.dumps(doc, indent=2), encoding="utf-8")
+            out.write_text(_json.dumps(doc, indent=2, default=str), encoding="utf-8")
+            for f in [*doc["confirmed_criticals"], *doc["needs_human_review"], *doc["candidates"]]:
+                self._write_artifact_pack(f)
             self._emit(self.name, "lifecycle",
                        {"event": "findings_written", "path": str(out), "criticals": len(crits),
-                        "needs_human_review": len(nh), "candidates": len(candidates)})
+                        "needs_human_review": len(nh), "candidates": len(candidate_docs)})
         except OSError:
             pass
 
@@ -525,7 +1132,7 @@ class ClaudeSwarm:
             "depth": depth,
             "critical_means": str(critical_means),
             "seen": list(seen),
-            "known_patterns": list(self._known_patterns),
+            "known_patterns": [],
             "oracle_desc": str(oracle_desc),
             "tracks": [
                 {"theme": h.theme, "subsystem": getattr(h, "subsystem", h.theme),
@@ -624,6 +1231,9 @@ class ClaudeSwarm:
         session = make_session(
             agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
             guard_check=self._guard_check(guard, self.name), max_turns=12,
+            engine=self.config.models.engine,
+            effort=self.config.models.codex_effort,
+            codex_model=self.config.models.codex_model,
             perms=self._perms, egress_hosts=self._egress_hosts,
         )
         try:
@@ -684,7 +1294,83 @@ class ClaudeSwarm:
                 continue
             if d.get("kind") == "stop":
                 self._safety_event = True
-                self._emit(self.name, "lifecycle", {"event": "stop", "reason": "operator notify: stop"})
+                self._paused = False
+                self._emit(self.name, "lifecycle", {
+                    "event": "stop",
+                    "reason": str(d.get("message") or "operator requested stop")[:240],
+                    "source": str(d.get("source") or "control"),
+                })
+                continue
+            if d.get("kind") == "pause":
+                self._paused = True
+                self._emit(self.name, "lifecycle", {
+                    "event": "pause",
+                    "reason": str(d.get("message") or "operator requested pause")[:240],
+                    "source": str(d.get("source") or "control"),
+                })
+                continue
+            if d.get("kind") == "resume":
+                self._paused = False
+                self._emit(self.name, "lifecycle", {
+                    "event": "resume",
+                    "reason": str(d.get("message") or "operator requested resume")[:240],
+                    "source": str(d.get("source") or "control"),
+                })
+                continue
+            if d.get("kind") in ("reload", "hot_reload"):
+                mods = [str(m).strip() for m in (d.get("modules") or []) if str(m).strip()]
+                try:
+                    from ..runtime_reload import apply_runtime_reload
+
+                    out = apply_runtime_reload(self, modules=mods or None)
+                    self._emit(self.name, "lifecycle",
+                               {"event": "runtime_reload", "status": "applied",
+                                "modules": out.get("reloaded", [])[:20],
+                                "rebound": out.get("rebound", [])[:20],
+                                "refreshed": out.get("refreshed", [])[:20],
+                                "skipped": out.get("skipped", {}),
+                                "detail": out.get("limitations", "")[:500]})
+                    self._notices.insert(
+                        0,
+                        "Runtime hot reload applied at round boundary: future role calls use refreshed "
+                        "prompt/session/helper modules; main hunt-loop bytecode changes may still need resume.",
+                    )
+                except Exception as exc:
+                    self._emit(self.name, "lifecycle",
+                               {"event": "runtime_reload", "status": "failed",
+                                "detail": str(exc)[:500]})
+                continue
+            if d.get("kind") == "triage":
+                key = str(d.get("finding_key") or "").strip()
+                title = str(d.get("title") or "").strip()
+                msg = str(d.get("message") or "").strip()
+                target_agent = str(d.get("target_agent") or "parent_a").strip() or "parent_a"
+                source_agent = str(d.get("source_agent") or self.name).strip() or self.name
+                action = str(d.get("action") or "prioritize verifier/prover/deep-dive now").strip()
+                notice = (
+                    "TRIAGE NOW: prioritize verifier/prover/deep-dive on "
+                    + (f"finding key {key}" if key else f"finding '{title}'")
+                    + (f". Operator note: {msg}" if msg else ".")
+                )
+                triage = {
+                    "finding_key": key,
+                    "title": title,
+                    "message": msg,
+                    "target_agent": target_agent,
+                    "action": action,
+                }
+                self._operator_triage.append(triage)
+                self._agent_directives.setdefault(target_agent, []).insert(0, notice + f" Action: {action}")
+                self._notices.insert(0, notice)
+                self._emit(source_agent, "message", {
+                    "phase": "intervention",
+                    "to": target_agent,
+                    "title": title,
+                    "dedup_key": key,
+                    "reason": msg,
+                    "directive": action,
+                    "notice": notice,
+                })
                 continue
             msg = str(d.get("message", "")).strip()
             paths = [str(p).strip() for p in (d.get("paths") or []) if str(p).strip()]
@@ -692,6 +1378,24 @@ class ClaudeSwarm:
             if notice:
                 self._notices.append(notice)
                 self._emit(self.name, "message", {"phase": "notice", "notice": notice})
+
+    async def _pause_gate(self, findings, all_candidates, needs_human) -> None:
+        """Hold the swarm at a round boundary until a resume or stop directive arrives."""
+        import asyncio as _asyncio
+        import time as _t
+
+        announced = False
+        while self._paused and not self._safety_event:
+            if not announced:
+                self._write_findings_json(findings, all_candidates, needs_human)
+                self._emit(self.name, "lifecycle", {
+                    "event": "paused",
+                    "reason": "operator pause active; waiting for resume or stop",
+                })
+                announced = True
+            self._last_activity = _t.monotonic()
+            await _asyncio.sleep(2.0)
+            self._drain_control()
 
     def _guard_check(self, guard: ScopeGuard, agent: str):
         """The ONE hard guardrail, enforced on every file tool (Read/Grep/Glob/Write/Edit/…):
@@ -732,11 +1436,10 @@ class ClaudeSwarm:
 
         return check
 
-    # --- environment arming (the P1 unblocker: build + fork + packs + corpus) ----
+    # --- environment arming (build + fork + corpus) ----
     async def _arm_environment(self, tracks: list[dict]) -> None:
-        """Before the first round: select class-level packs, surface EVM static leads, BUILD the
-        target so harnesses can deploy it, start a local mainnet fork (EVM, if configured), and
-        open the persistent corpus. All steps are graceful — a missing toolchain/fork/pack never
+        """Before the first round: build the target so harnesses can run, start a local fork when
+        configured, and open the persistent corpus. All steps are graceful — a missing toolchain/fork never
         stops the hunt; it just narrows what the team can do this run."""
         repo = self.repo_path
         tc = self._target_class
@@ -750,12 +1453,11 @@ class ClaudeSwarm:
             except Exception:
                 pass
 
-        # 1) NOTHING PRESET: invariants and known bug-patterns come ONLY from Parent A's recon
-        # (derived from the ACTUAL code + web research on THIS specific target — see _scope()).
-        # No class/subclass invariant or bug-pattern packs are injected. A track Parent A left
+        # 1) NOTHING PRESET: invariants come only from Parent A's recon over this target.
+        # No class/subclass invariant packs are injected. A track Parent A left
         # without invariants is hunted with the in-session "derive the invariants from the code
         # yourself" path the hunter/fuzzer prompts already instruct — never a generic floor.
-        # `self._known_patterns` and each track's `invariants` are populated by recon, not here.
+        # Track invariants are populated by recon, not here.
 
         # 2) Optional DERIVED observation (a property of the actual code, not a preset): how
         # assembly-heavy the EVM source is, so the team leans on invariant/differential search
@@ -770,19 +1472,10 @@ class ClaudeSwarm:
                         "hint": ("assembly-heavy — prefer invariant/differential search over keyword reading"
                                  if density >= 0.5 else "lean on derived invariants + differential testing")})
 
-        # DERIVED static leads: a Solidity-aware scan of the ACTUAL code surfaces concrete
-        # high-value bug-class primitives (unchecked low-level call, bare ecrecover, raw
-        # delegatecall, div-before-mul, reentrant external call) the hunters then reason about and
-        # PROVE-or-kill. These are derived from the target in front of us (NOTHING PRESET); they
-        # are hints, not a checklist, and findings still only promote on a reproduced artifact.
-        try:
-            self._scan_hits = scan_combined(repo)
-        except Exception:
-            self._scan_hits = []
-        if self._scan_hits:
-            self._emit(self.name, "lifecycle",
-                       {"event": "static_leads", "count": len(self._scan_hits),
-                        "sample": [f"{h.signal.id} @ {h.file}:{h.line}" for h in self._scan_hits[:4]]})
+        # No preset static leads are injected into hunters. Parent A must derive hunt tracks,
+        # invariants, and hypotheses from the target during recon; deterministic scanners are not
+        # allowed to front-run that reasoning with canned failure modes.
+        self._scan_hits = []
 
         # 2b) TOOLCHAIN PROVISIONING — the biggest unblocker for confirmed criticals. The
         # reproduction gate cannot EXECUTE a harness without forge, so on an EVM target with no
@@ -846,7 +1539,7 @@ class ClaudeSwarm:
         # authorized non-production target was unlocked above, wire it up so the EXISTING web
         # reproduction harnesses actually fire: export the env vars they read, ship the scope-
         # enforced interaction client into the PoC sandbox, and start the loopback OOB listener so
-        # blind SSRF/injection can be CONFIRMED. All graceful — any failure just narrows the run.
+        # callback-based behavior can be CONFIRMED. All graceful — any failure just narrows the run.
         if self._egress_hosts is not None:
             self._arm_dynamic()
 
@@ -854,24 +1547,6 @@ class ClaudeSwarm:
         # reproduction toolchain is installed — without it EVERY finding is quarantined forever, no
         # matter how good the reasoning. Warn unmissably (and say how to fix) so this never fails silently.
         self._warn_if_no_repro_toolchain()
-
-        # 8) CROSS-ENGAGEMENT MEMORY recall: seed known_patterns with OUR OWN past confirmed findings
-        # on similar targets (fallible priors — hunt NEW variants; the old instances are likely
-        # patched). Merged into the SAME channel recon already uses; Parent A still derives the hunt.
-        if self._memory is not None:
-            try:
-                priors = self._memory.recall(self._target_class, self._subclass, limit=8)
-            except Exception:
-                priors = []
-            if priors:
-                have = {p.lower()[:80] for p in self._known_patterns}
-                added = [p for p in priors if p.lower()[:80] not in have]
-                self._known_patterns = (self._known_patterns + added)[:16]
-                if added:
-                    self._emit(self.name, "lifecycle",
-                               {"event": "memory_recalled", "count": len(added),
-                                "source": "own confirmed findings on similar targets",
-                                "sample": added[:3]})
 
     def _repro_tools_for_class(self) -> list[str]:
         """The reproduction toolchain(s) that can EXECUTE a PoC for the derived class (any one
@@ -932,7 +1607,7 @@ class ClaudeSwarm:
                 continue
             name = (ident.name or "").strip().lower()
             _set("P1HUNT_TOKEN" if name in ("", "default") else f"P1HUNT_TOKEN_{name.upper()}", tok)
-        # OOB interaction listener (loopback) for blind SSRF/injection confirmation.
+        # OOB interaction listener (loopback) for callback-based confirmation.
         try:
             from ..dynamic.oob import start_oob_listener
             hits = self.poc_dir / "oob_hits.jsonl"
@@ -1015,10 +1690,7 @@ class ClaudeSwarm:
         # Deep-discovery raises the floor so a hunter can sustain a long, compounding investigation
         # within a round (its accumulated `model` already carries across rounds). Env always wins.
         _default = 80 if self._deep_discovery else 28
-        try:
-            return max(8, int(os.environ.get("P1HUNT_HUNTER_TURNS", str(_default))))
-        except ValueError:
-            return _default
+        return _env_int("P1HUNT_HUNTER_TURNS", _default, minimum=8)
 
     def _retune_budgets(self, hunters, per_hunter) -> None:
         """ADAPTIVE BUDGET (§8): pour more turns into the tracks showing real leads and let cold
@@ -1069,23 +1741,8 @@ class ClaudeSwarm:
         return "\n\n".join(lines)
 
     def _static_leads_for(self, focus_files: list[str]) -> list[str]:
-        """Derived static leads relevant to this hunter: those whose file matches one of the
-        hunter's focus files, else the strongest few overall. Formatted as one line each. Skips
-        out-of-scope (non-deployed) files so a hunter never chases a lead it cannot report."""
-        if not self._scan_hits:
-            return []
-        focus = {f.strip().lstrip("./") for f in (focus_files or []) if f and f.strip()}
-
-        def _matches(rel: str) -> bool:
-            if not focus:
-                return False
-            r = rel.lstrip("./")
-            return any(r == f or r.endswith("/" + f) or f.endswith("/" + r) or r.startswith(f) for f in focus)
-
-        scored = [h for h in self._scan_hits if not self._out_of_scope(h.file)]
-        chosen = [h for h in scored if _matches(h.file)] or scored[:8]
-        return [f"{h.signal.title} — {h.file}:{h.line} (lens: {h.signal.lens}; class: {h.signal.id})"
-                for h in chosen[:12]]
+        """Preset-free mode: static scanner hits are never injected as hunter leads."""
+        return []
 
     async def hunt(self, max_rounds: int | None = None) -> HuntResult:
         """Never-stop: hunt round after round until a critical is confirmed or the operator
@@ -1105,6 +1762,27 @@ class ClaudeSwarm:
         self._hunt_t0 = _t0mod.monotonic()  # hunt start, for the UI status panel's true uptime
         # SETTINGS SNAPSHOT for the UI: the operative knobs in one event the cockpit can render.
         m = self.config.models
+        if m.engine == "codex":
+            codex_desc = f"codex:{m.codex_model or 'default'}/{m.codex_effort}"
+            model_map = {
+                "orchestrator": codex_desc,
+                "worker": codex_desc,
+                "falsifier": codex_desc,
+                "poc_prover": codex_desc,
+                "exploit_dev": codex_desc,
+                "fuzzer": codex_desc,
+                "debate": codex_desc,
+                "dedup": codex_desc,
+            }
+        else:
+            model_map = {"orchestrator": m.orchestrator,
+                         "worker": m.worker,
+                         "falsifier": m.falsifier,
+                         "poc_prover": m.falsifier,
+                         "exploit_dev": m.falsifier,
+                         "fuzzer": m.falsifier,
+                         "debate": m.falsifier,
+                         "dedup": m.warm_pool}
         self._emit(self.name, "lifecycle", {
             "event": "settings", "program": self.scope.program, "target_class": self._target_class,
             "max_criticals": self._max_criticals, "max_rounds": max_rounds,
@@ -1115,15 +1793,12 @@ class ClaudeSwarm:
             "no_model_downgrade": os.environ.get("P1HUNT_NO_MODEL_DOWNGRADE", "0") == "1",
             "run_mode": self.config.run_mode, "cost_cap_usd": self._cost_cap,
             "engine": m.engine, "discovery_engine": m.discovery_engine,
-            "claude_account": self.config.claude_account,
-            "models": {"orchestrator": m.orchestrator,
-                       "worker": (f"codex:{m.codex_model}/{m.codex_effort}"
-                                  if m.discovery_engine == "codex" else m.worker),
-                       "falsifier": m.falsifier,
-                       "warm_pool": m.warm_pool, "debate": m.falsifier, "dedup": m.warm_pool},
-            "fuzz_campaigns": int(os.environ.get("P1HUNT_FUZZ_CAMPAIGNS", "1") or 1),
+            "role_routing": "all_roles" if m.engine == "codex" else "legacy_claude",
+            "models": model_map,
+            "fuzz_campaigns": _env_int("P1HUNT_FUZZ_CAMPAIGNS", 1, minimum=0),
             "second_opinion": os.environ.get("P1HUNT_SECOND_OPINION") == "1",
-            "recon_turns": int(os.environ.get("P1HUNT_RECON_TURNS", "45") or 45)})
+            "recon_mode": self._recon_mode(),
+            "recon_turns": _env_int("P1HUNT_RECON_TURNS", 45, minimum=20)})
 
         policy = plan.scopeguard_policy
         policy.allowlist = list(dict.fromkeys([*policy.allowlist, self.repo_path, str(self.poc_dir)]))
@@ -1158,17 +1833,15 @@ class ClaudeSwarm:
             if resume:
                 critical_means = resume.get("critical_means") or plan.impact_definition
                 tracks = (resume.get("tracks") or self._fallback_tracks())[:6]
-                self._known_patterns = list(resume.get("known_patterns", []) or [])
+                self._known_patterns = []
                 oracle_desc = str(resume.get("oracle_desc", "") or "")
             else:
                 # NOTHING PRESET (§1): Parent A performs COLD reconnaissance of the target and
-                # DERIVES the subsystems/invariants/tracks itself (Pillar 2) plus the historical bug
-                # patterns to hunt new variants of (Pillar 3) — no playbook, no checklist.
+                # DERIVES the subsystems/invariants/tracks itself from this source tree.
                 scope_plan = await self._scope(guard)
                 critical_means = scope_plan.get("critical_means") or plan.impact_definition
                 tracks = (scope_plan.get("tracks") or self._fallback_tracks())[:6]
-                self._known_patterns = [str(p).strip() for p in (scope_plan.get("known_patterns") or [])
-                                        if str(p).strip()][:12]
+                self._known_patterns = []
                 _orc = scope_plan.get("differential_oracle") or {}
                 if isinstance(_orc, dict) and _orc.get("exists"):
                     oracle_desc = str(_orc.get("description", "")).strip()
@@ -1192,25 +1865,17 @@ class ClaudeSwarm:
                 self._emit(self.name, "message",
                            {"phase": "scoped", "summary": str(scope_plan.get("summary", ""))[:400],
                             "critical_means": str(critical_means)[:300], "tracks": len(tracks),
-                            "known_patterns": len(self._known_patterns)})
-                if self._known_patterns:
-                    self._emit(self.name, "lifecycle",
-                               {"event": "patterns_loaded", "count": len(self._known_patterns),
-                                "sample": self._known_patterns[:3]})
+                            "known_patterns": 0})
 
             # Arm the environment ONCE before any round: BUILD the target (submodules + compile) so
             # harnesses can deploy it, start a local mainnet fork when configured, and open the
-            # persistent corpus. Invariants/patterns are NOT injected here — they come from Parent A's
-            # recon (derived from the actual code + web research), so nothing preset reaches the hunt.
+            # persistent corpus. Invariants are not injected here; Parent A derives them from code.
             await self._arm_environment(tracks)
 
-            # One Child B per DERIVED track (a real Claude hunter), plus the Falsifier.
+            # One Child B per DERIVED track, plus verifier/prover/depth roles.
             # Scoped web (technique/spec only) is on with a hard per-session search budget so a
-            # stuck hunter can't rabbit-hole into "<product> known bugs" (P1HUNT_WEB_BUDGET, 0=off).
-            try:
-                _web_budget = max(0, int(os.environ.get("P1HUNT_WEB_BUDGET", "5")))
-            except ValueError:
-                _web_budget = 5
+            # stuck hunter can't rabbit-hole into "<product> prior disclosures" (P1HUNT_WEB_BUDGET, 0=off).
+            _web_budget = _env_int("P1HUNT_WEB_BUDGET", 5, minimum=0)
             _base_turns = self._hunter_base_turns()
             hunters: list[ClaudeHunter] = []
             for i, tr in enumerate(tracks, start=1):
@@ -1230,7 +1895,6 @@ class ClaudeSwarm:
                 h.perms = self._perms  # Parent A's permission posture for this engagement
                 h.egress_hosts = self._egress_hosts  # live-testing host jail (None = static mode)
                 h.poc_reldir = self.poc_reldir  # where forge can actually compile/run PoCs
-                # Discovery engine: Claude hunters by default, or optional Codex (GPT-5.5-Codex xhigh).
                 h.discovery_engine = self.config.models.discovery_engine
                 h.codex_model = self.config.models.codex_model
                 h.codex_effort = self.config.models.codex_effort
@@ -1240,7 +1904,8 @@ class ClaudeSwarm:
                 h.base_urls = [getattr(t, "base_url", "") for t in (self.scope.dynamic_targets or [])]
                 h.identities = [getattr(idn, "name", "") for idn in (getattr(self.scope, "test_identities", None) or [])]
                 h.oob_available = self._oob is not None
-                h.scope_note = getattr(self.scope, "safe_harbor_text", "") or ""
+                h.scope_note = (getattr(self.scope, "scope_note", "")
+                                or getattr(self.scope, "safe_harbor_text", "") or "")
                 if resume:  # restore this track's memory so it resumes at depth, not from scratch
                     h._ruled_out = list(tr.get("ruled_out", []) or [])
                     h._directive = str(tr.get("directive", "") or "")
@@ -1267,20 +1932,29 @@ class ClaudeSwarm:
                 so.perms = self._perms
                 so.egress_hosts = self._egress_hosts
                 so.poc_reldir = self.poc_reldir
+                so.discovery_engine = self.config.models.discovery_engine
+                so.codex_model = self.config.models.codex_model
+                so.codex_effort = self.config.models.codex_effort
                 so.web_mode = self._egress_hosts is not None
                 so.base_urls = [getattr(t, "base_url", "") for t in (self.scope.dynamic_targets or [])]
                 so.identities = [getattr(idn, "name", "") for idn in (getattr(self.scope, "test_identities", None) or [])]
                 so.oob_available = self._oob is not None
-                so.scope_note = getattr(self.scope, "safe_harbor_text", "") or ""
+                so.scope_note = (getattr(self.scope, "scope_note", "")
+                                 or getattr(self.scope, "safe_harbor_text", "") or "")
                 hunters.append(so)
                 self._emit(self.name, "lifecycle",
                            {"event": "second_opinion", "subsystem": so.subsystem,
                             "detail": "independent hunter on the top subsystem (diversity)"})
+            self._live_hunters = hunters
             self.bus.register("falsifier", "falsifier")
             verifier = ClaudeVerifier("falsifier", model=self.config.models.falsifier, on_event=self._emit,
                                       guard_check=self._guard_check(guard, "falsifier"))
             verifier.perms = self._perms
             verifier.egress_hosts = self._egress_hosts
+            verifier.web_mode = self._egress_hosts is not None
+            verifier.base_url = self._base_url
+            verifier.poc_reldir = self.poc_reldir
+            self._apply_role_engine(verifier)
             # The PoC prover runs ONLY after the Falsifier believes a finding is real (so we never
             # build a PoC for an intended/non-bug), and can REFUTE it if it won't actually reproduce.
             self.bus.register("poc_prover", "prover")
@@ -1289,6 +1963,7 @@ class ClaudeSwarm:
             prover.perms = self._perms
             prover.egress_hosts = self._egress_hosts
             prover.poc_reldir = self.poc_reldir
+            self._apply_role_engine(prover)
             # EXPLOIT-DEVELOPMENT depth phase (strong model, large turn budget, sustained focus):
             # takes a believed primitive and builds the full attacker-WIN exploit, or proves it can't.
             self.bus.register("exploit_dev", "prover")
@@ -1299,6 +1974,7 @@ class ClaudeSwarm:
             developer.perms = self._perms
             developer.egress_hosts = self._egress_hosts
             developer.poc_reldir = self.poc_reldir
+            self._apply_role_engine(developer)
             # Dedup agent (cheap model — confirmation-gate de-duplication) and the debate panel
             # (strong model — round-end adversarial re-test of confirmed criticals).
             self.bus.register("dedup", "verifier")
@@ -1306,11 +1982,13 @@ class ClaudeSwarm:
                                          guard_check=self._guard_check(guard, "dedup"))
             deduper.perms = self._perms
             deduper.egress_hosts = self._egress_hosts
+            self._apply_role_engine(deduper)
             self.bus.register("debate", "verifier")
             debate = ClaudeDebate("debate", model=self.config.models.falsifier, on_event=self._emit,
                                   guard_check=self._guard_check(guard, "debate"))
             debate.perms = self._perms
             debate.egress_hosts = self._egress_hosts
+            self._apply_role_engine(debate)
 
             # FUZZING ENGINE (Pillar 1): one campaign per top subsystem. If a reference impl exists,
             # the first is a DIFFERENTIAL campaign (optimized vs reference) — the highest-yield search
@@ -1328,10 +2006,7 @@ class ClaudeSwarm:
             # track); only a small number of fuzz campaigns run alongside them. Default 1
             # (the single highest-value subsystem, differential if an oracle exists); override
             # with P1HUNT_FUZZ_CAMPAIGNS. This keeps most of the compute on reasoning-to-a-bug.
-            try:
-                _n_fuzz = max(0, int(os.environ.get("P1HUNT_FUZZ_CAMPAIGNS", "1")))
-            except ValueError:
-                _n_fuzz = 1
+            _n_fuzz = _env_int("P1HUNT_FUZZ_CAMPAIGNS", 1, minimum=0)
             fuzz_assignments = self._fuzz_assignments(tracks, reference_hint, max_n=_n_fuzz)
             fuzzers: list[ClaudeFuzzer] = []
             for i, asn in enumerate(fuzz_assignments, start=1):
@@ -1342,11 +2017,20 @@ class ClaudeSwarm:
                 _fz.perms = self._perms
                 _fz.egress_hosts = self._egress_hosts
                 _fz.poc_reldir = self.poc_reldir
+                self._apply_role_engine(_fz)
                 fuzzers.append(_fz)
                 self._emit(self.name, "message",
                            {"to": fname, "kind": "assign",
                             "mode": "differential" if asn["differential"] else "invariant",
                             "subsystem": asn["subsystem"], "invariants": asn["invariants"][:4]})
+            self._live_roles = {
+                "verifier": verifier,
+                "poc_prover": prover,
+                "exploit_dev": developer,
+                "dedup": deduper,
+                "debate": debate,
+                "fuzzers": fuzzers,
+            }
 
             findings: list[Finding] = []
             all_candidates: list[ClaudeFinding] = []
@@ -1364,9 +2048,27 @@ class ClaudeSwarm:
                 prior_titles = [c.title for c in all_candidates]
                 start_depth = int(resume.get("depth", 0) or 0)
 
+            def _ingest_background_candidates(cands: list[ClaudeFinding], *, source: str) -> None:
+                for cf in cands:
+                    key = f"{cf.file}:{cf.line}:{cf.title.lower()[:40]}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    all_candidates.append(cf)
+                    prior_titles.append(cf.title)
+                    self._record_hypothesis(cf)
+                    self._record_candidate_status(
+                        cf, stage=source, status="queued",
+                        target_agent="parent_a",
+                        next_action="Parent A will pick this up in the next verifier/proof pipeline pass.",
+                        blocked_by="awaiting_parent_pipeline",
+                        reason=f"reported by {source} background lane",
+                    )
+
             depth = start_depth
             while True:
                 depth += 1
+                self._harvest_exploit_tasks()
                 if max_rounds is not None and depth > max_rounds:
                     self._emit(self.name, "lifecycle", {"event": "cap_reached", "round": depth - 1})
                     self._write_findings_json(findings, all_candidates, needs_human)
@@ -1393,6 +2095,19 @@ class ClaudeSwarm:
                     return self._result(status, plan, guard, findings, all_candidates, depth - 1, needs_human)
 
                 self._drain_control()  # pick up any `p1hunt notify` directives before this round
+                if self.bb.has_stop(self.name) or self._safety_event:
+                    self._emit(self.name, "lifecycle", {"event": "stop", "reason": "operator/safety"})
+                    self._write_findings_json(findings, all_candidates, needs_human)
+                    watchdog.cancel()
+                    self._stop_fork()
+                    return self._result(EngagementStatus.STOPPED, plan, guard, findings, all_candidates, depth, needs_human)
+                await self._pause_gate(findings, all_candidates, needs_human)
+                if self.bb.has_stop(self.name) or self._safety_event:
+                    self._emit(self.name, "lifecycle", {"event": "stop", "reason": "operator/safety"})
+                    self._write_findings_json(findings, all_candidates, needs_human)
+                    watchdog.cancel()
+                    self._stop_fork()
+                    return self._result(EngagementStatus.STOPPED, plan, guard, findings, all_candidates, depth, needs_human)
                 self._emit(self.name, "message", {"phase": "round", "round": depth, "lenses": len(hunters)})
                 import time as _t
                 round_start = _t.monotonic()
@@ -1403,7 +2118,11 @@ class ClaudeSwarm:
                 # block the round (the inactivity timeout only catches SILENCE, not endless grinding).
                 # Wall-clock per hunter per round. Deep-discovery extends it to 1h so a sustained
                 # investigation isn't guillotined mid-reasoning (the #1 cause of shallow passes). Env wins.
-                hunter_cap = float(os.environ.get("P1HUNT_HUNTER_TIMEOUT", "3600" if self._deep_discovery else "1200"))
+                hunter_cap = _env_float(
+                    "P1HUNT_HUNTER_TIMEOUT",
+                    3600.0 if self._deep_discovery else 1200.0,
+                    minimum=1.0,
+                )
 
                 async def _run(h: ClaudeHunter) -> list[ClaudeFinding]:
                     async with self.sem:
@@ -1412,7 +2131,7 @@ class ClaudeSwarm:
                                 h.hunt(critical_means + self._scope_guidance(), self.repo_path, depth,
                                        prior_titles, focus_files=h.focus_files, investigate=h.investigate,
                                        notices=list(self._notices), invariants=h.invariants,
-                                       known_patterns=self._known_patterns, subsystem=h.subsystem,
+                                       known_patterns=[], subsystem=h.subsystem,
                                        scaffold=self._scaffold_for(h.subsystem, h.focus_files),
                                        build_status=self._build_status_line(),
                                        static_leads=self._static_leads_for(h.focus_files)),
@@ -1434,7 +2153,7 @@ class ClaudeSwarm:
                 # findings arrive with a forge counterexample (a reproducing sequence) — high-signal,
                 # and they feed the same Falsifier→PoC pipeline so harness artifacts still get rejected.
                 async def _run_fuzz(fz: ClaudeFuzzer, asn: dict) -> list[ClaudeFinding]:
-                    async with self.sem:
+                    async with self.side_sem:
                         subsystem = asn["subsystem"]
                         focus = asn["focus_files"]
                         eps = self._entrypoints_for(subsystem, focus)
@@ -1446,7 +2165,7 @@ class ClaudeSwarm:
                             fnds, cov, covered = await asyncio.wait_for(
                                 fz.campaign(subsystem, asn["invariants"], focus,
                                             self.repo_path, differential=asn["differential"],
-                                            reference_hint=reference_hint, known_patterns=self._known_patterns,
+                                            reference_hint=reference_hint, known_patterns=[],
                                             scaffold=self._scaffold_for(subsystem, focus),
                                             fork_url=self._fork_url, build_status=self._build_status_line(),
                                             coverage_hint=cov_hint, entrypoints=eps, seeds=seeds),
@@ -1468,16 +2187,87 @@ class ClaudeSwarm:
                                 pass
                         return fnds
 
-                # Expose this round's tasks so the watchdog can cancel them if they stall.
+                # Expose this round's CHILD tasks so the watchdog can cancel them if they stall. While
+                # they run, poll the live blackboard and surface high/critical posts. By default this
+                # does NOT cancel active child discovery; operators who prefer the old "drop
+                # discovery and verify immediately" behavior can set P1HUNT_FASTLANE_CUT_DISCOVERY=1.
                 self._round_tasks = [asyncio.ensure_future(_run(h)) for h in hunters]
-                self._round_tasks += [asyncio.ensure_future(_run_fuzz(fz, asn))
-                                      for fz, asn in zip(fuzzers, fuzz_assignments)]
-                results = await asyncio.gather(*self._round_tasks, return_exceptions=True)
+                for fz, asn in zip(fuzzers, fuzz_assignments):
+                    fkey = f"{fz.agent_name}:{asn['subsystem']}:{asn['differential']}"
+                    if fkey in self._fuzz_tasks and not self._fuzz_tasks[fkey].done():
+                        continue
+                    task = asyncio.ensure_future(_run_fuzz(fz, asn))
+                    self._fuzz_tasks[fkey] = task
+
+                    def _done(t, *, key=fkey, agent=fz.agent_name) -> None:
+                        self._fuzz_tasks.pop(key, None)
+                        try:
+                            result = t.result()
+                        except asyncio.CancelledError:
+                            return
+                        except Exception as exc:
+                            self._emit(agent, "lifecycle",
+                                       {"event": "fuzz_background_error", "detail": str(exc)[:200]})
+                            return
+                        _ingest_background_candidates(result, source=agent)
+
+                    task.add_done_callback(_done)
+                    self._emit(self.name, "lifecycle",
+                               {"event": "fuzz_background_started",
+                                "agent": fz.agent_name,
+                                "subsystem": asn["subsystem"],
+                                "detail": "fuzz campaign is running without blocking child discovery"})
+                results = []
+                pending = set(self._round_tasks)
+                fastlane = os.environ.get("P1HUNT_LIVE_FASTLANE", "1") != "0"
+                cut_for_fastlane = os.environ.get("P1HUNT_FASTLANE_CUT_DISCOVERY", "0") == "1"
+                fastlane_seen: set[str] = set()
+                poll_s = _env_float("P1HUNT_LIVE_CANDIDATE_POLL", 15.0, minimum=5.0)
+                while pending:
+                    done, pending = await asyncio.wait(pending, timeout=poll_s,
+                                                       return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        try:
+                            results.append(task.result())
+                        except Exception as exc:
+                            results.append(exc)
+                    if fastlane:
+                        hot = [
+                            c for c in self._live_findings_as_candidates()
+                            if c.severity in ("critical", "high")
+                            and not self._out_of_scope(c.file)
+                            and not getattr(c, "relies_on_non_target_behavior", False)
+                        ]
+                        new_hot = [c for c in hot if self._finding_key(c) not in fastlane_seen]
+                        if new_hot:
+                            fastlane_seen.update(self._finding_key(c) for c in new_hot)
+                            for cand in new_hot:
+                                self._mark_fastlane_pending(cand, cut_discovery=cut_for_fastlane)
+                            self._emit(self.name, "lifecycle",
+                                       {"event": "live_fastlane",
+                                        "count": len(new_hot),
+                                        "reason": ("high/critical blackboard post cut discovery short for immediate verification"
+                                                   if cut_for_fastlane
+                                                   else "high/critical blackboard post observed; child discovery continues")})
+                            if cut_for_fastlane:
+                                for task in pending:
+                                    task.cancel()
+                                if pending:
+                                    results.extend(await asyncio.gather(*pending, return_exceptions=True))
+                                pending = set()
+                                break
                 self._round_tasks = []
                 round_findings: list[ClaudeFinding] = []
                 for r in results:
                     if isinstance(r, list):
                         round_findings.extend(r)
+                live_candidates = self._live_findings_as_candidates()
+                if live_candidates:
+                    round_findings.extend(live_candidates)
+                    self._emit(self.name, "lifecycle",
+                               {"event": "live_candidates_queued",
+                                "count": len(live_candidates),
+                                "reason": "blackboard posts are entering the verifier/prover pipeline"})
 
                 # Dedupe, record as hypotheses/candidates for full visibility.
                 fresh: list[ClaudeFinding] = []
@@ -1498,12 +2288,49 @@ class ClaudeSwarm:
                 for cf in fresh:
                     if cf.severity not in ("critical", "high"):
                         continue
+                    if getattr(cf, "relies_on_non_target_behavior", False):
+                        self._record_candidate_status(
+                            cf, stage="parent_a", status="attribution_blocked",
+                            target_agent="parent_a",
+                            next_action="Do not promote unless the defect is re-attributed to target-owned behavior.",
+                            blocked_by="non_target_behavior",
+                            reason=(cf.attribution_notes or cf.non_target_attribution or
+                                    "finder says the win depends on non-target behavior"),
+                        )
+                        continue
                     if self._out_of_scope(cf.file):
                         self._emit("falsifier", "message",
                                    {"verdict": "out-of-scope", "title": cf.title,
                                     "reason": f"{cf.file} is out of scope (not deployed) — not promoted"})
                         continue
                     strong.append(cf)
+                    self._record_candidate_status(
+                        cf, stage="parent_a", status="selected_for_verification",
+                        target_agent="falsifier",
+                        next_action="Adversarial verification, then proof materialization if it survives.",
+                    )
+                # Operator/Parent-A triage can pull an older candidate back into the verifier/prover
+                # lane. Without this, `p1hunt triage` only writes a notice and a stale candidate may
+                # never be re-entered because the verify loop used to process only this round's fresh
+                # findings.
+                existing_keys = {self._candidate_key_doc(c)[0] for c in strong}
+                for cf in all_candidates:
+                    if cf.severity not in ("critical", "high") or self._out_of_scope(cf.file):
+                        continue
+                    if getattr(cf, "relies_on_non_target_behavior", False):
+                        continue
+                    key, _doc = self._candidate_key_doc(cf)
+                    if key in existing_keys or not self._is_operator_priority(cf):
+                        continue
+                    strong.insert(0, cf)
+                    existing_keys.add(key)
+                    self._parent_intervene(
+                        cf,
+                        target_agent="falsifier",
+                        blocked_by="operator_triage",
+                        reason="Operator/Parent A requested this existing candidate be pulled back into the proof pipeline.",
+                        directive="Re-run adversarial verification, then immediately hand surviving evidence to PoC/deep-dive.",
+                    )
                 # COST/TIME GUARD: the verify→materialize→repair→reproduce pipeline is serial and
                 # each candidate is expensive (multiple Opus sessions + up to 3×600s reproduce). Cap
                 # how many we verify per round to the STRONGEST few (critical before high; high before
@@ -1513,46 +2340,85 @@ class ClaudeSwarm:
                 _conf_rank = {"high": 0, "medium": 1, "low": 2}
                 strong.sort(key=lambda c: (_sev_rank.get(c.severity, 2),
                                            _conf_rank.get(str(c.confidence).lower(), 3)))
-                try:
-                    _max_verify = max(1, int(os.environ.get("P1HUNT_MAX_VERIFY", "6")))
-                except ValueError:
-                    _max_verify = 6
+                _max_verify = _env_int("P1HUNT_MAX_VERIFY", 10, minimum=1)
                 if len(strong) > _max_verify:
                     self._emit(self.name, "lifecycle",
                                {"event": "verify_capped", "verifying": _max_verify,
                                 "deferred": len(strong) - _max_verify,
                                 "reason": "top candidates verified this round; the rest carry to next round"})
                     strong = strong[:_max_verify]
-                _verify_cap = float(os.environ.get("P1HUNT_VERIFY_TIMEOUT", "900"))
+                _verify_cap = _env_float("P1HUNT_VERIFY_TIMEOUT", 900.0, minimum=1.0)
                 for cf in strong:
                   # GUARD: one malformed candidate must NEVER crash the never-quit hunt. Any error in
                   # this candidate's verify/prove/promote is logged and skipped; the loop continues.
                   try:
+                    self._record_candidate_status(
+                        cf, stage="verifier", status="running", target_agent="falsifier",
+                        next_action="Decide real/refuted/unverified from direct evidence.",
+                    )
                     status, _severity, reason = await asyncio.wait_for(
-                        verifier.verify(cf, self.repo_path), timeout=_verify_cap)
+                        verifier.verify(cf, self.repo_path,
+                                        operator_notes=self._operator_notes_for("falsifier", cf)),
+                        timeout=_verify_cap)
+                    self._record_candidate_status(
+                        cf, stage="verifier", status=status, target_agent="falsifier",
+                        next_action=("Materialize a runnable proof harness."
+                                     if status == "real" else "Keep as candidate unless re-triaged."),
+                        blocked_by=("" if status == "real" else status),
+                        reason=reason,
+                    )
                     hyp = self._hyp_by_finding.get(id(cf))
                     if status == "refuted":
                         if hyp:
                             self.bb.set_state(hyp.id, HypState.FALSIFIED)
                         continue
+                    if status == "real":
+                        self._parent_intervene(
+                            cf,
+                            target_agent="poc_prover",
+                            blocked_by="not_reproduced_yet",
+                            reason="Falsifier validated the finding as real, but confirmation requires deterministic reproduction and, when enabled, exploit-depth proof.",
+                            directive="Build and run the smallest complete proof harness now; if a class runner cannot prove it, preserve evidence and hand it to exploit_developer.",
+                        )
                     # STRICT REPRODUCED-CRITICAL GATE (§10): the Falsifier only earns the candidate a
                     # chance to be PROVEN. The prover MATERIALIZES a runnable harness into the sandbox;
                     # a DETERMINISTIC class runner then EXECUTES it and decides reproduction from the
                     # real toolchain output — never the model's say-so. NOTHING is promoted to a
                     # confirmed finding unless reproduced=True; otherwise it stays a candidate.
                     _scaffold = self._scaffold_for(cf.lens or "subsystem", [cf.file] if cf.file else [])
+                    self._record_candidate_status(
+                        cf, stage="poc_prover", status="materializing", target_agent="poc_prover",
+                        next_action="Write runnable harness under the PoC sandbox.",
+                    )
                     spec_dict = await asyncio.wait_for(
-                        prover.materialize(cf, self.repo_path, scaffold=_scaffold, fork_url=self._fork_url),
+                        prover.materialize(cf, self.repo_path, scaffold=_scaffold, fork_url=self._fork_url,
+                                           operator_notes=self._operator_notes_for("poc_prover", cf)),
                         timeout=_verify_cap)
+                    self._record_candidate_status(
+                        cf, stage="poc_prover",
+                        status="harness_materialized" if spec_dict else "no_harness",
+                        target_agent="poc_prover",
+                        next_action="Run deterministic reproduction." if spec_dict else "Escalate to deep-dive/manual review.",
+                        blocked_by="" if spec_dict else "materialization_failed",
+                        reason=str((spec_dict or {}).get("notes", ""))[:240] if isinstance(spec_dict, dict) else "",
+                    )
                     repro = await self._reproduce(cf, spec_dict)
+                    self._record_candidate_status(
+                        cf, stage="runner",
+                        status=("reproduced" if bool(repro and repro.reproduced)
+                                else "not_reproduced"),
+                        target_agent="poc_prover",
+                        next_action=("Run counterfactual/severity gate."
+                                     if bool(repro and repro.reproduced)
+                                     else "Parent A will queue exploit-depth proof or needs-human review."),
+                        blocked_by="" if bool(repro and repro.reproduced) else "deterministic_reproduction_missing",
+                        reason=(getattr(repro, "detail", "") or getattr(repro, "stdout_excerpt", "") or "")[:240] if repro else "",
+                    )
                     # POC ITERATION LOOP: if the harness didn't reproduce, feed the REAL runner output
                     # back to the prover to FIX it and rerun — up to P1HUNT_POC_ATTEMPTS times. This
                     # converts reasoned-but-unproven P1s into confirmed ones (one-shot proof misses
                     # the many bugs whose harness just needs a compile fix / better setup).
-                    try:
-                        _max_attempts = max(1, int(os.environ.get("P1HUNT_POC_ATTEMPTS", "3")))
-                    except ValueError:
-                        _max_attempts = 3
+                    _max_attempts = _env_int("P1HUNT_POC_ATTEMPTS", 5, minimum=1)
                     _attempt = 1
                     while spec_dict and not (repro and repro.reproduced) and _attempt < _max_attempts:
                         feedback = (repro.detail or repro.stdout_excerpt) if repro else "no harness was produced"
@@ -1561,12 +2427,24 @@ class ClaudeSwarm:
                                     "of": _max_attempts})
                         new_spec = await asyncio.wait_for(
                             prover.repair(cf, spec_dict, str(feedback), self.repo_path,
-                                          scaffold=_scaffold, fork_url=self._fork_url),
+                                          scaffold=_scaffold, fork_url=self._fork_url,
+                                          operator_notes=self._operator_notes_for("poc_prover", cf)),
                             timeout=_verify_cap)
                         if not new_spec:
                             break
                         spec_dict = new_spec
                         repro = await self._reproduce(cf, spec_dict)
+                        self._record_candidate_status(
+                            cf, stage="runner",
+                            status=("reproduced" if bool(repro and repro.reproduced)
+                                    else "not_reproduced"),
+                            target_agent="poc_prover",
+                            next_action=("Run counterfactual/severity gate."
+                                         if bool(repro and repro.reproduced)
+                                         else "Continue repair attempts or queue exploit-depth proof."),
+                            blocked_by="" if bool(repro and repro.reproduced) else "deterministic_reproduction_missing",
+                            reason=(getattr(repro, "detail", "") or getattr(repro, "stdout_excerpt", "") or "")[:240] if repro else "",
+                        )
                         _attempt += 1
                     reproduced = bool(repro and repro.reproduced)
                     # Ingest REAL coverage (parsed from the tool, not model-reported) into the corpus.
@@ -1577,7 +2455,7 @@ class ClaudeSwarm:
                         except Exception:
                             pass
                     # Deterministic severity — map REAL impact facts to THIS program's taxonomy.
-                    impact = self._impact_of(cf, reproduced)
+                    impact = self._impact_of(cf, reproduced, repro)
                     sev_label, sev_rationale = self._severity.map(impact)
                     if not reproduced:
                         if hyp:
@@ -1586,30 +2464,46 @@ class ClaudeSwarm:
                                    {"event": "candidate_not_reproduced", "title": cf.title,
                                     "ran": bool(repro and repro.ran), "severity": sev_label,
                                     "detail": (repro.detail[:200] if repro else "no harness/runner — stays a candidate")})
-                        # SURFACE FOR HUMAN REVIEW (don't bury it): the Falsifier believes it's real
+                        # SURFACE FOR AUTONOMOUS FOLLOW-UP (don't bury it): the Falsifier believes it's real
                         # and the finder claims a concrete, high-confidence loss — it just couldn't be
                         # auto-reproduced (hard-to-harness class, missing toolchain, multi-step setup).
-                        # A reasoned P1 a human should look at is the MOST valuable output, not the
+                        # A reasoned P1 the bot should keep attacking is the MOST valuable output, not the
                         # least. It is clearly marked verified=False — the reproduced=confirmed floor
-                        # is untouched; this is a separate, prominent "needs human" tier.
+                        # is untouched; this is a separate, prominent autonomous follow-up tier.
                         # SURFACE WIDELY: the Falsifier already believes it's real and it's a
                         # critical/high in scope — surface it for a human even if the finder didn't
                         # phrase the loss as one of the exact literal words or hedged confidence.
                         # Missing a real P1 because of a string mismatch is the worst outcome; a human
                         # triages false positives cheaply. (status here is 'real' or 'unverified'.)
                         if status == "real" and not self._out_of_scope(cf.file):
+                            self._parent_intervene(
+                                cf,
+                                target_agent="exploit_developer",
+                                blocked_by="deterministic_reproduction_missing",
+                                reason="Falsifier says real, but the deterministic runner did not prove the attacker win.",
+                                directive="Sustain focus on this lead: close the full attacker-win chain or produce a rigorous blocker.",
+                            )
                             f = self._surface_for_human(cf, reason, sev_label, guard,
                                                         ran=bool(repro and repro.ran),
                                                         detail=(repro.detail if repro else ""))
                             needs_human.append(f)
+                            self._record_candidate_status(
+                                cf, stage="parent_a", status="autonomous_followup",
+                                target_agent="exploit_developer",
+                                next_action="Exploit-depth phase must close the attacker-win or park with a precise blocker.",
+                                blocked_by="not_confirmed_until_attacker_win_is_proven",
+                                reason="Falsifier-believed lead was not auto-reproduced.",
+                            )
                             self._emit(self.name, "lifecycle",
-                                       {"event": "needs_human_review", "title": cf.title,
+                                       {"event": "autonomous_followup", "title": cf.title,
                                         "severity": sev_label, "confidence": cf.confidence,
                                         "concrete_loss": cf.concrete_loss,
-                                        "reason": "Falsifier-believed P1, not auto-reproduced — REVIEW"})
+                                        "reason": "Falsifier-believed P1, not auto-reproduced — queued for exploit-depth"})
                         continue
-                    # Reproduced by a real runner -> a CONFIRMED finding (tier from the mapper).
+                    # Reproduced by a real runner -> confirmed evidence. It only enters the critical
+                    # confirmation lanes if the counterfactual/severity gates make it critical.
                     tier = self._norm_tier(sev_label, self._severity.is_p1(impact))
+                    is_critical = tier == "critical"
                     # DEDUP GATE: before publishing, check it isn't the SAME root cause as one already
                     # confirmed (the swarm re-finds one bug many ways across rounds/hunters). Duplicate
                     # -> drop quietly; distinct -> publish. Only runs when prior confirmed exist.
@@ -1628,50 +2522,68 @@ class ClaudeSwarm:
                             continue
                     if hyp:
                         self.bb.set_state(hyp.id, HypState.CONFIRMED)
-                    findings.append(self._promote(cf, f"{sev_rationale} | falsifier: {reason}", guard,
-                                                  repro=repro, severity_label=sev_label, tier=tier))
+                    promoted = self._promote(cf, f"{sev_rationale} | falsifier: {reason}", guard,
+                                             repro=repro, severity_label=sev_label, tier=tier)
+                    findings.append(promoted)
+                    self._record_candidate_status(
+                        promoted, stage="parent_a",
+                        status=("reproduced_pending_deepdive" if is_critical and self._deepdive_on and self.config.use_claude
+                                else "reproduced_pending_debate" if is_critical and self._debate_max and self.config.use_claude
+                                else "confirmed" if is_critical else "confirmed_noncritical"),
+                        target_agent=("exploit_developer" if is_critical and self._deepdive_on and self.config.use_claude
+                                      else "debate" if is_critical and self._debate_max and self.config.use_claude
+                                      else "parent_a"),
+                        next_action=("Demonstrate full attacker-win in exploit-depth phase."
+                                     if is_critical and self._deepdive_on and self.config.use_claude
+                                     else "Run debate panel before counting as confirmed critical."
+                                     if is_critical and self._debate_max and self.config.use_claude
+                                     else "Count in confirmed criticals." if is_critical
+                                     else "Keep as lower-severity evidence; continue hunting for P1."),
+                        blocked_by=("deepdive_attacker_win_required" if is_critical and self._deepdive_on and self.config.use_claude
+                                    else "debate_uphold_required" if is_critical and self._debate_max and self.config.use_claude
+                                    else (getattr(repro, "impact_blocker", "") or "")),
+                    )
                   except asyncio.TimeoutError:
+                    self._record_candidate_status(
+                        cf, stage="parent_a", status="deferred",
+                        target_agent="poc_prover",
+                        next_action="Retry verifier/prover next round.",
+                        blocked_by="verify_timeout",
+                    )
                     self._emit("poc_prover", "lifecycle",
                                {"event": "verify_timeout", "title": cf.title,
                                 "detail": f"verify/prove exceeded {int(_verify_cap)}s — deferred to next round"})
                   except Exception as exc:
+                    self._record_candidate_status(
+                        cf, stage="parent_a", status="deferred",
+                        target_agent="poc_prover",
+                        next_action="Retry verifier/prover next round after fixing pipeline error.",
+                        blocked_by="candidate_verify_error",
+                        reason=str(exc)[:240],
+                    )
                     # One bad candidate must not kill the never-quit hunt (§8).
                     self._emit("poc_prover", "lifecycle",
                                {"event": "candidate_verify_error", "title": cf.title, "detail": str(exc)[:200]})
 
-                # EXPLOIT-DEVELOPMENT DEPTH PHASE (round end): take the top believed-real primitives
-                # (needs-human P1s + un-proven criticals) and SUSTAIN focus to build the full
-                # attacker-win exploit. ONLY a demonstrated win in shipped code promotes to a confirmed
-                # critical (a primitive is not a critical). Bounded by P1HUNT_DEEPDIVE_TOP_N per round.
+                # EXPLOIT-DEVELOPMENT DEPTH PHASE (background lane): take the top believed-real
+                # primitives (needs-human P1s + un-proven criticals) and SUSTAIN focus to build the
+                # full attacker-win exploit. ONLY a demonstrated win in shipped code promotes to a
+                # confirmed critical (a primitive is not a critical). This used to be awaited at
+                # round-end, which starved child discovery whenever exploit_dev ran long.
                 if self._deepdive_on and self.config.use_claude:
-                    _dt = float(os.environ.get("P1HUNT_DEEPDIVE_TIMEOUT", "3600"))
+                    _dt = _env_float("P1HUNT_DEEPDIVE_TIMEOUT", 3600.0, minimum=1.0)
                     rubric = (getattr(self.scope, "scope_note", "")
                               or getattr(self.scope, "safe_harbor_text", "") or "")
-                    # The pool is needs-human P1s + un-proven criticals + the IN-RUBRIC candidates
-                    # (key/signature/nonce classes) — so the depth phase chases the leads with real
-                    # Critical potential (e.g. MtA decrypt-before-verify), not just whatever was
-                    # already promoted. Then PRIORITIZE: in-rubric key/sig leads first, off-rubric
-                    # (freeze/availability) last, so the expensive budget isn't spent on non-criticals.
-                    import re as _re_dd
-                    _inrub = _re_dd.compile(
-                        r"decrypt.?before|\bmta\b|nonce|reuse|bias|forge|rogue|recover|extract|"
-                        r"signature|lattice|paillier|\bzkp\b|proof|small.?factor|alpha.?ray|key", _re_dd.I)
-                    _offrub = _re_dd.compile(r"freeze|conserv|availab|desync|resurrect|permanent|\bdos\b", _re_dd.I)
+                    # The pool is needs-human P1s + un-proven criticals + candidates whose text
+                    # matches this PROGRAM'S captured severity/rubric language. No target-specific
+                    # keywords: each engagement's taxonomy decides what deserves scarce exploit-depth.
+                    rubric_terms = self._rubric_priority_terms()
 
-                    def _promise(_f) -> int:
-                        t = (getattr(_f, "title", "") or "").lower()
-                        sc = 0
-                        if _inrub.search(t):
-                            sc += 3
-                        if _offrub.search(t):
-                            sc -= 4
-                        if getattr(_f, "severity", "") == "critical":
-                            sc += 1
-                        return sc
+                    def _promise(_f) -> float:
+                        return self._rubric_lead_score(_f, rubric_terms)
 
                     inrubric_cands = [c for c in all_candidates
-                                      if _inrub.search((getattr(c, "title", "") or ""))
-                                      and not _offrub.search((getattr(c, "title", "") or ""))]
+                                      if _promise(c) >= 5.0]
                     pool = (list(needs_human)
                             + [f for f in findings if f.severity == "critical"
                                and self._finding_key(f) not in self._exploit_proven]
@@ -1681,67 +2593,135 @@ class ClaudeSwarm:
                     # the engine rotates to fresher leads, but keeps cycling back — it never abandons a
                     # lead after one failed PoC; it changes the angle and tries again next round.
                     def _eff_promise(_f) -> float:
-                        return _promise(_f) - 2.0 * self._lead_attempts(self._finding_key(_f))
+                        boost = 20.0 if self._is_operator_priority(_f) else 0.0
+                        return boost + _promise(_f) - 2.0 * self._lead_attempts(self._finding_key(_f))
                     pool.sort(key=_eff_promise, reverse=True)
                     todo, seen_k = [], set()
                     for f in pool:
                         k = self._finding_key(f)
-                        if k in seen_k or _promise(f) < 0:
-                            continue  # skip dups and off-rubric (freeze) leads
+                        if k in seen_k:
+                            continue  # skip duplicate-looking leads in this deep-dive pass
+                        if k in self._exploit_tasks:
+                            continue  # exploit-depth already active; keep child discovery moving
                         if not self._lead_open(k):
                             continue  # proven / exhausted / hit the attempt cap -> stop pursuing
                         seen_k.add(k)
                         todo.append(f)
                         if len(todo) >= self._deepdive_top_n:
                             break
-                    for f in todo:
+
+                    async def _run_exploit_depth(f) -> None:
                         k = self._finding_key(f)
                         prior = self._lead_log.get(k, {}).get("attempts", [])
                         try:
-                            verdict = await asyncio.wait_for(
-                                developer.develop(f, self.repo_path, rubric=rubric, scaffold="",
-                                                  fork_url=self._fork_url, prior_attempts=prior),
-                                timeout=_dt)
-                        except Exception as exc:
-                            # transient -> NOT counted as an attempt; the lead stays open and retries
-                            self._emit(self.name, "lifecycle",
-                                       {"event": "exploit_dev_error", "title": f.title, "detail": str(exc)[:160]})
-                            continue
-                        if verdict and verdict.get("_achieved"):
-                            tier = str(verdict.get("tier", "critical")).lower()
-                            f.severity = tier if tier in ("critical", "high") else "critical"
                             try:
-                                f.verified = True
-                            except Exception:
-                                pass
-                            self._exploit_proven.add(k)
-                            self._lead_log.setdefault(k, {"attempts": [], "status": "open"})["status"] = "proven"
-                            if f not in findings:
-                                findings.append(f)
-                                if f in needs_human:
-                                    needs_human.remove(f)
-                            self._emit(self.name, "lifecycle",
-                                       {"event": "exploit_confirmed", "title": f.title, "tier": tier,
-                                        "win": str(verdict.get("win", ""))[:160],
-                                        "aborts": str(verdict.get("aborts", "")),
-                                        "attempts": self._lead_attempts(k) + 1})
-                        else:
-                            # NOT a win -> log the failed angle and decide: keep pursuing, exhausted, or capped.
-                            status = self._record_lead_attempt(k, verdict)
-                            n = self._lead_attempts(k)
-                            if status == "exhausted":
+                                verdict = await asyncio.wait_for(
+                                    developer.develop(f, self.repo_path, rubric=rubric, scaffold="",
+                                                      fork_url=self._fork_url, prior_attempts=prior,
+                                                      operator_notes=self._operator_notes_for("exploit_developer", f)),
+                                    timeout=_dt)
+                            except Exception as exc:
+                                # transient -> NOT counted as an attempt; the lead stays open and retries
+                                self._record_candidate_status(
+                                    f, stage="exploit_developer", status="deferred",
+                                    target_agent="exploit_developer",
+                                    next_action="Retry exploit-depth next round.",
+                                    blocked_by="exploit_dev_error",
+                                    reason=str(exc)[:240],
+                                )
                                 self._emit(self.name, "lifecycle",
-                                           {"event": "exploit_exhausted", "title": f.title, "attempts": n,
-                                            "detail": str((verdict or {}).get("impossibility", ""))[:200]})
-                            elif status == "maxed":
+                                           {"event": "exploit_dev_error", "title": f.title, "detail": str(exc)[:160]})
+                                return
+                            if verdict and verdict.get("_achieved"):
+                                tier = normalize_exploit_tier(str(verdict.get("tier", "critical")))
+                                f.severity = tier
+                                try:
+                                    f.verified = True
+                                except Exception:
+                                    pass
+                                is_critical_win = f.severity == "critical"
+                                self._exploit_proven.add(k)
+                                self._lead_log.setdefault(k, {"attempts": [], "status": "open"})["status"] = "proven"
+                                if f not in findings:
+                                    findings.append(f)
+                                    if f in needs_human:
+                                        needs_human.remove(f)
+                                self._record_candidate_status(
+                                    f, stage="exploit_developer",
+                                    status=(("exploit_confirmed_pending_debate"
+                                             if self._debate_max and self.config.use_claude else "confirmed")
+                                            if is_critical_win else "confirmed_noncritical"),
+                                    target_agent=("debate" if is_critical_win and self._debate_max and self.config.use_claude
+                                                  else "parent_a"),
+                                    next_action=(("Run debate panel before counting as confirmed critical."
+                                                  if self._debate_max and self.config.use_claude
+                                                  else "Count in confirmed criticals.")
+                                                 if is_critical_win
+                                                 else "Keep as confirmed lower-severity evidence; continue hunting for P1."),
+                                    blocked_by=("debate_uphold_required"
+                                                if is_critical_win and self._debate_max and self.config.use_claude else ""),
+                                    reason=str(verdict.get("win", ""))[:240],
+                                )
                                 self._emit(self.name, "lifecycle",
-                                           {"event": "exploit_pursuit_capped", "title": f.title, "attempts": n,
-                                            "detail": f"no win after {n} angles — parked for human review"})
+                                           {"event": "exploit_confirmed", "title": f.title, "tier": tier,
+                                            "win": str(verdict.get("win", ""))[:160],
+                                            "aborts": str(verdict.get("aborts", "")),
+                                            "attempts": self._lead_attempts(k) + 1})
                             else:
-                                self._emit(self.name, "lifecycle",
-                                           {"event": "exploit_retry", "title": f.title, "attempts": n,
-                                            "next_angle": str((verdict or {}).get("next_angle", ""))[:160],
-                                            "detail": "lead still open — will try a different angle next round"})
+                                # NOT a win -> log the failed angle and decide: keep pursuing, exhausted, or capped.
+                                status = self._record_lead_attempt(k, verdict)
+                                n = self._lead_attempts(k)
+                                if status == "exhausted":
+                                    self._record_candidate_status(
+                                        f, stage="exploit_developer", status="exhausted",
+                                        target_agent="parent_a",
+                                        next_action="Park as needs-human with a rigorous impossibility argument.",
+                                        blocked_by="exploit_chain_exhausted",
+                                        reason=str((verdict or {}).get("impossibility", ""))[:240],
+                                    )
+                                    self._emit(self.name, "lifecycle",
+                                               {"event": "exploit_exhausted", "title": f.title, "attempts": n,
+                                                "detail": str((verdict or {}).get("impossibility", ""))[:200]})
+                                elif status == "maxed":
+                                    self._record_candidate_status(
+                                        f, stage="exploit_developer", status="autonomous_backlog",
+                                        target_agent="parent_a",
+                                        next_action="Park with blocker; resume when new evidence, operator triage, or a fresh angle appears.",
+                                        blocked_by="lead_attempt_cap",
+                                        reason=str((verdict or {}).get("why_failed", ""))[:240],
+                                    )
+                                    self._emit(self.name, "lifecycle",
+                                               {"event": "exploit_pursuit_capped", "title": f.title, "attempts": n,
+                                                "detail": f"no win after {n} angles — parked with explicit blocker"})
+                                else:
+                                    self._record_candidate_status(
+                                        f, stage="exploit_developer", status="retry_next_round",
+                                        target_agent="exploit_developer",
+                                        next_action=str((verdict or {}).get("next_angle", ""))[:240],
+                                        blocked_by="attacker_win_not_yet_demonstrated",
+                                        reason=str((verdict or {}).get("why_failed", ""))[:240],
+                                    )
+                                    self._emit(self.name, "lifecycle",
+                                               {"event": "exploit_retry", "title": f.title, "attempts": n,
+                                                "next_angle": str((verdict or {}).get("next_angle", ""))[:160],
+                                                "detail": "lead still open — will try a different angle next round"})
+                        finally:
+                            self._exploit_tasks.pop(k, None)
+                            self._write_findings_json(findings, all_candidates, needs_human)
+
+                    for f in todo:
+                        k = self._finding_key(f)
+                        self._record_candidate_status(
+                            f, stage="exploit_developer", status="running",
+                            target_agent="exploit_developer",
+                            next_action="Close the full attacker-win chain or produce a rigorous blocker.",
+                            blocked_by="attacker_win_not_yet_demonstrated",
+                        )
+                        self._exploit_tasks[k] = asyncio.create_task(_run_exploit_depth(f))
+                        self._emit(self.name, "lifecycle",
+                                   {"event": "exploit_background_started", "title": f.title,
+                                    "target_agent": "exploit_developer",
+                                    "detail": "exploit-depth is running while child discovery continues"})
 
                 # DEBATE PANEL (round end, CRITICALS ONLY): adversarially re-test each newly-confirmed
                 # critical — a prosecutor argues to invalidate/downgrade, a defender argues it's a real
@@ -1749,36 +2729,85 @@ class ClaudeSwarm:
                 # critical); uphold -> keep. Bounded by P1HUNT_DEBATE_MAX (0 disables) and deduped, so
                 # only a few distinct criticals are ever debated — keeps the token cost in check.
                 if self._debate_max and self.config.use_claude:
-                    _vt = float(os.environ.get("P1HUNT_VERIFY_TIMEOUT", "900"))
+                    _vt = _env_float("P1HUNT_VERIFY_TIMEOUT", 900.0, minimum=1.0)
                     pending = [f for f in findings
                                if f.severity == "critical"
                                and self._finding_key(f) not in self._debated][:self._debate_max]
                     for f in pending:
                         key = self._finding_key(f)
+                        self._record_candidate_status(
+                            f, stage="debate", status="running", target_agent="debate",
+                            next_action="Adjudicate uphold/downgrade/reject before counting as confirmed.",
+                            blocked_by="debate_uphold_required",
+                        )
                         try:
                             verdict, sev, why = await asyncio.wait_for(
                                 debate.adjudicate(f, self.repo_path), timeout=_vt)
                         except Exception as exc:
-                            # Do NOT mark debated on error -> it retries next round, and stays
-                            # OUT of confirmed (un-upheld) until it genuinely passes the panel.
-                            self._emit(self.name, "lifecycle",
-                                       {"event": "debate_error", "title": f.title, "detail": str(exc)[:160]})
+                            # Retry transient debate failures, but fail closed after a small cap.
+                            # Otherwise a prompt/schema bug can keep a candidate in DEBATE for hours.
+                            n = self._debate_errors.get(key, 0) + 1
+                            self._debate_errors[key] = n
+                            if n >= self._debate_error_max:
+                                self._debated.add(key)
+                                self._debate_rejected.add(key)
+                                findings[:] = [x for x in findings if self._finding_key(x) != key]
+                                self._record_candidate_status(
+                                    f, stage="debate", status="rejected", target_agent="parent_a",
+                                    next_action="Do not report as confirmed; debate gate failed closed.",
+                                    blocked_by="debate_error_cap",
+                                    reason=str(exc)[:240],
+                                )
+                                self._emit(
+                                    self.name,
+                                    "lifecycle",
+                                    {"event": "debate_error_cap", "title": f.title,
+                                     "attempts": n, "detail": str(exc)[:160]},
+                                )
+                            else:
+                                self._record_candidate_status(
+                                    f, stage="debate", status="deferred", target_agent="debate",
+                                    next_action=f"Retry debate next round ({n}/{self._debate_error_max}).",
+                                    blocked_by="debate_error",
+                                    reason=str(exc)[:240],
+                                )
+                                self._emit(self.name, "lifecycle",
+                                           {"event": "debate_error", "title": f.title,
+                                            "attempts": n, "detail": str(exc)[:160]})
                             continue
                         self._debated.add(key)
                         if verdict == "reject":
                             self._debate_rejected.add(key)  # never confirmable again
                             findings[:] = [x for x in findings if self._finding_key(x) != key]
+                            self._record_candidate_status(
+                                f, stage="debate", status="rejected", target_agent="parent_a",
+                                next_action="Do not report as confirmed.",
+                                blocked_by="debate_rejected",
+                                reason=why[:240],
+                            )
                             self._emit(self.name, "lifecycle",
                                        {"event": "debate_rejected", "title": f.title, "reason": why[:200]})
                         elif verdict == "downgrade":
                             f.severity = sev if sev in ("high", "medium", "low") else "high"
                             self._debate_downgraded[key] = f.severity
                             f.severity_rationale = f"[DEBATE-DOWNGRADED to {f.severity}] {why} | {f.severity_rationale}"
+                            self._record_candidate_status(
+                                f, stage="debate", status="downgraded", target_agent="parent_a",
+                                next_action="Report only at downgraded severity if useful.",
+                                blocked_by="debate_downgraded",
+                                reason=why[:240],
+                            )
                             self._emit(self.name, "lifecycle",
                                        {"event": "debate_downgraded", "title": f.title,
                                         "to": f.severity, "reason": why[:200]})
                         else:
                             self._debate_upheld.add(key)  # survived the panel -> now confirmable
+                            self._record_candidate_status(
+                                f, stage="debate", status="upheld", target_agent="parent_a",
+                                next_action="Count in confirmed criticals at the next findings write.",
+                                blocked_by="",
+                                reason=why[:240],
+                            )
                             self._emit(self.name, "lifecycle", {"event": "debate_upheld", "title": f.title})
 
                 # Find ALL criticals — do NOT stop at the first. Keep hunting/reframing across
@@ -1841,14 +2870,20 @@ class ClaudeSwarm:
         finally:
             # Always tear down the watchdog task and any local anvil fork, even on an
             # exception path (the two in-loop returns also do this; both are idempotent).
+            await self._cancel_fuzz_tasks()
+            await self._cancel_exploit_tasks()
             watchdog.cancel()
             self._stop_fork()
 
     # --- helpers ----------------------------------------------------------
     _SEC_KEYWORDS = (
-        "verify", "proof", "zero_knowledge", "zk", "sign", "mta", "keygen", "key", "commit",
-        "paillier", "ring_pedersen", "range", "ecdsa", "eddsa", "schnorr", "cosigner", "crypto",
-        "auth", "token", "session", "permission", "nonce", "refresh", "share",
+        # Broad guarantee/data/control terms only. Parent A derives class-specific focus from the
+        # actual target; this fallback ranker must not bake in a protocol, product, or bug shape.
+        "access", "account", "admin", "asset", "auth", "balance", "boundary", "capability",
+        "commit", "credential", "decrypt", "encrypt", "guard", "hash", "identity", "key",
+        "limit", "nonce", "owner", "permission", "policy", "proof", "quota", "role",
+        "secret", "session", "share", "sign", "signature", "tenant", "token", "transfer",
+        "trust", "validate", "verify", "withdraw",
     )
     _SRC_EXTS = {".cpp", ".cc", ".c", ".h", ".hpp", ".go", ".rs", ".py", ".ts", ".js", ".tsx",
                  ".sol", ".java", ".kt", ".rb", ".php"}
@@ -1928,6 +2963,43 @@ class ClaudeSwarm:
         return [rel for _, rel in scored[:limit]]
 
     # --- Parent A cold reconnaissance (§6, NOTHING PRESET) ----------------
+    def _recon_mode(self) -> str:
+        """Cold-recon execution mode.
+
+        Dry-run hunts may spend more model/tooling budget up front. Active runs stay conservative
+        because live testing should not unexpectedly fan out additional autonomous work.
+        """
+        mode = os.environ.get("P1HUNT_RECON_MODE", "auto").strip().lower()
+        if mode not in ("auto", "solo", "parallel"):
+            mode = "auto"
+        if getattr(self.config, "run_mode", "dry_run") != "dry_run" and mode == "parallel":
+            return "solo"
+        return mode
+
+    def _recon_policy_text(self) -> str:
+        mode = self._recon_mode()
+        if mode == "solo":
+            return (
+                "RECON EXECUTION MODE: SOLO. Do the deep reconnaissance yourself in this Parent A "
+                "turn. Do not dispatch parallel sub-agents unless a file is too large to summarize "
+                "safely. You still MUST produce the full structured attacker map before children start."
+            )
+        if mode == "parallel":
+            return (
+                "RECON EXECUTION MODE: PARALLEL. This is a dry-run deep reconnaissance pass: after a "
+                "brief top-level layout read, dispatch focused parallel sub-agents for the major "
+                "subsystems, then synthesize their file:line-anchored maps into the final JSON. Keep "
+                "each sub-agent brief targeted and bounded; do not paste giant file dumps."
+            )
+        return (
+            "RECON EXECUTION MODE: AUTO. This is a dry-run-friendly deep reconnaissance pass. First "
+            "size up the repository, then CHOOSE the most efficient method: SOLO for small/clear "
+            "targets, PARALLEL for large/multi-component/protocol/crypto/reference-heavy targets, or "
+            "HYBRID when Parent A should map the top level and dispatch only the expensive subsystem "
+            "reads. Your choice changes HOW you read, never WHETHER recon is deep: you still MUST "
+            "return the same structured attacker map before children start."
+        )
+
     def _scope_prompt(self) -> str:
         return (
             "You are Parent A, the LEAD of this security audit and the BRAIN of the whole hunt. Your "
@@ -1943,10 +3015,12 @@ class ClaudeSwarm:
             "CORRECT ≠ SAFE — a faithful implementation of a flawed rule, or a perfectly-correct "
             "computation fed an input the attacker chose, still loses funds/control/data. You are "
             "looking for OUTCOMES an attacker can force, not for code that looks wrong.\n\n"
-            "READ DEEPLY: this is the one phase where breadth AND depth both matter. DISPATCH SUB-"
-            "AGENTS (Agent/Task) to read whole subsystems and return rich, file-anchored summaries; "
-            "reason over those. Cite real file:line for every claim — never guess. Spend real effort "
-            "here; the rest of the hunt inherits the quality of this map.\n\n"
+            "READ DEEPLY: this is the one phase where breadth AND depth both matter. The exact shape "
+            "must fit the target: sometimes Parent A should read the critical files directly; "
+            "sometimes it should dispatch parallel subsystem readers; often it should do a hybrid. "
+            "Cite real file:line for every claim — never guess. Spend real effort here; the rest of "
+            "the hunt inherits the quality of this map.\n\n"
+            f"{self._recon_policy_text()}\n\n"
             "1) UNDERSTAND the system: what it is, its language/stack, how it's built and tested, "
             "what it's FOR, and what 'critical' means for THIS specific system (the maximum attacker "
             "win — theft, takeover, key/secret extraction, permanent loss/freeze, integrity break).\n\n"
@@ -1976,7 +3050,7 @@ class ClaudeSwarm:
             "signature: unforgeable + non-malleable; a value meant unique/unpredictable: stays so; a "
             "secret/share: never leaks; an invariant the accounting must preserve). Phrase each as 'an "
             "attacker must NEVER be able to <violate property>'. The team's job is to BREAK these derived "
-            "guarantees — the bug class is whatever the break turns out to be — not to scan for known shapes.\n"
+            "guarantees — the failure mode is whatever the break turns out to be — not to scan for known shapes.\n"
             "   MINE THE TESTS: the tests encode the contract — which operations are guarded (throw on "
             "re-call/misuse) vs permitted, and which properties the authors did and did NOT enforce. A "
             "guarantee the tests show is NOT defended is a high-value lead.\n\n"
@@ -1985,10 +3059,12 @@ class ClaudeSwarm:
             "library implementing the same primitive, or the documented spec itself? If so, say where "
             "and how the pieces pair up — any divergence on the same input is a likely bug. Else say "
             "none exists.\n\n"
-            "6) RESEARCH HISTORICAL PATTERNS (WebSearch/WebFetch). Identify what this project IS, then "
-            "research the known critical bug CLASSES for its category and past audit findings/CVEs/"
-            "disclosed exploits for it and its close peers. The old bugs are patched — you want the "
-            "PATTERNS so the team hunts NEW VARIANTS. Short, concrete, checkable statements.\n\n"
+            "6) OPTIONAL TECHNICAL CONTEXT (WebSearch/WebFetch). Use web only to understand public "
+            "specs, standards, APIs, deployment facts, build/tooling docs, or protocol terminology "
+            "needed to read THIS code correctly. Do NOT research known vulnerability taxonomies, past "
+            "audit findings, CVEs, disclosed exploits, or '<product> vulnerabilities' for this target "
+            "or its peers. Convert any external context into code-specific guarantees and citations "
+            "from the local repository; never into a preset lead.\n\n"
             "7) DECOMPOSE & RANK (deep ownership, not breadth). Split the in-scope code into up to 6 "
             "cohesive SUBSYSTEMS (each a distinct mechanism); one track OWNS each end-to-end. ORDER "
             "the tracks MOST-DANGEROUS-FIRST — by (attacker reachability × blast radius × how likely "
@@ -2028,8 +3104,14 @@ class ClaudeSwarm:
             "the repo self-contained / does the program forbid them? Are there commands that should "
             "be blocked outright for this target? Default to allowing what the work genuinely needs "
             "and turning OFF what it doesn't (e.g. an offline crypto-lib audit: network off).\n\n"
+            "OUTPUT BUDGET: the final answer must be ONE compact JSON object under 18000 characters. "
+            "No markdown, no prose, no status object before or after it. Use 4-6 tracks. Cap "
+            "crown_jewels at 8, attack_surface at 12, focus_files per track "
+            "at 8, invariants per track at 5, and investigate items per track at 5. Keep file:line "
+            "citations inside those compact strings; do not paste long notes or file contents.\n\n"
             "Return ONLY JSON:\n"
             '{"summary":"...",'
+            '"recon_strategy":"solo|hybrid|parallel",'
             # target_class is used ONLY to route which toolchain RE-RUNS your PoC (forge / go / '
             # cargo / pytest / native-cc / web). Pick the one that fits how THIS target is built and
             # tested — derived from what you observed, not from any list of bugs. Use OTHER if none fit.
@@ -2046,7 +3128,6 @@ class ClaudeSwarm:
             '"attack_surface":["<externally-reachable entrypoint + which actor controls it — file:line>",...],'
             '"differential_oracle":{"exists":true|false,"description":"where the second '
             'implementation/spec is and how it pairs with the in-scope code, or why none exists"},'
-            '"known_patterns":["<known bug pattern to hunt a NEW variant of in this code>",...],'
             '"top_hypothesis":"<the single place you would bet the P1 is, citing code + the first move to test it>",'
             # tracks MUST be ORDERED most-dangerous-first (track 0 is worked first/deepest).
             '"tracks":[{"theme":"...","subsystem":"...","fuzz_mode":"differential|invariant",'
@@ -2062,31 +3143,101 @@ class ClaudeSwarm:
         from .claude_session import make_session
 
         self._emit(self.name, "message",
-                   {"phase": "scoping", "detail": "cold reconnaissance — no prior knowledge of the target"})
+                   {"phase": "scoping", "detail": "cold reconnaissance — no prior knowledge of the target",
+                    "recon_mode": self._recon_mode()})
         try:
-            _recon_turns = max(20, int(os.environ.get("P1HUNT_RECON_TURNS", "45")))
+            _recon_turns = _env_int("P1HUNT_RECON_TURNS", 45, minimum=20)
         except ValueError:
             _recon_turns = 45
         session = make_session(
             agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
             guard_check=self._guard_check(guard, self.name), max_turns=_recon_turns,
+            engine=self.config.models.engine,
+            effort=self.config.models.codex_effort,
+            codex_model=self.config.models.codex_model,
             perms=self._perms, egress_hosts=self._egress_hosts,
         )
         result = await session.run(self._scope_prompt(), self.repo_path)
         parsed = _parse_json_object(result.text)
+        if self._should_retry_scope_parse(result, parsed):
+            self._emit(self.name, "lifecycle",
+                       {"event": "scope_parse_retry",
+                        "reason": "Parent A did not return parseable tracks",
+                        "tool_calls": getattr(result, "tool_calls", 0)})
+            retry = make_session(
+                agent_name=self.name, model=self.config.models.orchestrator, on_event=self._emit,
+                guard_check=self._guard_check(guard, self.name), max_turns=max(10, min(_recon_turns, 30)),
+                engine=self.config.models.engine,
+                effort=self.config.models.codex_effort,
+                codex_model=self.config.models.codex_model,
+                perms=self._perms, egress_hosts=self._egress_hosts,
+            )
+            retry_result = await retry.run(self._scope_retry_prompt(result.text), self.repo_path)
+            retry_parsed = _parse_json_object(retry_result.text)
+            if retry_parsed and retry_parsed.get("tracks"):
+                result, parsed = retry_result, retry_parsed
+            else:
+                self._emit(self.name, "lifecycle",
+                           {"event": "scope_parse_retry_failed",
+                            "reason": getattr(retry_result, "error", "") or "still no tracks",
+                            "tool_calls": getattr(retry_result, "tool_calls", 0)})
         self._apply_workspace_guardrail((parsed or {}).get("workspace_root"))
         if not parsed or not parsed.get("tracks"):
-            self._emit(self.name, "lifecycle", {"event": "scope_fallback", "reason": "no tracks derived"})
-            return {"tracks": self._fallback_tracks(),
+            tracks = self._fallback_tracks()
+            event = "scope_repo_derived_fallback" if self._deep_discovery else "scope_fallback"
+            self._emit(self.name, "lifecycle",
+                       {"event": event, "reason": "no tracks derived",
+                        "tracks": [t.get("subsystem") or t.get("theme") for t in tracks[:6]]})
+            return {"tracks": tracks,
                     "critical_means": (parsed or {}).get("critical_means"),
                     "summary": (parsed or {}).get("summary", "")}
         # Surface Parent A's recon reasoning so the operator can see the map it drew (and judge it).
         self._emit(self.name, "lifecycle",
                    {"event": "recon", "crown_jewels": (parsed.get("crown_jewels") or [])[:5],
+                    "strategy": str(parsed.get("recon_strategy", "") or self._recon_mode())[:40],
                     "attack_surface": (parsed.get("attack_surface") or [])[:6],
                     "top_hypothesis": str(parsed.get("top_hypothesis", ""))[:300],
                     "tracks": [t.get("subsystem") or t.get("theme") for t in (parsed.get("tracks") or [])][:6]})
         return parsed
+
+    def _should_retry_scope_parse(self, result, parsed: dict | None) -> bool:
+        if os.environ.get("P1HUNT_SCOPE_RETRY", "1") == "0":
+            return False
+        if parsed and parsed.get("tracks"):
+            return False
+        err = str(getattr(result, "error", "") or "").lower()
+        if "rate_limited" in err or "rate limit" in err or "session limit" in err:
+            return False
+        return bool(str(getattr(result, "text", "") or "").strip())
+
+    def _scope_retry_prompt(self, prior_text: str) -> str:
+        excerpt = (prior_text or "")[-8000:]
+        return (
+            "You are Parent A. Your previous scoping turn did useful reconnaissance but did not "
+            "return a parseable plan. Do not redo the full read unless absolutely necessary; synthesize "
+            "from the excerpt below and emit the plan now.\n\n"
+            "Return exactly ONE compact JSON object under 12000 characters. No markdown. No prose. "
+            "No status object. No second object. Use 4-6 most-dangerous-first tracks with concrete "
+            "focus_files, invariants, and investigate items. Cap arrays tightly: crown_jewels <= 6, "
+            "attack_surface <= 8, focus_files <= 8 per track, invariants <= 4 "
+            "per track, investigate <= 4 per track.\n\n"
+            "Required schema:\n"
+            '{"summary":"...","recon_strategy":"solo|hybrid|parallel",'
+            '"target_class":"EVM_CONTRACT|CRYPTO_LIB|WEB_API|MOBILE_APP|INFRA|SUPPLY_CHAIN|OTHER",'
+            '"threat_model":"...","target_subclass":"...","workspace_root":".",'
+            '"permissions":{"allow_network":true|false,"allow_install":true|false,'
+            '"deny_commands":[],"note":"..."},'
+            '"critical_means":"...","crown_jewels":["..."],"attack_surface":["..."],'
+            '"differential_oracle":{"exists":true|false,"description":"..."},'
+            '"top_hypothesis":"...",'
+            '"tracks":[{"theme":"...","subsystem":"...","fuzz_mode":"differential|invariant",'
+            '"expected_severity":"critical|high|medium","attacker_reachability":"high|medium|low",'
+            '"focus_files":["relative/path"],"invariants":["attacker must never ..."],'
+            '"investigate":["concrete attacker move"]}]}'
+            "\n\nPrevious reconnaissance excerpt:\n```text\n"
+            + excerpt
+            + "\n```"
+        )
 
     def _apply_workspace_guardrail(self, workspace_root: str | None) -> None:
         """Parent A decides the workspace folder; we LOCK it as the one hard guardrail. The choice
@@ -2138,17 +3289,84 @@ class ClaudeSwarm:
                               "this can only tighten the rules-derived floor, never loosen it"})
 
     def _fallback_tracks(self) -> list[dict]:
-        """Only when no Claude brain is available (offline/tests): generic lens tracks. Each track
-        gets the FULL file set (NOT a disjoint 1/N slice) so a hunter can follow a value/trust flow
-        ACROSS files instead of being boxed into a fragment — disjoint partitioning severs the
-        cross-cutting bugs where real P1s live. Plus one explicit cross-cutting 'composition' track
-        that owns the SEAMS between subsystems."""
-        files = self._enumerate_targets()
-        lenses = list(_LENSES) + ["composition-and-trust-seams"]
-        return [
-            {"theme": lens, "focus_files": list(files), "investigate": []}
-            for lens in lenses
-        ]
+        """Last-resort offline/test decomposition derived only from repository names.
+
+        Active hunts should get meaningful tracks from Parent A. If Parent A is unavailable or its
+        JSON is unusable, do not insert domain lanes, failure taxonomies, or invariants. Keep the process
+        alive with file clusters that force the child to derive its own threat model from code.
+        """
+        return self._repo_component_tracks()
+
+    def _repo_component_tracks(self, *, limit: int = 6) -> list[dict]:
+        import re
+        from collections import Counter
+
+        files = [f for f in self._enumerate_targets(limit=180) if not self._out_of_scope(f)]
+        if not files:
+            return [{"theme": "repo", "subsystem": "repo", "focus_files": [],
+                     "invariants": [], "investigate": []}]
+
+        stop = {
+            "src", "source", "include", "includes", "lib", "libs", "common", "internal",
+            "external", "core", "main", "index", "pkg", "packages", "module", "modules",
+            "test", "tests", "mock", "mocks", "spec", "specs", "util", "utils", "helper",
+            "helpers", "base", "types", "type", "interface", "interfaces",
+        }
+
+        def tokens(rel: str) -> list[str]:
+            parts: list[str] = []
+            for part in Path(rel).with_suffix("").parts:
+                parts.extend(t.lower() for t in re.split(r"[^A-Za-z0-9]+", part) if len(t) >= 3)
+            return [t for t in parts if t not in stop and not t.isdigit()]
+
+        counts = Counter(t for rel in files for t in set(tokens(rel)))
+        ranked = [tok for tok, count in counts.most_common() if count >= 1]
+        seeds: list[str] = []
+        for tok in ranked:
+            if all(tok not in s and s not in tok for s in seeds):
+                seeds.append(tok)
+            if len(seeds) >= limit:
+                break
+        if not seeds:
+            seeds = ["repo"]
+
+        tracks: list[dict] = []
+        assigned: set[str] = set()
+        for seed in seeds[:limit]:
+            focus = [rel for rel in files if seed == "repo" or seed in tokens(rel)]
+            if not focus:
+                continue
+            assigned.update(focus)
+            tracks.append({
+                "theme": f"derived:{seed}",
+                "subsystem": seed,
+                "fuzz_mode": "invariant",
+                "expected_severity": "critical",
+                "attacker_reachability": "unknown",
+                "focus_files": focus[:12],
+                "invariants": [],
+                "investigate": [
+                    f"Read the {seed} file cluster end-to-end and derive externally reachable attacker wins from cited code.",
+                    "Report only after deriving target-specific invariants and running a concrete local proof attempt.",
+                ],
+            })
+        remaining = [rel for rel in files if rel not in assigned]
+        if remaining and len(tracks) < limit:
+            tracks.append({
+                "theme": "derived:remaining",
+                "subsystem": "remaining",
+                "fuzz_mode": "invariant",
+                "expected_severity": "critical",
+                "attacker_reachability": "unknown",
+                "focus_files": remaining[:12],
+                "invariants": [],
+                "investigate": [
+                    "Read these remaining files and decide whether they expose a real attacker-controlled path.",
+                    "Derive invariants from code before proposing or testing any bug hypothesis.",
+                ],
+            })
+        return tracks or [{"theme": "derived:repo", "subsystem": "repo", "focus_files": files[:12],
+                           "invariants": [], "investigate": []}]
 
     def _record_hypothesis(self, cf: ClaudeFinding) -> None:
         hyp = Hypothesis(
@@ -2160,7 +3378,7 @@ class ClaudeSwarm:
             assumptions=[cf.root_cause] if cf.root_cause else [],
             safe_validation_plan=SafeValidationPlan("local", "read-only", "synthetic/owned"),
             stop_conditions=["out of scope", "third-party data", "destructive action"],
-            evidence_required=["Claude-cited code evidence", "adversarial verification"],
+            evidence_required=["agent-cited code evidence", "adversarial verification"],
             state=HypState.CANDIDATE,
             counterfactual=cf.counterfactual or None,
         )
@@ -2182,26 +3400,102 @@ class ClaudeSwarm:
             return None
         try:
             spec = ReproSpec.from_dict(spec_dict)
-            timeout = float(os.environ.get("P1HUNT_REPRO_TIMEOUT", "600"))
+            blocker = spec.attribution_blocker()
+            if blocker:
+                from ..runners.base import ReproResult
+                self._emit("poc_prover", "lifecycle",
+                           {"event": "attribution_rejected", "title": cf.title,
+                            "detail": blocker[:240]})
+                return ReproResult(
+                    ran=False,
+                    reproduced=False,
+                    command="",
+                    artifact_paths=([spec.harness_path] if spec.harness_path else []),
+                    detail=f"attribution gate rejected proof: {blocker}",
+                    runner="attribution-gate",
+                    target_code_attribution=spec.target_code_attribution,
+                    non_target_attribution=spec.non_target_attribution,
+                    attribution_notes=spec.attribution_notes,
+                )
+            timeout = _env_float("P1HUNT_REPRO_TIMEOUT", 600.0, minimum=1.0)
             repro = await asyncio.to_thread(runner.run, self._workspace_root, spec,
                                             timeout=timeout, on_event=self._emit)
+            repro.target_code_attribution = spec.target_code_attribution
+            repro.non_target_attribution = spec.non_target_attribution
+            repro.attribution_notes = spec.attribution_notes
+            gate = assess_counterfactual_proof(
+                workspace=self._workspace_root,
+                harness_paths=[spec.harness_path, *list(repro.artifact_paths or [])],
+                stdout_excerpt=repro.stdout_excerpt,
+                detail=repro.detail,
+                finding_text=" ".join([
+                    cf.title or "",
+                    cf.root_cause or "",
+                    cf.reproduction or "",
+                    cf.evidence or "",
+                    spec.attribution_notes or "",
+                    spec.non_target_attribution or "",
+                ]),
+                concrete_loss=cf.concrete_loss,
+                counterfactual=cf.counterfactual,
+                finding_claim=spec.finding_claim,
+            )
+            repro.counterfactual_gate = gate.to_dict()
+            repro.impact_blocker = "" if gate.p1_ok else gate.reason
+            self._emit(
+                "poc_prover",
+                "lifecycle",
+                {
+                    "event": "counterfactual_gate",
+                    "title": cf.title,
+                    "p1_ok": gate.p1_ok,
+                    "reason": gate.reason[:200],
+                    "notes": gate.notes[:4],
+                },
+            )
         except Exception as exc:
             self._emit("poc_prover", "lifecycle", {"event": "runner_error", "detail": str(exc)})
             return None
         self._emit("poc_prover", "lifecycle",
                    {"event": "reproduction", "runner": repro.runner, "ran": repro.ran,
                     "reproduced": repro.reproduced, "command": repro.command[:200],
-                    "detail": (repro.detail or "")[:200]})
+                    "detail": (repro.detail or "")[:200],
+                    "impact_blocker": (getattr(repro, "impact_blocker", "") or "")[:200]})
         return repro
 
     _LOSS_TYPES = ("funds", "data", "control", "availability")
 
-    def _impact_of(self, cf: ClaudeFinding, reproduced: bool) -> "ImpactAssessment":
+    def _impact_of(self, cf: ClaudeFinding, reproduced: bool, repro=None) -> "ImpactAssessment":
         """Build an ImpactAssessment from DERIVED facts — NOTHING PRESET. ``reproduced`` and
         ``in_scope`` are deterministic (runner + ScopeGuard). The concrete loss is whatever the
         agent itself STATED it demonstrated (cf.concrete_loss), not a keyword guess — if the agent
         could not articulate a concrete loss, it is 'none' and the finding is not auto-promoted to
         P1 (it stays a candidate for human review, which is the correct conservative behavior)."""
+        if getattr(cf, "relies_on_non_target_behavior", False):
+            return ImpactAssessment(
+                reproduced=False, protected_asset=False, attacker_capability=False,
+                concrete_loss="none", in_scope=not self._out_of_scope(cf.file),
+                note="attribution gate: finding depends on non-target behavior",
+            )
+        gate = getattr(repro, "counterfactual_gate", None) if repro is not None else None
+        if reproduced and isinstance(gate, dict) and not bool(gate.get("p1_ok")):
+            band = str(gate.get("severity_band") or "low").lower()
+            loss = str((gate.get("finding_claim") or {}).get("loss_type") or cf.concrete_loss or "").lower()
+            loss = loss if loss in self._LOSS_TYPES else "none"
+            if band == "high":
+                protected_asset, attacker_capability, mapped_loss = True, False, (loss if loss != "none" else "control")
+            elif band == "medium":
+                protected_asset, attacker_capability, mapped_loss = True, False, "none"
+            else:
+                protected_asset, attacker_capability, mapped_loss = False, False, "none"
+            return ImpactAssessment(
+                reproduced=True,
+                protected_asset=protected_asset,
+                attacker_capability=attacker_capability,
+                concrete_loss=mapped_loss,
+                in_scope=not self._out_of_scope(cf.file),
+                note=(f"counterfactual gate ({band}): " + str(gate.get("reason", "")))[:200],
+            )
         loss = (cf.concrete_loss or "").strip().lower()
         loss = loss if loss in self._LOSS_TYPES else "none"
         capability = bool((cf.counterfactual or "").strip())
@@ -2227,10 +3521,17 @@ class ClaudeSwarm:
         cmd = getattr(repro, "command", "") or ""
         arts = list(getattr(repro, "artifact_paths", []) or [])
         proof = getattr(repro, "detail", "") or getattr(repro, "stdout_excerpt", "")
+        attribution = getattr(repro, "target_code_attribution", "") or cf.target_code_attribution
+        setup_attr = getattr(repro, "non_target_attribution", "") or cf.non_target_attribution
+        attr_note = f" Target-owned defect: {attribution[:220]}." if attribution else ""
+        setup_note = f" Non-target setup only: {setup_attr[:160]}." if setup_attr else ""
         artifact = ArtifactRef(
             id=new_id("art"), kind="repro",
             path=(arts[0] if arts else f"{cf.file}:{cf.line}"),
-            description=f"REPRODUCED by {getattr(repro, 'runner', 'runner')} runner via `{cmd}` — {proof[:280]}",
+            description=(
+                f"REPRODUCED by {getattr(repro, 'runner', 'runner')} runner via `{cmd}` — "
+                f"{proof[:280]}{attr_note}{setup_note}"
+            ),
             reproduced=True,
         )
         self.bb.add_artifact(artifact)
@@ -2253,33 +3554,31 @@ class ClaudeSwarm:
             verified=True,
         )
         self.bb.add_finding(finding)
-        # LEARN: persist this CONFIRMED finding (generalized) to cross-engagement memory so future
-        # engagements on similar targets start with it as a "hunt a new variant" prior.
+        # Optional operational memory: keep runner/outcome metadata only. Do not persist the title,
+        # root cause, counterfactual, lens, or any reusable failure pattern.
         if self._memory is not None:
             try:
                 self._memory.record(
                     target_class=self._target_class, subclass=self._subclass,
-                    finding={"program": self.scope.program, "title": cf.title, "lens": cf.lens,
-                             "severity": tier, "root_cause": cf.root_cause,
-                             "counterfactual": cf.counterfactual,
-                             "harness_kind": getattr(repro, "runner", "")})
+                    finding={"severity": tier, "harness_kind": getattr(repro, "runner", ""),
+                             "outcome": "confirmed_reproduced"})
             except Exception:
                 pass
         return finding
 
     def _surface_for_human(self, cf: ClaudeFinding, rationale: str, severity_label: str,
                            guard: ScopeGuard, *, ran: bool, detail: str) -> Finding:
-        """Build a NEEDS-HUMAN-REVIEW finding: believed-real + high-confidence + concrete-loss, but
+        """Build an AUTONOMOUS-FOLLOW-UP finding: believed-real + high-confidence + concrete-loss, but
         not auto-reproduced. Marked verified=False and given an UNreproduced artifact, so it never
-        counts as a confirmed critical (the reproduced=confirmed floor is intact) — it is surfaced
-        prominently for a human precisely because the reasoning is strong and only the mechanical
-        proof is missing. This is the opposite of burying it as a nondescript candidate."""
+        counts as a confirmed critical (the reproduced=confirmed floor is intact). It is surfaced
+        prominently and kept in the exploit-depth queue precisely because the reasoning is strong and
+        only the mechanical proof is missing."""
         why = ("ran but did not deterministically demonstrate the bug" if ran
                else "no runnable harness/toolchain to auto-reproduce")
         artifact = ArtifactRef(
             id=new_id("art"), kind="reasoned",
             path=f"{cf.file}:{cf.line}",
-            description=f"NOT auto-reproduced ({why}); reasoned P1 for human verification — {str(detail)[:240]}",
+            description=f"NOT auto-reproduced ({why}); reasoned P1 queued for autonomous follow-up — {str(detail)[:240]}",
             reproduced=False,
         )
         return Finding(
@@ -2291,10 +3590,10 @@ class ClaudeSwarm:
             root_cause=cf.root_cause,
             poc=artifact,
             severity=severity_label,
-            severity_rationale=f"[{severity_label}] NEEDS HUMAN REVIEW — believed real (high confidence, "
-                               f"concrete loss: {cf.concrete_loss}) but not auto-reproduced. {rationale}",
+            severity_rationale=f"[{severity_label}] AUTONOMOUS FOLLOW-UP — believed real (high confidence, "
+                               f"concrete loss: {cf.concrete_loss}) but not auto-reproduced yet. {rationale}",
             counterfactual=cf.counterfactual,
-            remediation=cf.remediation or "Verify manually, then fix the root cause and add a regression test.",
+            remediation=cf.remediation or "Complete autonomous proof, then fix the root cause and add a regression test.",
             safe_harbor_attestation=guard.attestation(),
             verified=False,
         )
@@ -2308,26 +3607,32 @@ class ClaudeSwarm:
             status=status, plan=plan, rounds_run=rounds, findings=findings,
             reframes=self._reframes, demoted_to_warm_pool=False, attestation=guard.attestation(),
             candidates=[c.__dict__ for c in candidates],
-            needs_human=[getattr(f, "__dict__", f) for f in (needs_human or [])], brain="claude",
+            needs_human=[getattr(f, "__dict__", f) for f in (needs_human or [])],
+            brain=self.config.models.engine if self.config.use_claude else "deterministic",
         )
 
 
 def _parse_json_object(text: str) -> dict:
-    """Extract the first JSON object from a Claude reply (fenced block or inline)."""
+    """Extract the first JSON object from an agent reply (fenced block or inline)."""
     import json
     import re
 
     if not text:
         return {}
-    cands = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        cands.append(m.group(0))
-    for raw in cands:
-        try:
-            d = json.loads(raw)
+    sources = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    sources.append(text)
+    decoder = json.JSONDecoder()
+    found: list[dict] = []
+    for raw in sources:
+        for idx, ch in enumerate(raw):
+            if ch != "{":
+                continue
+            try:
+                d, _end = decoder.raw_decode(raw[idx:])
+            except json.JSONDecodeError:
+                continue
             if isinstance(d, dict):
-                return d
-        except json.JSONDecodeError:
-            continue
-    return {}
+                found.append(d)
+    if not found:
+        return {}
+    return next((d for d in found if d.get("tracks")), found[0])

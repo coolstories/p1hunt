@@ -283,13 +283,13 @@ def _files_block(focus_files: list[str]) -> str:
 
 
 def _web_authz_skeleton(subsystem: str, focus_files: list[str], target_url: str) -> str:
-    """Web authz / IDOR / tenant-isolation — pytest + requests, expect='pass' (bug = the
-    unauthorized cross-tenant access SUCCEEDED, so the assertion that it FAILS does not hold)."""
+    """Two-principal resource-boundary harness — pytest + requests, expect='pass' (bug = an
+    unexpected cross-principal permit, so the assertion that it FAILS does not hold)."""
     files = _files_block(focus_files)
     base = target_url or "(read from P1HUNT_BASE_URL)"
     poc = f"{_POC_DIR}/test_authz.py"
-    return f"""SCAFFOLD — pytest+requests authorization/IDOR/tenant-isolation harness for the
-'{subsystem}' subsystem (target class: WEB_API, subclass: auth/IDOR/BOLA).
+    return f"""SCAFFOLD — pytest+requests cross-principal resource-boundary harness for the
+'{subsystem}' subsystem (target class: WEB_API, subclass: access-boundary).
 
 In-scope files to derive object/route shapes from:
   - {files}
@@ -332,18 +332,18 @@ def owned_object_id():
 
 
 def test_b_cannot_read_a_object(owned_object_id):
-    # B requests A's object by id (IDOR / BOLA). MUST be refused.
+    # B requests A's object by id. MUST be refused.
     r = requests.get(f"{{BASE}}/<in-scope-collection>/{{owned_object_id}}",
                      headers=_h(TOKEN_B), timeout=15)
     assert r.status_code in (401, 403, 404), (
-        f"AUTHZ BYPASS: B read A's object (status {{r.status_code}}) — IDOR/BOLA")
+        f"UNEXPECTED PERMIT: B read A's object (status {{r.status_code}})")
 
 
 def test_b_cannot_write_a_object(owned_object_id):
     r = requests.patch(f"{{BASE}}/<in-scope-collection>/{{owned_object_id}}",
                        headers=_h(TOKEN_B), json={{"name": "hijacked"}}, timeout=15)
     assert r.status_code in (401, 403, 404), (
-        f"AUTHZ BYPASS: B wrote A's object (status {{r.status_code}})")
+        f"UNEXPECTED PERMIT: B wrote A's object (status {{r.status_code}})")
 
 
 def test_tenant_isolation_on_list(owned_object_id):
@@ -354,7 +354,7 @@ def test_tenant_isolation_on_list(owned_object_id):
 ```
 
 INVARIANTS TO ASSERT (break ANY = critical): a principal can never read or mutate another
-principal's object by id (IDOR/BOLA); listings never cross the tenant boundary; an unauthenticated
+principal's object by id; listings never cross the tenant boundary; an unauthenticated
 or wrong-role request to a protected route is refused; ownership is enforced server-side, not by a
 client-supplied tenant/user field.
 
@@ -497,18 +497,18 @@ def _denied(resp):
 
 def test_protected_field_denied_to_low_role():
     resp = _gql("query {{ <in-scope-protected-field> {{ id }} }}")
-    assert _denied(resp), f"FIELD AUTHZ BYPASS: low role read protected field: {{resp}}"
+    assert _denied(resp), f"UNEXPECTED FIELD PERMIT: low role read protected field: {{resp}}"
 
 
 def test_protected_mutation_denied_to_low_role():
     resp = _gql("mutation {{ <in-scope-privileged-mutation>(input: {{}}) {{ ok }} }}")
-    assert _denied(resp), f"MUTATION AUTHZ BYPASS: low role ran privileged mutation: {{resp}}"
+    assert _denied(resp), f"UNEXPECTED MUTATION PERMIT: low role ran privileged mutation: {{resp}}"
 
 
 def test_alias_does_not_bypass_authz():
     # Aliasing must not change the authz decision for the same protected field.
     resp = _gql("query {{ a: <in-scope-protected-field> {{ id }} b: <in-scope-protected-field> {{ id }} }}")
-    assert _denied(resp), f"ALIAS AUTHZ BYPASS: {{resp}}"
+    assert _denied(resp), f"UNEXPECTED ALIAS PERMIT: {{resp}}"
 
 
 def test_batch_amplification_each_still_authorized():
@@ -854,8 +854,8 @@ how a web critical is PROVEN, not by reading alone. Use the shipped client (alre
     from p1hunt_dyn import Client
     c = Client()                                  # reads base URL + egress allowlist from env
     a = c.get('/me', identity='A')                # authenticate as principal A (env token)
-    c.assert_forbidden('GET', f'/objects/{{oid}}', identity='B')   # IDOR: B must be refused
-    url, tok = c.oob_url()                         # for blind SSRF: feed `url` to the sink, then
+    c.assert_forbidden('GET', f'/objects/{{oid}}', identity='B')   # B must be refused
+    url, tok = c.oob_url()                         # feed `url` to callback/fetch behavior, then
     assert c.oob_received(tok)                     # assert the target called back (proof)
 
 The egress jail confines every request to the in-scope host(s); a request elsewhere raises. Set
@@ -888,7 +888,7 @@ def scaffold_block(
     ``ReproSpec.expect`` (whether a reproduced bug makes the test FAIL or PASS):
 
       * ``WEB_API`` — subclass-routed via ``detect_web_subclass`` (scanning ``repo_path``):
-        ``auth`` -> IDOR/tenant-isolation (pytest+requests, expect='pass'); ``payments`` ->
+        ``auth`` -> resource-boundary checks (pytest+requests, expect='pass'); ``payments`` ->
         accounting/idempotency conservation (pytest, expect='pass'); ``graphql`` -> resolver
         field-authz (pytest, expect='pass'); else a generic web property loop.
       * ``CRYPTO_LIB`` — ``detect_crypto_subclass`` selects the subclass; a pytest property/

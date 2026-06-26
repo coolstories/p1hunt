@@ -16,17 +16,15 @@ class Models:
     """Per-tier model strings (verify current). Orchestrator/verifier on the strongest
     tier, workers a step down, warm-pool watcher cheapest (§3)."""
 
-    orchestrator: str = "claude-opus-4-8"
-    worker: str = "claude-opus-4-8"   # the reasoning hunters run on the strongest model — deep
-    #                                   reasoning is the primary way a P1 is found on hardened code
-    warm_pool: str = "claude-haiku-4-5"
-    falsifier: str = "claude-opus-4-8"
-    # DISCOVERY ENGINE: which model drives the HUNTERS (the discovery phase). "claude" (default)
-    # runs the Claude hunters; "codex" runs OpenAI's Codex CLI (GPT-5.5-Codex) at xhigh reasoning
-    # — a second strong model to widen what gets found (EVMbench model-alloy). Verification, PoC,
-    # and the exploit-development depth phase ALWAYS stay on Claude regardless.
-    engine: str = "claude"                  # GLOBAL engine for ALL roles ("claude" | "codex")
-    discovery_engine: str = "claude"        # discovery hunters only ("claude" | "codex"); follows engine
+    orchestrator: str = "claude-opus-4-8"  # legacy Claude slug, ignored when engine=codex
+    worker: str = "claude-opus-4-8"        # legacy Claude slug, ignored when engine=codex
+    warm_pool: str = "claude-haiku-4-5"    # legacy Claude slug, ignored when engine=codex
+    falsifier: str = "claude-opus-4-8"     # legacy Claude slug, ignored when engine=codex
+    # GLOBAL ENGINE: Codex is the default for EVERY AI role: orchestrator, hunters, verifier,
+    # prover, exploit-depth, debate, dedup, and fuzz harness writing. The old Claude model strings
+    # stay only as compatibility fields for explicit P1HUNT_ENGINE=claude runs.
+    engine: str = "codex"                  # GLOBAL engine for ALL roles ("codex" | "claude")
+    discovery_engine: str = "codex"        # discovery hunters; follows engine unless overridden
     codex_model: str = ""                   # "" = codex account default (ChatGPT auth rejects slugs)
     codex_effort: str = "xhigh"             # minimal | low | medium | high | xhigh
 
@@ -48,7 +46,7 @@ class Config:
     run_mode: str = "dry_run"  # dry_run (default) | active (still fully gated by ScopeGuard)
     permission_mode: str = "deny"  # most restrictive default; never "ask" unattended (§3, §9)
     unattended: bool = True
-    use_claude: bool = False  # the AI is the detector: real Claude swarm when available (§3)
+    use_claude: bool = False  # legacy name: true means the live AI swarm is enabled (§3)
     # Which Claude account the swarm authenticates as, via CLAUDE_CONFIG_DIR (mirrors the shell
     # aliases: c5 -> ~/.claude-5x [Max 5x], c20 -> ~/.claude-20x [Max 20x]). Lets a run use a
     # fresh-quota account instead of an exhausted one. "" leaves CLAUDE_CONFIG_DIR untouched.
@@ -76,17 +74,17 @@ class Config:
     auto_install_toolchain: bool = False
     # Authorized LIVE dynamic target (web/API/auth — the bulk of bug bounty). When set together
     # with run_mode=active, the CLI attaches a DynamicTarget so the swarm can interact with the
-    # RUNNING instance and prove web criticals (IDOR/SSRF/auth-bypass) instead of only reading
+    # RUNNING instance and prove engagement-derived web/API criticals instead of only reading
     # source. Never a production URL — only a UAT/owned/testnet/staging instance. Empty = static.
     live_base_url: str = ""        # P1HUNT_BASE_URL  (REST/HTTP)
     live_gql_url: str = ""         # P1HUNT_GQL_URL   (GraphQL)
     live_environment: str = "uat"  # P1HUNT_LIVE_ENV  (uat | owned | testnet | staging | local)
 
     def apply_claude_account(self) -> None:
-        """Resolve ``claude_account`` -> ``CLAUDE_CONFIG_DIR`` so the Claude CLI/SDK authenticates as
-        the chosen account (c5 -> ~/.claude-5x, c20 -> ~/.claude-20x; or P1HUNT_CLAUDE_CONFIG_DIR for
-        a direct path). Only applied when the dir exists, so it never breaks a host lacking it. Set
-        in os.environ so every Claude subprocess the swarm spawns inherits it."""
+        """Resolve ``claude_account`` -> ``CLAUDE_CONFIG_DIR`` for explicit Claude-engine runs.
+
+        Only applied when the dir exists, so it never breaks Codex-default hosts lacking a Claude
+        account. Set in os.environ so compatibility subprocesses inherit it."""
         acct = (self.claude_account or "").strip().lower()
         cfgdir = os.environ.get("P1HUNT_CLAUDE_CONFIG_DIR", "").strip()
         if not cfgdir:
@@ -109,23 +107,23 @@ class Config:
         # CLAUDE ACCOUNT: select which logged-in account the swarm uses (fresh quota vs exhausted).
         cfg.claude_account = os.environ.get("P1HUNT_CLAUDE_ACCOUNT", cfg.claude_account)
         cfg.apply_claude_account()
-        # The real detector is a Claude swarm — enabled whenever the Claude Agent SDK + CLI
-        # are reachable (no API key needed; uses the local `claude` auth). Override with
-        # P1HUNT_USE_CLAUDE=0/1. Falls back to the deterministic brain when unavailable.
+        # The real detector is the live AI swarm. Codex is the default engine; Claude remains only
+        # as an explicit compatibility engine. P1HUNT_USE_AGENT is the preferred on/off switch;
+        # P1HUNT_USE_CLAUDE is accepted as a legacy alias.
         from .agents.claude_session import engine_available
 
         # GLOBAL ENGINE: P1HUNT_ENGINE=codex runs the ENTIRE swarm on Codex — orchestrator, hunters,
         # falsifier, prover, exploit-developer, debate, dedup, fuzz — so NOTHING depends on Claude Code.
-        _global_eng = os.environ.get("P1HUNT_ENGINE", "claude").strip().lower()
+        _global_eng = os.environ.get("P1HUNT_ENGINE", "codex").strip().lower()
         if _global_eng not in ("claude", "codex"):
-            _global_eng = "claude"
+            _global_eng = "codex"
         os.environ["P1HUNT_ENGINE"] = _global_eng  # canonical value the make_session factory reads
         cfg.models.engine = _global_eng
         # DISCOVERY ENGINE: explicit override, else FOLLOWS the global engine (so codex-global => codex discovery).
         _eng = os.environ.get("P1HUNT_DISCOVERY_ENGINE", _global_eng).strip().lower()
         cfg.models.discovery_engine = _eng if _eng in ("claude", "codex") else _global_eng
         # AI brain is ON iff the chosen engine is actually runnable (codex CLI / claude SDK+CLI).
-        env_flag = os.environ.get("P1HUNT_USE_CLAUDE")
+        env_flag = os.environ.get("P1HUNT_USE_AGENT", os.environ.get("P1HUNT_USE_CLAUDE"))
         cfg.use_claude = (env_flag == "1") if env_flag is not None else engine_available(_global_eng)
         cfg.models.codex_model = os.environ.get("P1HUNT_CODEX_MODEL", cfg.models.codex_model)
         cfg.models.codex_effort = os.environ.get("P1HUNT_CODEX_EFFORT", cfg.models.codex_effort)
@@ -139,7 +137,9 @@ class Config:
         cfg.live_base_url = os.environ.get("P1HUNT_BASE_URL", cfg.live_base_url)
         cfg.live_gql_url = os.environ.get("P1HUNT_GQL_URL", cfg.live_gql_url)
         cfg.live_environment = os.environ.get("P1HUNT_LIVE_ENV", cfg.live_environment)
-        if not _has_agent_credentials():
+        # Active dynamic testing needs a runnable agent brain, but that may be local Claude CLI auth
+        # or the Codex CLI. Do not key this off Anthropic API env vars only.
+        if cfg.run_mode == "active" and not cfg.use_claude:
             cfg.run_mode = "dry_run"
         return cfg
 
@@ -164,7 +164,14 @@ class Config:
         return self.run_mode == "active"
 
 
-def _has_agent_credentials() -> bool:
+def _has_agent_credentials(engine: str = "") -> bool:
+    eng = (engine or os.environ.get("P1HUNT_ENGINE", "codex")).strip().lower()
+    if eng == "codex":
+        try:
+            from .agents.codex_session import codex_available
+            return codex_available()
+        except Exception:
+            return False
     return any(
         os.environ.get(name)
         for name in (

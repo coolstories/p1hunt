@@ -1,6 +1,6 @@
 """Invariant + differential fuzzing engine (the P1-finding centerpiece).
 
-Reading-based hunting converges on the textbook bug classes auditors already closed. Mature
+Reading-based hunting converges on the textbook checklists auditors already closed. Mature
 code yields its remaining bugs to SEARCH, not reasoning: define the invariants a system must
 uphold, then let a fuzzer hammer the real code with randomized sequences until one breaks — or
 drive identical random inputs through two implementations of the same logic (optimized vs a
@@ -19,6 +19,15 @@ import json
 import re
 
 from .claude_session import ClaudeFinding, ClaudeSession, EventEmit, SessionResult, make_session
+
+
+_ATTRIBUTION_GATE = """ATTRIBUTION GATE (applies to EVERY fuzz finding):
+The broken invariant must be caused by the in-scope target code/behavior. Do not report a finding
+whose failure is only caused by your handler, mock, fixture, scaffold, local test config, fake token,
+fork setup, external service, dependency not shipped/pinned by the target, or an integrator-only
+implementation/obligation. A harness can drive hostile states, but the defect must be target-owned.
+For each finding, separate target_code_attribution, non_target_attribution, and
+relies_on_non_target_behavior."""
 
 
 # --- deterministic forge-output parsing (unit-testable, no Claude needed) ------------------
@@ -70,11 +79,8 @@ def fuzz_prompt(
 ) -> str:
     inv = "\n  - ".join(invariants) if invariants else "(derive the invariants yourself from the code)"
     files = "\n  - ".join(focus_files[:8]) if focus_files else "(find the relevant in-scope files)"
-    patt = (
-        "\n\nKNOWN BUG PATTERNS for this class/protocol — encode an invariant that would CATCH a "
-        "new variant of each, then fuzz for it:\n  - " + "\n  - ".join(known_patterns[:10])
-        if known_patterns else ""
-    )
+    # Preset-free mode: fuzzers get only Parent A's code-derived invariants and target files.
+    patt = ""
     prior = (
         "\n\nAlready-tried fuzz harnesses that found nothing (vary the approach — new invariants, "
         "wider input ranges, longer sequences, different entrypoints):\n  - "
@@ -150,6 +156,8 @@ METHOD (execution is the whole point):
    would never allow); only report real ones. If the whole campaign passes, the invariants HOLD on
    what you fuzzed — record the coverage so the next pass widens it.
 
+{_ATTRIBUTION_GATE}
+
 CONTEXT DISCIPLINE: don't read large files into your own context — DISPATCH SUB-AGENTS (Agent/Task
 tool) to extract the exact function signatures/ABIs/struct layouts you need to build the harness,
 then reason over their short summaries. Keep your own context for writing + running the harness.
@@ -164,7 +172,11 @@ Report ONLY JSON:
    "remediation": "the specific fix for THIS root cause (derived, not generic)",
    "confidence": "high|medium|low",
    "poc": "path to the harness under {poc_reldir} + command + the forge counterexample output proving it",
-   "evidence": "the exact failing assertion + counterexample sequence from the run"}}],
+   "evidence": "the exact failing assertion + counterexample sequence from the run",
+   "target_code_attribution": "the exact in-scope target behavior/file:line/function that owns the defect",
+   "non_target_attribution": "what your handler/mocks/fixtures/fork setup supplied",
+   "relies_on_non_target_behavior": false,
+   "attribution_notes": "why this is target-owned and not a harness/setup artifact"}}],
  "coverage": ["<what input space / invariants you fuzzed and how deep, so the next pass widens it>"],
  "covered": ["<the exact entrypoints/functions your harness actually EXERCISED this round (so the next pass targets the dark ones)>"]}}
 "findings" is [] if the campaign found no violation — that is a valid, useful result (record coverage)."""
@@ -206,11 +218,15 @@ class ClaudeFuzzer:
             cf = ClaudeFinding.from_dict(d, subsystem)
             live.append(cf)
             self.on_event(self.agent_name, "finding_reported",
-                          {"title": cf.title, "severity": cf.severity, "file": cf.file, "line": cf.line})
+                          {"title": cf.title, "severity": cf.severity, "file": cf.file, "line": cf.line,
+                           "finding": cf.__dict__})
 
         session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns, finding_sink=_sink,
+            engine=getattr(self, "engine", None),
+            effort=getattr(self, "codex_effort", None),
+            codex_model=getattr(self, "codex_model", None),
             allow_web=False, perms=getattr(self, "perms", None),
             egress_hosts=getattr(self, "egress_hosts", None),
         )

@@ -11,20 +11,20 @@ class TestSelectInScopeRepo(unittest.TestCase):
         return {"repos": repos, "out_of_scope": oos or []}
 
     def test_match_by_only(self):
-        b = self._brief(["https://github.com/ProjectOpenSea/seaport",
-                         "https://github.com/ProjectOpenSea/opensea-js"])
-        chosen, others = select_in_scope_repo(b, only="seaport", program="OpenSea")
-        self.assertIn("seaport", chosen)
-        self.assertEqual(others, ["https://github.com/ProjectOpenSea/opensea-js"])
+        b = self._brief(["https://github.com/example/payments-engine",
+                         "https://github.com/example/sdk-js"])
+        chosen, others = select_in_scope_repo(b, only="payments", program="Example")
+        self.assertIn("payments", chosen)
+        self.assertEqual(others, ["https://github.com/example/sdk-js"])
 
     def test_match_by_program_when_no_only(self):
-        b = self._brief(["https://github.com/org/widgets", "https://github.com/org/seaport-core"])
-        chosen, _ = select_in_scope_repo(b, only="", program="Seaport")
-        self.assertIn("seaport", chosen)
+        b = self._brief(["https://github.com/org/widgets", "https://github.com/org/settlement-core"])
+        chosen, _ = select_in_scope_repo(b, only="", program="Settlement")
+        self.assertIn("settlement", chosen)
 
     def test_hyphen_space_insensitive(self):
-        b = self._brief(["https://github.com/org/seaport-core"])
-        chosen, _ = select_in_scope_repo(b, only="sea port")
+        b = self._brief(["https://github.com/org/settlement-core"])
+        chosen, _ = select_in_scope_repo(b, only="settlement core")
         self.assertIsNotNone(chosen)
 
     def test_falls_back_to_first_when_no_match(self):
@@ -34,7 +34,7 @@ class TestSelectInScopeRepo(unittest.TestCase):
         self.assertEqual(others, ["https://github.com/org/beta"])
 
     def test_empty_returns_none(self):
-        chosen, others = select_in_scope_repo({"repos": []}, only="seaport")
+        chosen, others = select_in_scope_repo({"repos": []}, only="core")
         self.assertIsNone(chosen)
         self.assertEqual(others, [])
 

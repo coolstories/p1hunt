@@ -35,6 +35,57 @@ from .ui.tui import LiveTui
 from .workflow import Phase, WorkflowRunner
 
 
+def _write_process_metadata(folder: Path, *, kind: str, report_path: str = "") -> None:
+    doc = {
+        "kind": kind,
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "argv": sys.argv,
+        "cwd": os.getcwd(),
+        "started_ts": time.time(),
+        "report_path": report_path,
+    }
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "process.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _brain_label(config: Config) -> str:
+    return config.models.engine if config.use_claude else "deterministic"
+
+
+def _configure_cli_engine(config: Config, args: argparse.Namespace) -> None:
+    """Apply CLI engine switches after Config.from_env().
+
+    Legacy ``--discovery-engine codex`` now promotes the whole run to Codex unless an explicit
+    ``--engine`` was supplied, so old commands stop creating accidental Claude downstream agents.
+    """
+    explicit_engine = getattr(args, "engine", None)
+    discovery = getattr(args, "discovery_engine", None)
+    if explicit_engine:
+        config.models.engine = explicit_engine
+    elif discovery == "codex":
+        config.models.engine = "codex"
+    if discovery:
+        config.models.discovery_engine = discovery
+    elif config.models.engine == "codex":
+        config.models.discovery_engine = "codex"
+    os.environ["P1HUNT_ENGINE"] = config.models.engine
+    os.environ["P1HUNT_DISCOVERY_ENGINE"] = config.models.discovery_engine
+    if getattr(args, "offline", False) or getattr(args, "no_claude", False):
+        config.use_claude = False
+        if config.run_mode == "active":
+            config.run_mode = "dry_run"
+        return
+    from .agents.claude_session import engine_available
+    env_flag = os.environ.get("P1HUNT_USE_AGENT", os.environ.get("P1HUNT_USE_CLAUDE"))
+    config.use_claude = (env_flag == "1") if env_flag is not None else engine_available(config.models.engine)
+    if config.run_mode == "active" and not config.use_claude:
+        config.run_mode = "dry_run"
+
+
 async def run_engagement(
     scope: Scope,
     artifact_dir: str,
@@ -43,6 +94,7 @@ async def run_engagement(
     rounds: int | None = 8,
     live: bool = False,
     event_log: EventLog | None = None,
+    report_path: str = "",
 ) -> tuple[HuntResult | None, Blackboard, EventLog, MessageBus, str]:
     log = event_log or EventLog()
     bus = MessageBus(log)
@@ -53,6 +105,7 @@ async def run_engagement(
     # --- intake (§2.3) ---
     eng = create_engagement(scope, artifact_dir, engagements_root=config.engagements_root)
     log.redirect(eng.folder / "events.jsonl")  # full event stream -> `p1hunt watch` can replay/follow
+    _write_process_metadata(eng.folder, kind="hunt", report_path=report_path)
     transcripts = TranscriptWriter(log, eng.folder / "notes")  # persist each agent's transcript (§11)
     log.emit("operator", "lifecycle", {"event": "intake", "status": eng.status.value, "folder": str(eng.folder)})
     if eng.status is EngagementStatus.BLOCKED_NEEDS_HUMAN_SCOPE_DECISION:
@@ -77,8 +130,10 @@ async def run_engagement(
 
     # --- delegation + never-quit hunt (§7, §8, §10) ---
     if config.use_claude:
-        # The AI is the detector: a real Claude swarm reads the code and hunts.
-        log.emit("operator", "lifecycle", {"event": "brain", "detail": "claude-agent-sdk swarm"})
+        # The AI is the detector: a live engine-backed swarm reads the code and hunts.
+        log.emit("operator", "lifecycle",
+                 {"event": "brain", "detail": f"{config.models.engine} swarm",
+                  "engine": config.models.engine})
         swarm = ClaudeSwarm(scope, artifact_dir, config=config, bus=bus, blackboard=bb, event_log=log)
         runner.complete(Phase.HYPOTHESIS, gate_passed=True)
         result = await swarm.hunt(max_rounds=rounds)  # None = never stop until a critical
@@ -88,14 +143,16 @@ async def run_engagement(
         # "the weak brain found nothing", NOT "the target is clean". This is the most dangerous
         # false-confidence path, so make it unmissable (mirrors the missing-toolchain warning).
         from .config import _has_agent_credentials
-        _why = "no ANTHROPIC creds / `claude` CLI" if not _has_agent_credentials() else "P1HUNT_USE_CLAUDE=0"
+        _why = (f"{config.models.engine} engine unavailable"
+                if not _has_agent_credentials(config.models.engine)
+                else "P1HUNT_USE_AGENT=0")
         banner_msg = (
             "\n" + "!" * 78 +
-            "\n!! DEGRADED MODE: deterministic OFFLINE brain (no Claude). It only matches regex"
+            f"\n!! DEGRADED MODE: deterministic OFFLINE brain (no {config.models.engine} engine). It only matches regex"
             "\n!! signals — it does NOT reason about logic and CANNOT find a real P1. A clean"
             "\n!! result here means NOTHING about the target's safety."
-            f"\n!! Cause: {_why}. Fix: install/authenticate the `claude` CLI (or set "
-            "P1HUNT_USE_CLAUDE=1)."
+            f"\n!! Cause: {_why}. Fix: install/authenticate the selected engine CLI (or set "
+            "P1HUNT_USE_AGENT=1)."
             "\n" + "!" * 78 + "\n")
         print(banner_msg)
         log.emit("operator", "lifecycle",
@@ -128,7 +185,8 @@ def _demo(args: argparse.Namespace) -> int:
     write_vulnerable_target(target_dir, kind=args.kind)
 
     result, bb, log, bus, report = asyncio.run(
-        run_engagement(scope, str(target_dir), config=config, rounds=args.rounds, live=args.live)
+        run_engagement(scope, str(target_dir), config=config, rounds=args.rounds, live=args.live,
+                       report_path=args.report or "")
     )
     print(render_snapshot(log, bb, bus))
     if result is None:
@@ -181,6 +239,7 @@ def build_scope(
     in_scope = [Asset("a1", target_value, kind, target_value, environment)]
     for i, t in enumerate(dyn, start=1):
         in_scope.append(Asset(f"live{i}", t.base_url, "domain", t.base_url, t.environment))
+    severity_taxonomy = _taxonomy_for_scope_note(scope_note)
     return Scope(
         program=program,
         platform=platform,
@@ -188,7 +247,7 @@ def build_scope(
         safe_harbor_text=safe_harbor
         or "Authorized local/fork/UAT/owned-account testing only. No production writes, DoS, "
         "credential use, or third-party data access.",
-        severity_taxonomy=dict(_TAXONOMY),
+        severity_taxonomy=severity_taxonomy,
         in_scope=in_scope,
         out_of_scope=[],
         rules=["Use only owned accounts or synthetic data.", "No production writes."],
@@ -199,6 +258,28 @@ def build_scope(
         dynamic_targets=dyn,
         test_identities=test_identities or [],
     )
+
+
+def _taxonomy_for_scope_note(scope_note: str) -> dict[str, str]:
+    """Use an engagement-specific reward table when the direct CLI scope note contains one."""
+    note = (scope_note or "").lower()
+    if (
+        ("retrieving the key" in note or "retrieve the key" in note or "private key" in note)
+        and "rogue signature" in note
+        and "1000" in note
+        and ("1 billion" in note or "1b" in note or "1000000000" in note)
+    ):
+        return {
+            "P1": (
+                "Critical: retrieving the key or producing a rogue signature without triggering "
+                "failures/aborts, regardless of transaction count; also obtaining the key or rogue "
+                "signature with fewer than 1000 failures/aborts."
+            ),
+            "P2": "High: obtaining the key or rogue signature with fewer than 1 billion failures/aborts.",
+            "P3": "Medium: leaking bits of the private key or causing memory corruption.",
+            "P4": "Low: exploit exposure to a smaller subset of non-critical systems and/or data.",
+        }
+    return dict(_TAXONOMY)
 
 
 def _web_hosts_from_brief(brief: dict) -> list[str]:
@@ -282,7 +363,8 @@ def _web_hunt(config: Config, args: argparse.Namespace) -> int:
         result, bb, log, bus, report = out
     else:
         result, bb, log, bus, report = asyncio.run(
-            run_engagement(scope, artifact_dir, config=config, rounds=max_rounds, live=args.live))
+            run_engagement(scope, artifact_dir, config=config, rounds=max_rounds, live=args.live,
+                           report_path=args.report or ""))
     print(render_snapshot(log, bb, bus))
     if result is None:
         print("\nEngagement BLOCKED — needs a human scope decision.")
@@ -298,27 +380,29 @@ def _web_hunt(config: Config, args: argparse.Namespace) -> int:
 
 def _hunt(args: argparse.Namespace) -> int:
     config = Config.from_env()
-    if args.no_claude:
-        config.use_claude = False
+    _configure_cli_engine(config, args)
     if getattr(args, "claude_account", None):
         config.claude_account = args.claude_account
         config.apply_claude_account()
-        print(f"◈ Claude account: {config.claude_account}  (CLAUDE_CONFIG_DIR={config.claude_config_dir or 'default'})")
+        if config.models.engine == "claude":
+            print(f"◈ Claude account: {config.claude_account}  (CLAUDE_CONFIG_DIR={config.claude_config_dir or 'default'})")
+        else:
+            print("◈ Claude account ignored: engine=codex")
     if getattr(args, "web", False):
         return _web_hunt(config, args)
     if getattr(args, "auto_install_toolchain", False):
         config.auto_install_toolchain = True
-    if getattr(args, "discovery_engine", None):
-        config.models.discovery_engine = args.discovery_engine
-    if config.models.discovery_engine == "codex":
+    if config.models.engine == "codex":
         from .agents.codex_session import codex_available
         if not codex_available():
-            print("⚠ discovery-engine=codex but the `codex` CLI is not on PATH — install it "
-                  "(`npm i -g @openai/codex`) or use --discovery-engine claude. Falling back to Claude.")
-            config.models.discovery_engine = "claude"
+            print("⚠ engine=codex but the `codex` CLI is not on PATH — install/authenticate it. "
+                  "This run will use deterministic offline mode until Codex is available.")
+            config.use_claude = False
         else:
-            print(f"◈ Discovery engine: CODEX ({config.models.codex_model} @ {config.models.codex_effort} "
-                  "reasoning) — verification/PoC/depth stay on Claude.")
+            print(f"◈ AI engine: CODEX ({config.models.codex_model or 'account-default'} @ "
+                  f"{config.models.codex_effort} reasoning) — all workflow roles use Codex.")
+    elif config.models.engine == "claude":
+        print("◈ AI engine: CLAUDE (explicit compatibility mode).")
     if getattr(args, "resume", False):
         # Continue from the saved snapshot (state.json) in the existing engagement folder —
         # skips cold reconnaissance, restores tracks/candidates/ruled-out/round. (Reuses the
@@ -375,7 +459,7 @@ def _hunt(args: argparse.Namespace) -> int:
             return 2
 
     cap = "never-stop (until a critical)" if max_rounds is None else f"max {max_rounds} rounds"
-    print(f"\nHunting {artifact_dir}  (brain: {'claude' if config.use_claude else 'deterministic'}, {cap})\n")
+    print(f"\nHunting {artifact_dir}  (brain: {_brain_label(config)}, {cap})\n")
     if getattr(args, "tui", False):
         out = run_with_tui(scope, artifact_dir, config=config, rounds=max_rounds, program=program)
         if not out:
@@ -384,7 +468,8 @@ def _hunt(args: argparse.Namespace) -> int:
         result, bb, log, bus, report = out
     else:
         result, bb, log, bus, report = asyncio.run(
-            run_engagement(scope, artifact_dir, config=config, rounds=max_rounds, live=args.live)
+            run_engagement(scope, artifact_dir, config=config, rounds=max_rounds, live=args.live,
+                           report_path=args.report or "")
         )
     print(render_snapshot(log, bb, bus))
     if result is None:
@@ -474,11 +559,13 @@ def _auto_scope(config: Config, program: str, platform: str, only: str, url: str
     from .intake_agent import research_program
 
     if not config.use_claude:
-        print("Auto-scope needs the Claude brain for web research — install/auth the SDK, or pass a target path/URL.")
+        print("Auto-scope needs the live AI engine for web research — install/auth Codex, or pass a target path/URL.")
         return None
     print(f"\n🔎 Researching {platform or 'bug-bounty'} program '{program}'… (live web)")
     brief = asyncio.run(
-        research_program(program, url or "", only, platform=platform, model=config.models.orchestrator)
+        research_program(program, url or "", only, platform=platform, model=config.models.orchestrator,
+                         engine=config.models.engine, codex_model=config.models.codex_model,
+                         codex_effort=config.models.codex_effort)
     )
     if not brief.get("_ok"):
         print(f"  Could not read the program: {brief.get('_error') or brief.get('notes') or 'unknown'}")
@@ -534,18 +621,21 @@ def interactive() -> int:
     banner("interactive intake", sys.stdout)
     print("Authorized safe-harbor research only.\n")
 
-    name = _ask("What bug bounty do you want to hunt? (engagement name, e.g. 'Fireblocks MPC')")
+    name = _ask("What bug bounty do you want to hunt? (engagement name, e.g. 'example-program')")
     if not name:
         print("An engagement name is required. Exiting.")
         return 1
     url = _ask("Program URL (Immunefi / HackerOne / Bugcrowd / etc.)")
-    focus = _ask("Audit a specific area? (e.g. 'Seaport' in OpenSea) — or press Enter to hunt everything")
+    focus = _ask("Audit a specific area? (e.g. 'core module') — or press Enter to hunt everything")
     platform = _platform_of(url)
 
     brief: dict = {}
     if url and config.use_claude:
         print("\n\033[36m⠋ Fetching the program and reading the rules…\033[0m")
-        brief = asyncio.run(research_program(name, url, focus, model=config.models.orchestrator))
+        brief = asyncio.run(research_program(name, url, focus, model=config.models.orchestrator,
+                                             engine=config.models.engine,
+                                             codex_model=config.models.codex_model,
+                                             codex_effort=config.models.codex_effort))
     if not brief.get("_ok"):
         print("  (could not auto-read the program — I'll ask you directly.)")
 
@@ -626,9 +716,10 @@ def _new(args: argparse.Namespace) -> int:
         return 2
 
     cap = "never-stop (until a critical)" if args.max_rounds is None else f"max {args.max_rounds} rounds"
-    print(f"\nHunting {acq.artifact_dir}  (brain: {'claude' if config.use_claude else 'deterministic'}, {cap})\n")
+    print(f"\nHunting {acq.artifact_dir}  (brain: {_brain_label(config)}, {cap})\n")
     result, bb, log, bus, report = asyncio.run(
-        run_engagement(scope, acq.artifact_dir, config=config, rounds=args.max_rounds, live=args.live)
+        run_engagement(scope, acq.artifact_dir, config=config, rounds=args.max_rounds, live=args.live,
+                       report_path=args.report or "")
     )
     print(render_snapshot(log, bb, bus))
     if result is None:
@@ -667,18 +758,48 @@ def _notify(args: argparse.Namespace) -> int:
         ctrl = target.with_name("control.jsonl")
     else:
         ctrl = target
-    if not args.stop and not args.message and not args.paths:
-        print("nothing to send — provide --message and/or --paths, or --stop")
+    if not args.stop and not args.reload and not args.message and not args.paths:
+        print("nothing to send — provide --message and/or --paths, --reload, or --stop")
         return 2
+    kind = "stop" if args.stop else ("reload" if args.reload else "notify")
     rec = {
-        "kind": "stop" if args.stop else "notify",
+        "kind": kind,
         "message": args.message or "",
         "paths": [p.strip() for p in args.paths.split(",")] if args.paths else [],
+    }
+    if args.reload_modules:
+        rec["modules"] = [p.strip() for p in args.reload_modules.split(",") if p.strip()]
+    ctrl.parent.mkdir(parents=True, exist_ok=True)
+    with ctrl.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec) + "\n")
+    print(f"✓ directive queued → {ctrl}\n  {rec}\n(the running hunt picks it up at its next round boundary)")
+    return 0
+
+
+def _triage(args: argparse.Namespace) -> int:
+    """Queue a focused triage directive for one live finding."""
+    target = Path(args.target)
+    if target.is_dir():
+        ctrl = target / "control.jsonl"
+    elif target.name == "events.jsonl":
+        ctrl = target.with_name("control.jsonl")
+    else:
+        ctrl = target
+    if not args.finding and not args.title:
+        print("provide --finding <dedup_key> or --title <finding title>")
+        return 2
+    rec = {
+        "kind": "triage",
+        "finding_key": args.finding or "",
+        "title": args.title or "",
+        "message": args.message or "",
+        "target_agent": args.agent or "parent_a",
+        "action": args.action or "prioritize verifier/prover/deep-dive now",
     }
     ctrl.parent.mkdir(parents=True, exist_ok=True)
     with ctrl.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec) + "\n")
-    print(f"✓ notice queued → {ctrl}\n  {rec}\n(the running hunt picks it up at its next round boundary)")
+    print(f"✓ triage queued → {ctrl}\n  {rec}\n(the running hunt applies it at its next round boundary)")
     return 0
 
 
@@ -686,15 +807,29 @@ def _jumpstart(args: argparse.Namespace) -> int:
     """Operator override for the rate-limit gate. Writes a manual-clear to the shared throttle
     file: any RUNNING hunt that is cooling down picks it up within ~20s and retries immediately.
     If the hunt PROCESS has died, also print the one-liner to resume it from saved state."""
-    from .agents.claude_session import _THROTTLE_FILE, _throttle_remaining
+    from .session_limit import THROTTLE_FILE, jumpstart_if_clear
 
-    try:
-        with open(_THROTTLE_FILE, "w") as fh:
-            json.dump({"throttled": False, "manual": True, "at": time.time()}, fh)
-        print(f"✓ jumpstart sent (throttle file: {_THROTTLE_FILE}).")
-    except OSError as exc:
-        print(f"could not write throttle file: {exc}")
-        return 2
+    eng_dir = None
+    if getattr(args, "engagement", ""):
+        cand = Path(Config.from_env().engagements_root) / str(args.engagement)
+        if cand.is_dir():
+            eng_dir = cand
+    result = jumpstart_if_clear(
+        eng_dir,
+        force=not bool(getattr(args, "check", False)),
+        note="operator cli jumpstart",
+    )
+    state = result.get("state") if isinstance(result.get("state"), dict) else {}
+    if result.get("cleared"):
+        print(f"✓ jumpstart sent (throttle file: {THROTTLE_FILE}).")
+        if result.get("forced"):
+            print("  • forced operator override; the next model attempt will prove whether the limit lifted.")
+    else:
+        rem = state.get("remaining_s")
+        reset = state.get("reset_ts")
+        suffix = f"; reset_ts={reset}" if reset else ""
+        print(f"session limit still appears active (~{rem}s remaining{suffix}); leaving the gate in place.")
+        return 1
     print("  • A running, cooling-down hunt will retry within ~20s.")
     print("  • If the hunt process has DIED, resume it from saved state (no progress lost) with:")
     print("      p1hunt hunt <target> --program <same name> [same flags] --resume")
@@ -706,22 +841,43 @@ def _web(args: argparse.Namespace) -> int:
     return serve(args.host, args.port)
 
 
+def _autopilot(args: argparse.Namespace) -> int:
+    from .autopilot import AutopilotConfig, run_autopilot
+
+    cfg = AutopilotConfig(
+        root=Path(args.root or Config.from_env().engagements_root),
+        interval_s=float(args.interval),
+        candidate_stale_s=float(args.candidate_stale),
+        hunt_stale_s=float(args.hunt_stale),
+        triage_cooldown_s=float(args.triage_cooldown),
+        session_probe_s=float(args.session_probe),
+        host=args.host,
+        port=int(args.port),
+        supervise_web=not args.no_web,
+        resume_hunts=not args.no_resume,
+        include_stopped=bool(args.include_stopped),
+        engagements=list(args.engagement or []),
+        dry_run=bool(args.dry_run),
+        once=bool(args.once),
+    )
+    return run_autopilot(cfg)
+
+
 def _status(_args: argparse.Namespace) -> int:
     config = Config.from_env()
-    from .agents.claude_session import _THROTTLE_FILE, sdk_available
+    from .agents.claude_session import sdk_available
+    from .agents.codex_session import codex_available
+    from .session_limit import session_limit_state
 
+    st = session_limit_state()
     throttle = "clear"
-    try:
-        with open(_THROTTLE_FILE) as fh:
-            d = json.load(fh)
-        if d.get("throttled"):
-            throttle = f"THROTTLED (~{d.get('seconds','?')}s, strike {d.get('strikes','?')}): {d.get('reason','')}"
-    except (OSError, ValueError):
-        pass
+    if st.get("throttled"):
+        throttle = f"THROTTLED (~{st.get('remaining_s','?')}s, strike {st.get('strikes','?')}): {st.get('reason','')}"
     print(f"rate-limit gate: {throttle}")
 
-    print(f"detector brain: {'claude-agent-sdk swarm' if config.use_claude else 'deterministic offline'}")
-    print(f"claude SDK available: {sdk_available()}")
+    print(f"detector brain: {_brain_label(config)}")
+    print(f"codex CLI available: {codex_available()}")
+    print(f"claude SDK available: {sdk_available()} (compatibility engine only)")
     from .tools.build_env import activate_foundry_path, toolchain_available
     activate_foundry_path()  # discover a previously-installed Foundry in ~/.foundry/bin
     forge_ok, anvil_ok = toolchain_available("forge"), toolchain_available("anvil")
@@ -729,7 +885,11 @@ def _status(_args: argparse.Namespace) -> int:
           + ("" if forge_ok else f"  (auto-install: {'on' if config.auto_install_toolchain else 'off — set P1HUNT_AUTO_INSTALL_TOOLCHAIN=1'})"))
     print(f"run_mode: {config.run_mode}")
     print(f"permission_mode: {config.permission_mode} (never 'ask' unattended)")
-    print(f"models: {config.models.orchestrator} / {config.models.worker} / {config.models.warm_pool}")
+    print(f"engine: {config.models.engine} (discovery={config.models.discovery_engine})")
+    if config.models.engine == "codex":
+        print(f"codex: model={config.models.codex_model or 'account-default'} effort={config.models.codex_effort}")
+    else:
+        print(f"models: {config.models.orchestrator} / {config.models.worker} / {config.models.warm_pool}")
     print(f"engagements_root: {config.engagements_root}")
     return 0
 
@@ -753,22 +913,22 @@ def main(argv: list[str] | None = None) -> int:
     demo.add_argument("--report", help="Write the draft report to this path.")
     demo.set_defaults(func=_demo)
 
-    hunt = sub.add_parser("hunt", help="Hunt a REAL target (local path or repo URL) with the Claude swarm.")
+    hunt = sub.add_parser("hunt", help="Hunt a REAL target (local path or repo URL) with the Codex swarm.")
     hunt.add_argument("target", nargs="?", default="",
                       help="Local path to a repo, or a git/GitHub URL to clone. OPTIONAL when you pass "
                            "--program (+ --platform): the swarm then auto-discovers the engagement scope "
                            "and pulls the in-scope source itself.")
-    hunt.add_argument("--program", help="Program/engagement name (e.g. 'Seaport'). With no target, this "
+    hunt.add_argument("--program", help="Program/engagement name (e.g. 'example-program'). With no target, this "
                                         "triggers live auto-scoping from the bounty platform.")
     hunt.add_argument("--platform", default="local",
                       help="Bounty platform to research for auto-scope (bugcrowd|hackerone|immunefi|…).")
     hunt.add_argument("--only", default="",
-                      help="Restrict auto-scope to the in-scope asset matching this (e.g. 'seaport').")
+                      help="Restrict auto-scope to the in-scope asset matching this (e.g. 'core').")
     hunt.add_argument("--url", default="",
                       help="Explicit program/policy URL (skips the discovery search step).")
     hunt.add_argument("--max-rounds", type=int, default=None, dest="max_rounds",
                       help="Optional safety cap. Default: never stop until a critical is confirmed.")
-    hunt.add_argument("--live", action="store_true", help="Stream Claude's reasoning and tool calls live (scrolling).")
+    hunt.add_argument("--live", action="store_true", help="Stream reasoning and tool calls live (scrolling).")
     hunt.add_argument("--tui", action="store_true", help="Interactive cockpit: ↑/↓ switch agents, Blackboard tab, token usage.")
     hunt.add_argument("--report", help="Write the draft report to this path.")
     hunt.add_argument("--out-of-scope", dest="out_of_scope",
@@ -777,8 +937,8 @@ def main(argv: list[str] | None = None) -> int:
                            "the code is used only as a differential oracle.")
     hunt.add_argument("--base-url", dest="base_url",
                       help="Authorized RUNNING instance to test live (UAT/owned/testnet/staging — "
-                           "never production). Enables request-driven hunting for web/API criticals "
-                           "(IDOR/SSRF/auth-bypass). Needs P1HUNT_RUN_MODE=active + agent creds; "
+                           "never production). Enables request-driven hunting for critical web/API "
+                           "attacker wins derived from the engagement. Needs P1HUNT_RUN_MODE=active + agent creds; "
                            "supply test creds via P1HUNT_TOKEN_A / P1HUNT_TOKEN_B env vars.")
     hunt.add_argument("--live-env", dest="live_env", default=None,
                       choices=["uat", "owned", "testnet", "staging", "local", "bounty"],
@@ -786,20 +946,24 @@ def main(argv: list[str] | None = None) -> int:
                            "public bug-bounty program whose safe harbor permits in-scope live testing "
                            "(e.g. T-Mobile on HackerOne). The bare label 'production' is never allowed.")
     hunt.add_argument("--web", action="store_true",
-                      help="Black-box WEB-APP pentest of a live authorized target (XBOW-style): recon the "
-                           "in-scope hosts, hunt IDOR/BOLA, auth bypass, SSRF, injection, business-logic, "
-                           "etc., and prove each against the live target. Implies run_mode=active; pair with "
+                      help="Black-box WEB-APP pentest of a live authorized target: recon the "
+                           "in-scope hosts, derive attacker-win hypotheses from observed app behavior, "
+                           "and prove them against the live target. Implies run_mode=active; pair with "
                            "--program/--platform (auto-scope the in-scope domains) or a target URL/domain.")
     hunt.add_argument("--scope-note", dest="scope_note",
                       help="Rules-of-engagement note surfaced to Parent A and the hunters.")
-    hunt.add_argument("--no-claude", action="store_true", help="Force the deterministic offline brain.")
+    hunt.add_argument("--engine", choices=("codex", "claude"), default=None,
+                      help="AI engine for every workflow role. Default: codex.")
+    hunt.add_argument("--offline", action="store_true", help="Force the deterministic offline brain.")
+    hunt.add_argument("--no-claude", action="store_true",
+                      help="Legacy alias for --offline.")
     hunt.add_argument("--claude-account", dest="claude_account", choices=("c5", "c20"), default=None,
                       help="Which logged-in Claude account to use (CLAUDE_CONFIG_DIR): c5=Max 5x "
                            "(~/.claude-5x), c20=Max 20x (~/.claude-20x). Use a fresh-quota account.")
     hunt.add_argument("--discovery-engine", dest="discovery_engine", choices=("claude", "codex"), default=None,
-                      help="Which model drives the HUNTERS (discovery). 'claude' (default) or 'codex' "
-                           "(GPT-5.5-Codex at xhigh reasoning — a second strong model to widen what gets "
-                           "found). Verification/PoC/depth always stay on Claude. Needs the `codex` CLI.")
+                      help="Advanced override for discovery hunters only. For legacy commands, "
+                           "--discovery-engine codex now promotes the whole run to engine=codex unless "
+                           "--engine is also supplied.")
     hunt.add_argument("--auto-install-toolchain", dest="auto_install_toolchain", action="store_true",
                       help="Install Foundry (forge/anvil) if missing so the reproduction gate can actually "
                            "fire — the biggest unblocker for confirmed criticals on EVM targets.")
@@ -815,7 +979,7 @@ def main(argv: list[str] | None = None) -> int:
     new.add_argument("--report", help="Write the draft report to this path.")
     new.set_defaults(func=_new)
 
-    watch = sub.add_parser("watch", help="Claude-Code-style live/replay viewer of a hunt (agent transcripts + blackboard).")
+    watch = sub.add_parser("watch", help="Live/replay viewer of a hunt (agent transcripts + blackboard).")
     watch.add_argument("target", help="Engagement folder or events.jsonl path.")
     watch.add_argument("--follow", "-f", action="store_true", help="Tail the run live (Ctrl-C to stop).")
     watch.add_argument("--tui", action="store_true", help="Interactive cockpit: ↑/↓ switch agents, Blackboard tab, token usage.")
@@ -823,10 +987,25 @@ def main(argv: list[str] | None = None) -> int:
 
     notify = sub.add_parser("notify", help="Send a live notice to a RUNNING hunt (e.g. new code is available) without restarting it.")
     notify.add_argument("target", help="Engagement folder or events.jsonl path of the running hunt.")
-    notify.add_argument("--message", "-m", help="Notice text for the agents (e.g. 'production code is now at lib/seaport-core/src/lib — hunt it').")
+    notify.add_argument("--message", "-m", help="Notice text for the agents (e.g. 'production code is now under src/core — hunt it').")
     notify.add_argument("--paths", help="Comma-separated new-code paths to highlight to the agents.")
+    notify.add_argument("--reload", action="store_true",
+                        help="Hot-reload safe runtime modules at the next round boundary without restarting.")
+    notify.add_argument("--reload-modules",
+                        help="Advanced: comma-separated p1hunt.* module names to reload instead of the default safe set.")
     notify.add_argument("--stop", action="store_true", help="Tell the running hunt to stop after the current round.")
     notify.set_defaults(func=_notify)
+
+    triage = sub.add_parser("triage", help="Prioritize verifier/prover/deep-dive on a live finding in a running hunt.")
+    triage.add_argument("target", help="Engagement folder or events.jsonl path of the running hunt.")
+    triage.add_argument("--finding", help="Finding dedup_key from live_findings.json/findings.json.")
+    triage.add_argument("--title", help="Finding title when a dedup_key is not available.")
+    triage.add_argument("--message", "-m", help="Operator note to include with the triage directive.")
+    triage.add_argument("--agent", default="parent_a",
+                        help="Service to target next: parent_a, falsifier, poc_prover, exploit_developer, debate, or *.")
+    triage.add_argument("--action", default="prioritize verifier/prover/deep-dive now",
+                        help="Specific action/directive for Parent A to pass to that service.")
+    triage.set_defaults(func=_triage)
 
     status = sub.add_parser("status", help="Show detector brain, run mode, models, rate-limit gate, and config.")
     status.set_defaults(func=_status)
@@ -836,7 +1015,34 @@ def main(argv: list[str] | None = None) -> int:
     web.add_argument("--port", type=int, default=8787)
     web.set_defaults(func=_web)
 
+    autop = sub.add_parser("autopilot", help="Run the autonomous operations loop: web uptime, candidate triage, and hunt resume.")
+    autop.add_argument("--root", default="", help="engagements root (default from P1HUNT_ENGAGEMENTS or ./engagements)")
+    autop.add_argument("--interval", type=float, default=30.0, help="seconds between supervisor passes")
+    autop.add_argument("--candidate-stale", type=float, default=900.0,
+                       help="seconds before an active candidate state is considered stuck")
+    autop.add_argument("--hunt-stale", type=float, default=600.0,
+                       help="seconds after the last event before a dead hunt is eligible for --resume")
+    autop.add_argument("--triage-cooldown", type=float, default=600.0,
+                       help="minimum seconds before repeating the same triage directive")
+    autop.add_argument("--session-probe", type=float, default=300.0,
+                       help="seconds between safe session-limit recovery checks")
+    autop.add_argument("--host", default="127.0.0.1", help="dashboard bind host when web supervision starts it")
+    autop.add_argument("--port", type=int, default=8787, help="dashboard port when web supervision starts it")
+    autop.add_argument("--engagement", action="append", default=[],
+                       help="engagement folder name to supervise; repeat or comma-separate to pin autopilot")
+    autop.add_argument("--include-stopped", action="store_true",
+                       help="also triage stopped/archive engagements that are not active or resumable")
+    autop.add_argument("--no-web", action="store_true", help="do not supervise/start the dashboard")
+    autop.add_argument("--no-resume", action="store_true", help="do not resume dead/stale hunts")
+    autop.add_argument("--dry-run", action="store_true", help="print/write autopilot state but do not spawn or append control directives")
+    autop.add_argument("--once", action="store_true", help="run one supervisor pass and exit")
+    autop.set_defaults(func=_autopilot)
+
     jump = sub.add_parser("jumpstart", help="Override the rate-limit cooldown: tell a waiting hunt to retry NOW (and print how to resume a dead one).")
+    jump.add_argument("--check", action="store_true",
+                      help="only clear the gate if the stored cooldown/reset evidence says retrying is due")
+    jump.add_argument("--engagement", default="",
+                      help="engagement folder name to inspect for model reset notices when using --check")
     jump.set_defaults(func=_jumpstart)
 
     args = parser.parse_args(argv)

@@ -13,6 +13,8 @@ def _scope() -> Scope:
     return Scope(
         program="P", safe_harbor_text="x", severity_taxonomy={"P1": "critical"},
         in_scope=[Asset("a1", "https://uat.example.com", "domain", "https://uat.example.com", "uat")],
+        out_of_scope_globs=["reference/*"],
+        scope_note="Engagement-specific reward table and scope note.",
         dynamic_targets=[DynamicTarget("https://uat.example.com", "uat", "rest")],
         test_identities=[TestIdentity("A", token_env="P1HUNT_TOKEN_A"),
                          TestIdentity("B", token="literal-secret")],
@@ -32,6 +34,8 @@ class TestPersistence(unittest.TestCase):
         self.assertEqual(len(s2.dynamic_targets), 1)
         self.assertEqual(s2.dynamic_targets[0].base_url, "https://uat.example.com")
         self.assertEqual([i.name for i in s2.test_identities], ["A", "B"])
+        self.assertEqual(s2.out_of_scope_globs, ["reference/*"])
+        self.assertEqual(s2.scope_note, "Engagement-specific reward table and scope note.")
 
     def test_redacted_token_not_used_as_credential(self):
         s2 = scope_from_dict(scope_to_dict(_scope()))

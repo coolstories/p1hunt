@@ -1,20 +1,4 @@
-"""Tests for the EVM detection wiring + the "there IS a P1, find it" persistence stance.
-
-These lock in the fix for the gap where hardened, assembly-heavy EVM targets (e.g. a
-battle-tested exchange like Seaport) were effectively un-scanned: the run path used the
-generic ``scan_artifacts`` alone, so the Solidity-aware detectors never fired, and the
-deterministic reasoner auto-killed any candidate sitting next to a guard token — the
-pessimistic "probably nothing here" prior. The new behaviour:
-
-* ``scan_combined`` merges generic + EVM detectors and demotes keyword noise on hardened code;
-* it is wired into both ``derive_plan`` and ``ParentA``;
-* the reasoner treats hardened-EVM primitives as leads that PERSIST (a nearby guard does not
-  neutralize a low-level primitive class) while keeping the strict kill for generic web sinks;
-* the deterministic hunt surfaces every signal as a ranked P1 candidate (total observability),
-  and confirms a critical on a hardened target where it previously found nothing.
-
-Pure-logic + deterministic end-to-end only: no network, no Claude SDK, no Foundry.
-"""
+"""Tests for static detector utilities and preset-free planner wiring."""
 
 from __future__ import annotations
 
@@ -124,18 +108,18 @@ class ScanCombined(unittest.TestCase):
             self.assertIn("secret-in-source", {h.signal.id for h in non_sol})
 
 
-class DerivationUsesEvmLens(unittest.TestCase):
-    def test_plan_surfaces_reflect_evm_signals(self) -> None:
+class DerivationIsPresetFree(unittest.TestCase):
+    def test_plan_surfaces_are_neutral_components_not_signal_lenses(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             _write(Path(d), "contracts/Exchange.sol", _HARDENED_SOL)
             scope = build_scope("evm-derive-test", d)
             plan = derive_plan(scope, d)
             self.assertEqual(plan.target_class, TargetClass.EVM_CONTRACT)
-            # The ranked surfaces are derived from real EVM signal lenses, not the BASELINE stub.
-            ids = {s.id for s in plan.surface_ranking}
-            self.assertNotEqual(ids, {"SURF-BASELINE"})
             lenses = {s.lens for s in plan.surface_ranking}
-            self.assertTrue(lenses & {"asset-custody", "authorization-boundary", "trusted-execution"})
+            self.assertTrue(lenses)
+            self.assertTrue(all(lens.startswith("component:") for lens in lenses))
+            self.assertFalse(lenses & {"asset-custody", "authorization-boundary", "trusted-execution"})
+            self.assertEqual(plan.hypothesis_seeds, [])
 
 
 class ReasonerProfiles(unittest.TestCase):
@@ -196,7 +180,9 @@ class HardenedTargetEndToEnd(unittest.TestCase):
             repo = Path(tmp) / "exchange"
             _write(repo, "contracts/Exchange.sol", _HARDENED_SOL)
             prev = os.environ.get("P1HUNT_USE_CLAUDE")
+            prev_static = os.environ.get("P1HUNT_LEGACY_STATIC_SIGNALS")
             os.environ["P1HUNT_USE_CLAUDE"] = "0"  # force the deterministic brain
+            os.environ["P1HUNT_LEGACY_STATIC_SIGNALS"] = "1"
             try:
                 cfg = Config.from_env()
                 cfg.engagements_root = str(Path(tmp) / "eng")
@@ -207,6 +193,10 @@ class HardenedTargetEndToEnd(unittest.TestCase):
                     os.environ.pop("P1HUNT_USE_CLAUDE", None)
                 else:
                     os.environ["P1HUNT_USE_CLAUDE"] = prev
+                if prev_static is None:
+                    os.environ.pop("P1HUNT_LEGACY_STATIC_SIGNALS", None)
+                else:
+                    os.environ["P1HUNT_LEGACY_STATIC_SIGNALS"] = prev_static
             self.assertEqual(result.plan.target_class, TargetClass.EVM_CONTRACT)
             self.assertTrue(result.confirmed_critical, "a hardened EVM target must yield a confirmed P1")
             self.assertEqual(result.status, EngagementStatus.REPORT_READY)
@@ -217,15 +207,14 @@ class HardenedTargetEndToEnd(unittest.TestCase):
 
 
 class HunterPromptLeads(unittest.TestCase):
-    def test_static_leads_render_into_prompt(self) -> None:
+    def test_static_leads_do_not_render_into_prompt(self) -> None:
         from p1hunt.agents.claude_hunter import hunt_prompt
 
         leads = ["ecrecover used without a zero-address / signer check — contracts/Exchange.sol:9 "
                  "(lens: authorization-boundary; class: evm-bare-ecrecover)"]
         prompt = hunt_prompt("asset-custody", "loss of funds", 1, [], None, None, static_leads=leads)
-        self.assertIn("DERIVED STATIC LEADS", prompt)
-        self.assertIn("evm-bare-ecrecover", prompt)
-        # No leads -> no block (and no crash).
+        self.assertNotIn("DERIVED STATIC LEADS", prompt)
+        self.assertNotIn("evm-bare-ecrecover", prompt)
         self.assertNotIn("DERIVED STATIC LEADS", hunt_prompt("x", "y", 1, [], None, None))
 
 
@@ -241,7 +230,7 @@ class SwarmStaticLeads(unittest.TestCase):
                            config=Config.from_env(), bus=MessageBus(log),
                            blackboard=Blackboard(log), event_log=log)
 
-    def test_leads_filtered_to_focus_and_formatted(self) -> None:
+    def test_static_leads_disabled_even_when_scanner_has_hits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             _write(repo, "contracts/Exchange.sol", _HARDENED_SOL)
@@ -251,10 +240,7 @@ class SwarmStaticLeads(unittest.TestCase):
             swarm._scan_hits = scan_combined(str(repo))
             self.assertTrue(swarm._scan_hits)
             leads = swarm._static_leads_for(["contracts/Exchange.sol"])
-            self.assertTrue(leads)
-            # Focus filtering keeps only the focused file's leads.
-            self.assertTrue(all("contracts/Exchange.sol" in ln for ln in leads))
-            self.assertTrue(all("class:" in ln for ln in leads))
+            self.assertEqual(leads, [])
 
     def test_out_of_scope_leads_excluded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,9 +251,32 @@ class SwarmStaticLeads(unittest.TestCase):
             # Mark the reference impl out of scope (a differential oracle, never reported).
             swarm.scope.out_of_scope_globs = ["reference/*"]
             swarm._scan_hits = scan_combined(str(repo))
-            leads = swarm._static_leads_for([])  # no focus -> strongest overall
-            self.assertTrue(leads)
-            self.assertFalse(any("reference/" in ln for ln in leads))
+            leads = swarm._static_leads_for([])
+            self.assertEqual(leads, [])
+
+
+class LegacyParentStaticSignals(unittest.TestCase):
+    def test_legacy_parent_does_not_load_static_signals_by_default(self) -> None:
+        from p1hunt.agents.parent_a import ParentA
+        from p1hunt.orchestrator.blackboard import Blackboard
+        from p1hunt.orchestrator.bus import MessageBus
+        from p1hunt.orchestrator.event_log import EventLog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _write(repo, "contracts/Exchange.sol", _HARDENED_SOL)
+            prev = os.environ.pop("P1HUNT_LEGACY_STATIC_SIGNALS", None)
+            try:
+                log = EventLog()
+                parent = ParentA(build_scope("no-static-default", str(repo)), str(repo),
+                                 config=Config.from_env(), bus=MessageBus(log),
+                                 blackboard=Blackboard(log), event_log=log)
+                parent.derive()
+                parent.setup_tracks()
+                self.assertEqual(parent._hits, [])
+            finally:
+                if prev is not None:
+                    os.environ["P1HUNT_LEGACY_STATIC_SIGNALS"] = prev
 
 
 if __name__ == "__main__":

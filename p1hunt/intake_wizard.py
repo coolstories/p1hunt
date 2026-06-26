@@ -70,7 +70,7 @@ def run_wizard() -> tuple[Scope, list[str]] | None:
             kind = "graphql" if "graphql" in base_url.lower() else "rest"
             dynamic_targets.append(DynamicTarget(base_url=base_url, environment=live_env, kind=kind))
             print("  Provide two test principals' tokens via env vars (NOT typed here): "
-                  "P1HUNT_TOKEN_A and P1HUNT_TOKEN_B (the core of IDOR/BOLA testing).")
+                  "P1HUNT_TOKEN_A and P1HUNT_TOKEN_B (for cross-principal proof harnesses).")
             for nm in ("A", "B"):
                 if _ask(f"  Will P1HUNT_TOKEN_{nm} be set for principal {nm}? (yes/no)", "yes").lower() in ("y", "yes"):
                     test_identities.append(TestIdentity(name=nm, token_env=f"P1HUNT_TOKEN_{nm}"))

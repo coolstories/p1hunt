@@ -1,23 +1,38 @@
-"""The optional Codex (GPT-5.5-Codex xhigh) discovery engine: config wiring, the CodexSession
-command/stream contract, and the hunter's engine factory. No Codex CLI is spawned."""
+"""Codex engine wiring: config defaults, CodexSession command/stream contract, and the hunter's
+engine factory. No Codex CLI is spawned."""
 
+import json
 import os
+import tempfile
+import time
 import unittest
+from pathlib import Path
 
 from p1hunt.config import Config
-from p1hunt.agents.codex_session import CodexSession, codex_available
+from p1hunt.agents.codex_session import (
+    CodexSession,
+    codex_available,
+    _looks_output_overflow,
+    _progress_for_command,
+    _progress_target,
+    _with_io_discipline,
+)
 from p1hunt.agents.claude_session import ClaudeSession
 from p1hunt.agents.claude_hunter import ClaudeHunter
 
 
 class TestConfigSelector(unittest.TestCase):
     def tearDown(self):
-        for k in ("P1HUNT_DISCOVERY_ENGINE", "P1HUNT_CODEX_MODEL", "P1HUNT_CODEX_EFFORT"):
+        for k in ("P1HUNT_ENGINE", "P1HUNT_DISCOVERY_ENGINE", "P1HUNT_CODEX_MODEL",
+                  "P1HUNT_CODEX_EFFORT", "P1HUNT_USE_AGENT", "P1HUNT_USE_CLAUDE"):
             os.environ.pop(k, None)
 
-    def test_default_is_claude(self):
+    def test_default_is_codex(self):
+        os.environ.pop("P1HUNT_ENGINE", None)
         os.environ.pop("P1HUNT_DISCOVERY_ENGINE", None)
-        self.assertEqual(Config.from_env().models.discovery_engine, "claude")
+        m = Config.from_env().models
+        self.assertEqual(m.engine, "codex")
+        self.assertEqual(m.discovery_engine, "codex")
 
     def test_env_selects_codex_and_params(self):
         os.environ["P1HUNT_DISCOVERY_ENGINE"] = "codex"
@@ -28,9 +43,9 @@ class TestConfigSelector(unittest.TestCase):
         self.assertEqual(m.codex_model, "gpt-5.5-codex")
         self.assertEqual(m.codex_effort, "xhigh")
 
-    def test_garbage_engine_falls_back_to_claude(self):
+    def test_garbage_discovery_engine_falls_back_to_global_codex(self):
         os.environ["P1HUNT_DISCOVERY_ENGINE"] = "gpt4"
-        self.assertEqual(Config.from_env().models.discovery_engine, "claude")
+        self.assertEqual(Config.from_env().models.discovery_engine, "codex")
 
 
 class TestCodexCommand(unittest.TestCase):
@@ -44,6 +59,7 @@ class TestCodexCommand(unittest.TestCase):
         self.assertIn("gpt-5.5-codex", cmd)
         self.assertIn('model_reasoning_effort="xhigh"', cmd)
         self.assertIn("workspace-write", cmd)              # OS sandbox jail
+        self.assertIn("--add-dir", cmd)                    # user-local tooling roots for safe installs
         self.assertIn("/work/repo", cmd)                   # --cd workspace
         self.assertIn("/tmp/last.txt", cmd)
 
@@ -60,6 +76,12 @@ class TestCodexCommand(unittest.TestCase):
             allow_network = True
         on = CodexSession(agent_name="a", allow_web=True, perms=_Perms())._build_cmd("/r", "/t")
         self.assertIn("sandbox_workspace_write.network_access=true", on)
+
+    def test_install_off_omits_user_local_write_roots(self):
+        class _Perms:
+            allow_install = False
+        cmd = CodexSession(agent_name="a", perms=_Perms())._build_cmd("/r", "/t")
+        self.assertNotIn("--add-dir", cmd)
 
 
 class TestCodexStreamMapping(unittest.TestCase):
@@ -80,6 +102,26 @@ class TestCodexStreamMapping(unittest.TestCase):
         self.assertIn("output", kinds)
         self.assertEqual(s.tool_calls, 1)
         self.assertIn("final answer", "".join(acc))
+
+    def test_command_events_emit_operator_progress(self):
+        s = self._session()
+        acc = []
+        line = json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "nl -ba src/common/cosigner/mta.cpp | sed -n '1125,1285p'",
+            },
+        })
+        s._handle_line(line, acc)
+        messages = [d for k, d in self.events if k == "message"]
+        self.assertTrue(any(d.get("phase") == "progress" for d in messages))
+        self.assertTrue(any("mta.cpp" in d.get("detail", "") for d in messages))
+
+    def test_progress_helpers_describe_observable_work(self):
+        self.assertIn("searching", _progress_for_command("rg -n 'verify' src/common"))
+        self.assertIn("reading source window", _progress_for_command("sed -n '1,120p' include/cosigner/types.h"))
+        self.assertEqual(_progress_target("nl -ba src/x.cpp | sed -n '1,80p'"), "src/x.cpp")
 
     def test_error_event_is_captured(self):
         s = self._session()
@@ -130,14 +172,73 @@ class TestModelFailover(unittest.TestCase):
         self.assertEqual(self.cs._err_kind("model not supported"), "auth")
         self.assertEqual(self.cs._err_kind("random failure"), "")
 
+    def test_output_overflow_is_classified_separately_from_rate_limit(self):
+        self.assertTrue(_looks_output_overflow("Separator is found, but chunk is longer than limit"))
+        self.assertTrue(_looks_output_overflow("Separator is not found, and chunk exceed the limit"))
+        self.assertFalse(_looks_output_overflow("You've hit your usage limit"))
+
+    def test_io_discipline_enforces_reasoned_bounded_code_reads(self):
+        wrapped = _with_io_discipline("hunt this code", retry=True)
+        self.assertIn("Reason your way to the code", wrapped)
+        self.assertIn("Cite shipped file:line", wrapped)
+        self.assertIn("No command may print more than about 120 lines", wrapped)
+        self.assertEqual(wrapped.count("P1HUNT HARD IO"), 1)
+
+
+class TestCodexJumpstart(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import p1hunt.agents.codex_session as cs
+        from p1hunt import session_limit
+        self.cs = cs
+        self.session_limit = session_limit
+        self.old_throttle = session_limit.THROTTLE_FILE
+        self.tmp = tempfile.TemporaryDirectory()
+        session_limit.THROTTLE_FILE = Path(self.tmp.name) / "throttle.json"
+        cs._MODEL_COOLDOWN.clear()
+
+    def tearDown(self):
+        self.cs._MODEL_COOLDOWN.clear()
+        self.session_limit.THROTTLE_FILE = self.old_throttle
+        self.tmp.cleanup()
+
+    def test_stale_manual_clear_is_ignored(self):
+        self.session_limit.THROTTLE_FILE.write_text(json.dumps({
+            "throttled": False,
+            "manual": True,
+            "at": 1000.0,
+        }), encoding="utf-8")
+        self.assertFalse(self.cs._operator_jumpstart_requested(1001.0))
+
+    async def test_manual_clear_cuts_codex_cooldown_immediately(self):
+        events = []
+        self.session_limit.THROTTLE_FILE.write_text(json.dumps({
+            "throttled": False,
+            "manual": True,
+            "at": time.time(),
+        }), encoding="utf-8")
+        self.cs._mark_cooldown("", 240)
+        s = self.cs.CodexSession(agent_name="poc_prover",
+                                 on_event=lambda a, k, d: events.append((a, k, d)))
+        slept = await s._await_cooldown_or_jumpstart(60)
+        self.assertLess(slept, 1.0)
+        self.assertEqual(self.cs.model_cooldowns(), {})
+        self.assertTrue(any(d.get("event") == "model_status" and d.get("state") == "available"
+                            for _a, _k, d in events))
+
 
 class TestHunterFactory(unittest.TestCase):
     def _hunter(self):
         return ClaudeHunter("child_b1", theme="signing", model="claude-opus-4-8",
                             on_event=lambda *a: None, guard_check=lambda *a: (True, "ok"))
 
-    def test_default_engine_is_claude_session(self):
-        self.assertIsInstance(self._hunter()._make_session(10), ClaudeSession)
+    def test_default_engine_is_codex_session(self):
+        os.environ.pop("P1HUNT_ENGINE", None)
+        self.assertIsInstance(self._hunter()._make_session(10), CodexSession)
+
+    def test_explicit_claude_engine_yields_claude_session(self):
+        h = self._hunter()
+        h.discovery_engine = "claude"
+        self.assertIsInstance(h._make_session(10), ClaudeSession)
 
     def test_codex_engine_yields_codex_session(self):
         h = self._hunter()

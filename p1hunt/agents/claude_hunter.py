@@ -1,16 +1,56 @@
-"""Claude-backed hunting + adversarial verification (spec §7, §10).
+"""Prompt-role wrappers for hunting + adversarial verification (spec §7, §10).
 
 NOTHING PRESET (§1, §2). Child B is NOT handed a hardcoded checklist or per-class playbook.
 It hunts on a track whose theme, focus files, and investigation questions were *derived by
 Parent A* from a cold reconnaissance of this specific target. The only fixed parts are
 generic methodology (read the real code thoroughly, cite file:line, prefer a reproducible
-critical) — no knowledge of the target or its bugs is injected. The Falsifier is a real
-Claude session with the opposite prior that tries to refute each candidate.
+critical) — no knowledge of the target or its bugs is injected. The runtime engine is selected
+through ``make_session``; Codex is the default for every role.
 """
 
 from __future__ import annotations
 
 from .claude_session import ClaudeFinding, ClaudeSession, EventEmit, SessionResult, make_session, parse_ruled_out
+
+
+_ATTRIBUTION_GATE = """ATTRIBUTION GATE (applies to EVERY finding):
+The root cause must be owned by the in-scope target under test. A harness may drive the target, mock
+neighbors, create fixtures, choose hostile inputs, or simulate protocol peers, but the DEFECT cannot
+be in the harness, mock, fixture, scaffold, local test config, fake service, external dependency not
+shipped/pinned by the target, operator account setup, deployment assumption, or an integrator-only
+implementation/obligation. If the exploit only works because of behavior you supplied outside the
+target, it is NOT a confirmed target finding; report it as a candidate/blocker.
+
+For every finding/proof, explicitly separate:
+- target_code_attribution: the exact in-scope target behavior/file:line/endpoint that is defective.
+- non_target_attribution: what the harness/mocks/fixtures/external setup did, and why that is not
+  the defect.
+- relies_on_non_target_behavior: true if the attacker win depends on non-target behavior or an
+  assumption outside the target; those cannot be promoted as confirmed target bugs."""
+
+
+_FINDING_CLAIM_JSON = '''"finding_claim": {"attacker_model": "who the attacker is under the program trust model",
+    "attacker_controls": "inputs/calls/roles/material the attacker controls",
+    "attacker_does_not_control": "honest secret/resource/authorization/state the attacker does NOT control",
+    "trust_boundary": "the target trust boundary crossed",
+    "honest_victim": "the honest party/account/key/tenant/resource owner harmed",
+    "honest_secret_or_resource": "the protected secret/resource/authority defeated",
+    "precommitted_value": "valuable target state that existed before the exploit",
+    "victim_state_before": "victim/protected state before exploit",
+    "victim_state_after": "victim/protected state after exploit",
+    "absent_bug_expected_behavior": "what target code should have done without the bug",
+    "loss_type": "funds|data|control|availability|none",
+    "exploit_path": "short end-to-end attacker path from input to victim-state delta"}'''
+
+
+def _engine_kwargs(owner, *, discovery: bool = False) -> dict:
+    """Return explicit engine args for a prompt-role wrapper."""
+    engine = getattr(owner, "discovery_engine", None) if discovery else getattr(owner, "engine", None)
+    return {
+        "engine": engine,
+        "effort": getattr(owner, "codex_effort", None),
+        "codex_model": getattr(owner, "codex_model", None),
+    }
 
 
 def hunt_prompt(
@@ -42,31 +82,24 @@ def hunt_prompt(
     )
     web_block = (
         "\n\nWEB (limited — for TECHNIQUE, never the answer): you MAY use WebSearch/WebFetch to "
-        "understand the SPEC, a cryptographic/protocol PRIMITIVE, or a known ATTACK CLASS for this "
-        "kind of system, to sharpen HOW you attack. The web does NOT contain the bug for THIS "
-        "target — do NOT search for this program's disclosed bugs/CVEs/'<product> vulnerabilities', "
-        "and do NOT use the web as somewhere to go when stuck. A few searches at most; then return "
-        "to the code. The vulnerability is found in the ACTUAL code, by YOU."
+        "understand the SPEC, a cryptographic/protocol PRIMITIVE, public API behavior, or tooling "
+        "needed to read this system correctly. The web does NOT contain the bug for THIS "
+        "target — do NOT search for this program's prior disclosures/CVEs/'<product> vulnerabilities', "
+        "do NOT research historical vulnerability classes for the target or its peers, and do NOT "
+        "use the web as somewhere to go when stuck. A few searches at most; then return to the code. "
+        "The vulnerability is found in the ACTUAL code, by YOU."
         if allow_web else ""
     )
-    leads_block = (
-        "\n\n🔬 DERIVED STATIC LEADS (high-value bug-CLASS primitives a Solidity-aware scan found in "
-        "the actual code — these are starting points DERIVED from this target, not a checklist and "
-        "MAYBE WRONG; for each, reason whether it is reachable with its guard's assumption violated, "
-        "then PROVE or kill it):\n  - " + "\n  - ".join(static_leads[:12])
-        if static_leads else ""
-    )
+    # Preset-free mode: callers may keep passing this argument for API compatibility, but static
+    # scanner hits are never rendered into the hunter prompt. Parent A must derive all real leads.
+    leads_block = ""
     inv_block = (
         "\n\nINVARIANTS your subsystem MUST uphold (your job is to BREAK one — each is a concrete "
         "property a test/fuzzer can check):\n  - " + "\n  - ".join(invariants[:8])
         if invariants else ""
     )
-    pattern_block = (
-        "\n\n🧬 KNOWN BUG PATTERNS (from this protocol's history + its class — the old bugs are "
-        "patched; hunt for a NEW VARIANT of each pattern in THIS code):\n  - "
-        + "\n  - ".join(known_patterns[:10])
-        if known_patterns else ""
-    )
+    # Preset-free mode: never render known failure-pattern feeds into hunter prompts.
+    pattern_block = ""
     steer = (
         f"\n\n🧭 YOUR LEAD (Parent A) REVIEWED THE TEAM'S PROGRESS AND GIVES YOU THIS DIRECTIVE "
         f"FOR THIS ROUND — follow it:\n{directive.strip()}"
@@ -188,20 +221,25 @@ fuzzer owns that search); reach for a quick property or differential check yours
 reasoning points at one specific invariant worth searching around — do NOT turn your own session
 into a blind fuzzing loop. Prefer ONE reasoned, PoC-proven critical over many shallow notes.
 
-CONTEXT DISCIPLINE (critical — your context window is limited and you WILL stall if you fill it):
+CONTEXT + TOKEN DISCIPLINE (critical — your context window is limited and you WILL stall if you fill it):
 do NOT read large files into your own session. To study any file beyond a one-line grep, DISPATCH
 A SUB-AGENT (the Agent/Task tool): tell it exactly what to read and to return ONLY the relevant
 functions, line numbers, and logic for your hypothesis — then reason over its short summary.
 Read directly yourself ONLY for tiny targeted confirmations (grep to find the line, then Read a
 <=60-line window with offset/limit). Keep YOUR context lean for forming hypotheses, writing the
-PoC, and the final report — never re-read whole files you've already seen.
+PoC, and the final report — never re-read whole files you've already seen. Your `model_update`
+must be compact working memory, not a transcript: keep cited entrypoints, state/trust boundaries,
+attacker-controlled inputs, invariants, open attack threads, PoC/blockers, and new deltas only.
+Do not paste source code, command output, or repeated prose into `model_update`.
 
-As soon as you develop a CREDIBLE LEAD or suspected finding — even before you are 100% certain —
-call the post_finding tool to record it to the shared blackboard (write-only; you cannot read it
-back), then keep digging. Don't sit on leads: the Falsifier and the PoC prover downstream sort
-real bugs from intended/guarded behavior and retract the false ones, so it is SAFE and expected to
-post anything genuinely suspicious (medium confidence or higher) with its in-scope file:line — not
-only slam-dunk criticals. Always also include every finding in your final JSON below.
+As soon as you develop a CREDIBLE LEAD with concrete evidence, call the post_finding tool to record
+it to the shared blackboard (write-only; you cannot read it back), then keep digging. Do NOT post a
+bare hunch: first do a focused depth check, cite the exact sink/endpoint/file:line, try the smallest
+safe PoC/escalation path you can, and state what still blocks confirmed-critical status. The
+blackboard post is a CANDIDATE for Parent A's verifier/prover/deep-dive pipeline, not a confirmed
+finding. Always also include every finding in your final JSON below.
+
+{_ATTRIBUTION_GATE}
 
 Report ONLY a JSON object (no prose) with two keys:
 {{"findings": [{{"title": "...", "severity": "critical|high|medium", "lens": "{theme}",
@@ -213,14 +251,17 @@ Report ONLY a JSON object (no prose) with two keys:
    "remediation": "the specific fix for THIS root cause (one line, derived from the code — not generic)",
    "confidence": "high|medium|low",
    "poc": "path to the PoC you wrote under {poc_reldir} + the command to run it + what running it showed (the proof) — or 'static' if you could not yet run one",
-   "evidence": "the exact code/flow + PoC run output that proves it"}}],
+   "evidence": "the exact code/flow + PoC run output that proves it",
+	   "target_code_attribution": "the in-scope target-owned behavior/file:line/endpoint that is actually defective",
+	   "non_target_attribution": "what your harness/mocks/fixtures/external setup supplied, and why that is not the defect",
+	   "relies_on_non_target_behavior": false,
+	   "attribution_notes": "one sentence separating target-owned defect from test harness/setup assumptions",
+	   {_FINDING_CLAIM_JSON}}}],
  "ruled_out": ["<one short line: what you investigated and why it is NOT exploitable — so the "
                "next pass skips it>", "..."],
- "model_update": "<your DEEPENED model of this subsystem to carry into the next round — the same "
-                 "structure as the model above, updated with everything you learned this pass "
-                 "(entrypoints, state, assumptions, attacks tried + outcomes, open threads, current "
-                 "best hypothesis). This is your memory; write it so next round starts where you "
-                 "ended, not from scratch.>"}}
+ "model_update": "<compact carried-forward memory, max ~5000 chars: cited entrypoints/state/trust "
+                 "boundaries/attacker inputs/invariants, attacks tried + outcomes, open threads, "
+                 "current best hypothesis, and exact blockers. Deltas only; no pasted source/output.>"}}
 "findings" may be [] if you found nothing solid. ALWAYS fill "ruled_out" with what you checked
 this pass, AND ALWAYS fill "model_update" so future passes go DEEPER instead of re-deriving."""
 
@@ -250,7 +291,7 @@ def web_hunt_prompt(
     urls = "\n  - ".join(base_urls) if base_urls else "(see the scope)"
     ids = ", ".join(identities) if identities else "none supplied (set P1HUNT_TOKEN_A / P1HUNT_TOKEN_B to test authz)"
     oob = ("An OOB listener is RUNNING — use p1hunt_dyn.oob_url(token)/oob_received(token) to CONFIRM "
-           "blind SSRF/XXE/injection (the proof is the target calling back)."
+           "callback-based behavior (the proof is the target calling back)."
            if oob_available else "No OOB listener this run — prefer in-band proofs.")
     prior = ("\nAlready reported (do not repeat): " + "; ".join((prior_titles or [])[:12])) if prior_titles else ""
     rl = ("\nAlready RULED OUT (skip): " + "; ".join((ruled_out or [])[:14])) if ruled_out else ""
@@ -277,9 +318,9 @@ SAFE HARBOR — NON-NEGOTIABLE (you are a guest on a real system):
 
 YOUR TOOLBELT:
  - A scope-ENFORCED HTTP client is shipped into ./{poc_reldir}/p1hunt_dyn.py — `from p1hunt_dyn import
-   Client`. It gives multi-identity sessions (auth as A vs B — the core of IDOR/BOLA), differential
-   authz helpers (idor_probe / assert_forbidden), injection oracles (timing/boolean/reflection), and
-   OOB confirmation. Every request it makes is scope-checked. PREFER it for proofs.
+   Client`. It gives multi-identity sessions, differential refusal helpers, input-behavior oracles
+   (timing/boolean/reflection), and OOB confirmation. Every request it makes is scope-checked.
+   PREFER it for proofs.
  - You may INSTALL and run standard recon/attack tooling, but ONLY against in-scope hosts and
    rate-limited: httpx, nuclei (with safe templates), ffuf/feroxbuster (gentle), katana/gau/waybackurls
    (endpoint discovery), subfinder/amass (subdomain enum — keep results in-scope), gf, jwt_tool, sqlmap
@@ -291,31 +332,28 @@ METHOD — RECON → MODEL → ATTACK-TO-WIN → PROVE (spend most effort on att
     JS bundles (extract API routes, hidden endpoints, secrets/keys), error pages, headers, CORS.
     Build a concrete map: for each endpoint — who SHOULD be allowed to do what, and what
     object IDs / tenants / roles exist.
- 2. For the '{theme}' angle, BECOME THE ATTACKER and hunt attacker-WIN outcomes (not a checklist —
-    chase impact). The win classes that pay as P1 here:
-    • Broken access control / IDOR / BOLA: identity B reads or MUTATES A's object; horizontal &
-      vertical privilege escalation; missing function-level authz; tenant isolation break.
-    • Authn / session: auth bypass, JWT alg/sig/claim flaws, OAuth/SAML misconfig, password-reset
-      poisoning, 2FA bypass, session fixation, predictable tokens.
-    • SSRF (incl. BLIND via OOB), XXE, request smuggling.
-    • Injection: SQL/NoSQL, command, SSTI, LDAP, GraphQL — drive to data read/RCE.
-    • Stored/reflected/DOM XSS where it yields account/session impact; CSRF on state-changing actions.
-    • Business logic: price/quantity/discount manipulation, race conditions (TOCTOU), workflow &
-      payment bypass, negative amounts, replay.
-    • Info disclosure: secrets/keys in JS or responses, debug/admin endpoints, exposed internal APIs,
-      directory listing; CORS misconfig; subdomain takeover.
+ 2. For the '{theme}' angle, BECOME THE ATTACKER and hunt attacker-WIN outcomes, not a checklist.
+    Derive the win conditions from the real app map and the program rubric: which principals exist,
+    what objects/resources/funds/privileges each should control, which workflows change state, where
+    the server consumes attacker-chosen data, and what outcome would cross the program's critical bar.
    What "critical" means for this program: {critical_means}
  3. CORRECT ≠ SAFE: a 200 OK or a working feature is not safety. Reason "can the attacker WIN" —
     e.g. an endpoint that faithfully returns a record is a CRITICAL if it returns ANOTHER user's
     record for an attacker-chosen id. Develop several concrete, request-cited hypotheses per pass.
  4. PROVE the strongest one DETERMINISTICALLY against the LIVE target. Write a runnable harness under
-    ./{poc_reldir}/ — a pytest using p1hunt_dyn (e.g. `idor_probe(a, b, url)` returns A's data to B;
-    or `oob_received(token)` is True after the request). The RUN is the JUDGE. A real PoC shows the
-    win (B got A's data; the callback fired; the price became negative) — not a description.
+    ./{poc_reldir}/ — a pytest using p1hunt_dyn (e.g. one principal is unexpectedly permitted on
+    another principal's resource, or `oob_received(token)` is True after the request). The RUN is
+    the JUDGE. A real PoC shows the win (unauthorized data/control moved; the callback fired; a
+    protected workflow accepted an impossible state) — not a description.
  5. DO NOT SELF-DISMISS. A real-impact hypothesis you could not DISPROVE with a run is INCONCLUSIVE,
     not safe — report it (the verifier + runner judge). Record genuine disproofs in ruled_out.
 
-You may POST a strong finding mid-pass via the blackboard tool the moment a PoC demonstrates the win.
+You may POST a strong finding mid-pass via the blackboard tool after a focused depth check or the
+moment a PoC demonstrates the win. Include the request/PoC evidence, attempted escalation, and any
+blocker that prevents confirmed-critical status.
+
+{_ATTRIBUTION_GATE}
+
 Reply ONLY with JSON (same shape the pipeline expects):
 {{"findings": [{{"title": "...", "severity": "critical|high|medium", "lens": "{theme}",
    "file": "<the vulnerable URL/endpoint, e.g. https://host/api/v2/orders/{{id}}>", "line": 0,
@@ -326,7 +364,11 @@ Reply ONLY with JSON (same shape the pipeline expects):
    "remediation": "the specific fix (server-side authz check / param binding / etc.)",
    "confidence": "high|medium|low",
    "poc": "harness path under {poc_reldir} + command + what running it showed (the proof) — or 'static'",
-   "evidence": "the exact requests/responses (redacted) + PoC output proving it"}}],
+   "evidence": "the exact requests/responses (redacted) + PoC output proving it",
+   "target_code_attribution": "the in-scope live target behavior/endpoint/request path that is defective",
+   "non_target_attribution": "what your client, tokens, OOB listener, fixture data, or local harness supplied",
+   "relies_on_non_target_behavior": false,
+   "attribution_notes": "one sentence separating target-owned behavior from test setup"}}],
  "ruled_out": ["<endpoint/class checked and why it is NOT exploitable>", "..."],
  "model_update": "<your DEEPENED attack-surface map + open threads + best current hypothesis to carry "
                  "into the next round (endpoints, params, roles, IDs, what you tried + outcomes)>"}}
@@ -351,17 +393,18 @@ def map_prompt(
             if investigate else "")
     inv = ("\nInvariants Parent A derived (frame each as 'what an attacker must never cause'):\n  - "
            + "\n  - ".join(invariants[:8]) if invariants else "")
-    patt = ("\nKnown attack CLASSES for this kind of system (hunt NEW variants, don't copy):\n  - "
-            + "\n  - ".join(known_patterns[:10]) if known_patterns else "")
+    patt = ""
     web = ("\nYou MAY consult the web to understand the SPEC or a primitive for this kind of system "
-           "(technique only — never search for this product's known bugs). A few searches at most."
+           "(technique only — never search for this product's prior disclosures). A few searches at most."
            if allow_web else "")
     return f"""You are a world-class security researcher who will OWN the '{subsystem}' subsystem. This
 is the MAP phase — you are NOT attacking yet and NOT writing a PoC. Your ONE deliverable is a
 COMPLETE, durable MODEL of this subsystem that you (and your future rounds) will attack from.
 
 UNLIKE later rounds, reading is ENCOURAGED here: read the subsystem's real code thoroughly (use
-sub-agents for breadth, but genuinely understand it). Cite real file:line throughout.{files}{todo}{inv}{patt}{web}
+sub-agents for breadth, but genuinely understand it). Be token-efficient: collect facts from
+targeted windows and return a compact security map, not pasted source or command output. Cite real
+file:line throughout.{files}{todo}{inv}{patt}{web}
 
 What "critical" means here: {critical_means}
 
@@ -379,18 +422,51 @@ Then rank the most promising SUSPICION THREADS to attack next (where an assumpti
 ly violable, where two correct pieces compose unsafely, where intent itself may be exploitable).
 
 Report ONLY JSON:
-{{"model": "<a thorough, structured model of this subsystem as described above, with file:line "
-          "citations — this becomes your persistent memory>",
+{{"model": "<thorough but compact structured model, max ~5000 chars, with file:line citations — "
+          "entrypoints, state, trust boundaries, attacker inputs, protected quantities, flows, "
+          "invariants, and the few highest-value open threads. No pasted source/output.>",
  "threads": ["<ranked, concrete attack thread to pursue, citing where>", "..."]}}"""
+
+
+def _json_object_candidates(text: str):
+    """Yield balanced top-level JSON-looking objects from noisy model output.
+
+    A greedy ``{.*}`` regex silently loses valid JSON whenever the agent prints prose/tool output with
+    extra braces. This scanner is small but respects quoted strings and escapes, which is enough for
+    the structured objects our prompts request.
+    """
+    start = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text or ""):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                yield text[start:i + 1]
+                start = None
 
 
 def parse_model_update(text: str) -> str:
     """Extract the ``model_update`` (or ``model``) field a hunter/mapper emitted, so it can be
     carried into the next round as the hunter's persistent memory. "" when absent/unparseable."""
     import json
-    import re
 
-    for raw in re.findall(r"\{.*\}", text or "", re.DOTALL):
+    for raw in _json_object_candidates(text or ""):
         try:
             d = json.loads(raw)
         except json.JSONDecodeError:
@@ -398,16 +474,77 @@ def parse_model_update(text: str) -> str:
         if isinstance(d, dict):
             val = d.get("model_update") or d.get("model")
             if isinstance(val, str) and val.strip():
-                return val.strip()
+                return compact_model_memory(val.strip())
     return ""
+
+
+def _model_memory_limit() -> int:
+    """Maximum carried-forward subsystem memory. This is prompt cost control, not analysis depth."""
+    import os
+
+    try:
+        return max(1200, int(os.environ.get("P1HUNT_MODEL_MEMORY_CHARS", "5000") or 5000))
+    except ValueError:
+        return 5000
+
+
+def compact_model_memory(model: str, *, limit: int | None = None) -> str:
+    """Keep high-signal, cited subsystem memory while preventing prompt growth across rounds.
+
+    The model is a working map, not a transcript. Preserve lines likely to contain the reusable
+    attack surface: entrypoints, state/trust boundaries, attacker-controlled inputs, invariants,
+    flows, open hypotheses, blockers, and file:line citations. Drop duplicated prose first.
+    """
+    import re
+
+    model = (model or "").strip()
+    if not model:
+        return ""
+    limit = _model_memory_limit() if limit is None else max(1200, int(limit))
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw in model.replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        line = re.sub(r"\s+", " ", raw.strip())
+        if not line:
+            continue
+        if len(line) > 260:
+            line = line[:257].rstrip() + "..."
+        key = re.sub(r"[^a-z0-9:/._-]+", " ", line.lower()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(line)
+
+    if len("\n".join(lines)) <= limit:
+        return "\n".join(lines)
+
+    high_signal = re.compile(
+        r"(\bentry|external|callable|state|storage|trust|auth|permission|signature|zone|"
+        r"attacker|input|domain|protected|asset|fund|owner|flow|sink|invariant|never|"
+        r"hypothesis|thread|blocked|blocker|poc|proof|repro|ruled|line|:[0-9]{1,6}\b)",
+        re.IGNORECASE,
+    )
+    ordered = [ln for ln in lines if high_signal.search(ln)] + [ln for ln in lines if not high_signal.search(ln)]
+    out: list[str] = []
+    used = 0
+    footer = "\n[model memory compacted: keep future updates to cited deltas, open attack threads, and blockers]"
+    budget = max(0, limit - len(footer))
+    for ln in ordered:
+        add = len(ln) + (1 if out else 0)
+        if used + add > budget:
+            continue
+        out.append(ln)
+        used += add
+    if not out:
+        return model[:limit].rstrip()
+    return "\n".join(out).rstrip() + footer
 
 
 def _parse_threads(text: str) -> list[str]:
     """Extract the ranked ``threads`` list a mapping pass emitted (its attack to-do)."""
     import json
-    import re
 
-    for raw in re.findall(r"\{.*\}", text or "", re.DOTALL):
+    for raw in _json_object_candidates(text or ""):
         try:
             d = json.loads(raw)
         except json.JSONDecodeError:
@@ -417,9 +554,74 @@ def _parse_threads(text: str) -> list[str]:
     return []
 
 
-def verify_prompt(f: ClaudeFinding) -> str:
+def verify_prompt(
+    f: ClaudeFinding,
+    *,
+    live_web: bool = False,
+    base_url: str = "",
+    egress_hosts: list[str] | None = None,
+    poc_reldir: str = ".p1hunt-poc",
+    operator_notes: str = "",
+) -> str:
+    finding = f"""Reported finding:
+- title: {f.title}
+- severity: {f.severity}
+- location: {f.file}:{f.line}
+- root cause: {f.root_cause}
+- counterfactual: {f.counterfactual}"""
+    op = ("\n\nPARENT A / OPERATOR DIRECTIVES FOR THIS VERIFICATION:\n"
+          + operator_notes.strip()) if operator_notes and operator_notes.strip() else ""
+
+    if live_web:
+        hosts = ", ".join(egress_hosts or []) or "(authorized host allowlist from environment)"
+        return f"""You are an adversarial Falsifier for a BLACK-BOX live web bounty finding.
+PRIOR: the reported finding is WRONG until proven, but backend source may NOT be present.
+
+Current working directory is an evidence workspace: harvested JS/OpenAPI/docs and PoCs under ./{poc_reldir}/.
+Do NOT get stuck trying to trace backend route source if it is absent. For a black-box web finding,
+the live HTTP result is the evidence.
+Keep every search bounded: use `rg --files | head -200`, `rg -n -m 50 ...`, or targeted paths.
+Never run an unbounded recursive grep over bundled/minified JS; huge tool output can break the verifier session.
+
+Authorized target: {base_url or "(from P1HUNT_BASE_URL)"}
+Authorized egress hosts: {hosts}
+PoC/client path: ./{poc_reldir}/p1hunt_dyn.py
+
+How to verify:
+- First inspect ./{poc_reldir}/ for a PoC matching the endpoint/parameter/title and run the smallest
+  relevant test with pytest if present.
+- For unauthenticated claims, ensure the request explicitly sends no Authorization, e.g. the shipped
+  Client must be called with token="" so an ambient P1HUNT_TOKEN is not added.
+- For callback/fetch claims, "real" means the live server uses an attacker-controlled destination
+  or returns a server-side connection/discovery error containing the unique marker, loopback/private
+  host, or constructed URL. An OOB hit also counts.
+- Refute only if a live, in-scope request shows authentication blocks the sink before processing,
+  destination validation rejects the attacker URL before any outbound dereference, or the PoC evidence
+  is incoherent. Lack of backend source is NOT a refutation.
+- If no relevant PoC/evidence can be run or inspected, return verdict "real" with reachable=false
+  and explain that the state is unverified; the orchestrator will keep it as a candidate.
+- Apply the attribution gate below. If the reported win depends on the local client/harness, fixture
+  data, OOB listener, token/account setup, external service, or any behavior outside the in-scope
+  live target, it is not a confirmed target bug.
+
+{_ATTRIBUTION_GATE}
+
+{finding}{op}
+
+Reply ONLY with JSON:
+{{"verdict": "real|refuted", "severity": "critical|high|medium|low",
+  "reachable": true|false,
+  "target_code_attribution": "the in-scope target endpoint/behavior that owns the defect, or ''",
+	  "non_target_attribution": "what the client/harness/OOB/token setup supplied, or ''",
+	  "relies_on_non_target_behavior": true|false,
+	  "attribution_notes": "why the defect is or is not target-owned",
+	  {_FINDING_CLAIM_JSON},
+	  "reason": "cite the live request/pytest/OOB evidence for real, or the specific live block for refuted"}}"""
+
     return f"""You are an adversarial Falsifier. PRIOR: this reported finding is WRONG until proven.
 Investigate the code in the current working directory with Read/Grep/Glob/Bash and try to REFUTE it.
+Keep every search bounded: use `rg --files | head -200`, `rg -n -m 50 ...`, or targeted paths.
+Never run an unbounded recursive grep over generated/minified bundles; huge tool output can break the verifier session.
 
 But refute it the RIGHT way. "The code is correct" / "the math checks out" / "there is a check here"
 is NOT a refutation — correct code still loses funds when the attacker controls the input (a
@@ -430,18 +632,21 @@ domain the rest of the logic assumes, BEFORE it moves the protected quantity, on
 concrete attacker-controlled value/sequence that reaches the bad outcome. Only "intended AND safe
 behavior" or a control that demonstrably blocks every path is a refutation; "looks correct" is not.
 
-Reported finding:
-- title: {f.title}
-- severity: {f.severity}
-- location: {f.file}:{f.line}
-- root cause: {f.root_cause}
-- counterfactual: {f.counterfactual}
+{_ATTRIBUTION_GATE}
+
+{finding}{op}
 
 Default to refuted ONLY when you have shown the attacker is blocked (or the finding is incoherent) —
 not merely because the code reads as correct. Reply ONLY with JSON:
 {{"verdict": "real|refuted", "severity": "critical|high|medium|low",
-  "reachable": true|false, "reason": "evidence from the code for your verdict — for 'refuted', the "
-  "specific control + why it blocks the attacker on every path; for 'real', the attacker value/path"}}"""
+  "reachable": true|false,
+  "target_code_attribution": "the exact in-scope target file:line/function/behavior that owns the defect, or ''",
+	  "non_target_attribution": "what the harness/mocks/fixtures/external setup supplied, or ''",
+	  "relies_on_non_target_behavior": true|false,
+	  "attribution_notes": "why the defect is or is not target-owned",
+	  {_FINDING_CLAIM_JSON},
+	  "reason": "evidence from the code for your verdict — for 'refuted', the "
+	  "specific control + why it blocks the attacker on every path; for 'real', the attacker value/path"}}"""
 
 
 class ClaudeHunter:
@@ -480,19 +685,18 @@ class ClaudeHunter:
         return self.allow_web and net_ok
 
     def _make_session(self, max_turns: int, finding_sink=None):
-        """Build the DISCOVERY session for this hunter — Claude by default, or the optional Codex
-        engine (GPT-5.5-Codex xhigh) when `discovery_engine == 'codex'`. Both are interface-
-        compatible (run(prompt,cwd)->SessionResult), so map+hunt are engine-agnostic. Only the
-        discovery phase is swapped; verification/PoC/depth stay on Claude."""
+        """Build the discovery session for this hunter.
+
+        The prompt and parser are engine-agnostic; Codex-global runs use the same prompt through a
+        CodexSession instead of the legacy Claude SDK session.
+        """
         common = dict(
             agent_name=self.agent_name, on_event=self.on_event, guard_check=self.guard_check,
             max_turns=max_turns, finding_sink=finding_sink,
             allow_web=self.allow_web, web_budget=self.web_budget,
             perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None),
         )
-        return make_session(model=self.model, engine=getattr(self, "discovery_engine", None),
-                            effort=getattr(self, "codex_effort", None),
-                            codex_model=getattr(self, "codex_model", None), **common)
+        return make_session(model=self.model, **_engine_kwargs(self, discovery=True), **common)
 
     async def _map(self, critical_means: str, repo_path: str, invariants, known_patterns,
                    subsystem: str) -> None:
@@ -505,12 +709,17 @@ class ClaudeHunter:
         prompt = map_prompt(subsystem, critical_means, self.focus_files, self.investigate,
                             invariants=invariants, known_patterns=known_patterns, allow_web=self._net())
         res = await session.run(prompt, repo_path, lens=self.theme)
-        self._model = parse_model_update(res.text) or self._model
-        for t in _parse_threads(res.text):
+        parsed_model = parse_model_update(res.text)
+        if parsed_model:
+            self._model = parsed_model
+        parsed_threads = _parse_threads(res.text)
+        for t in parsed_threads:
             if t not in self.investigate:
                 self.investigate.append(t)
         self.on_event(self.agent_name, "message",
-                      {"phase": "mapped", "lens": self.theme, "model_chars": len(self._model)})
+                      {"phase": "mapped" if parsed_model else "model_unparsed",
+                       "lens": self.theme, "model_chars": len(self._model),
+                       "threads": len(parsed_threads)})
 
     async def hunt(
         self, critical_means: str, repo_path: str, depth: int, prior_titles: list[str],
@@ -537,7 +746,8 @@ class ClaudeHunter:
             cf = ClaudeFinding.from_dict(d, self.theme)
             live.append(cf)
             self.on_event(self.agent_name, "finding_reported",
-                          {"title": cf.title, "severity": cf.severity, "file": cf.file, "line": cf.line})
+                          {"title": cf.title, "severity": cf.severity, "file": cf.file, "line": cf.line,
+                           "finding": cf.__dict__})
 
         session = self._make_session(self.max_turns, finding_sink=_sink)
         if getattr(self, "web_mode", False):
@@ -588,23 +798,40 @@ class ClaudeVerifier:
         self.guard_check = guard_check
         self.max_turns = max_turns
 
-    async def verify(self, finding: ClaudeFinding, repo_path: str) -> tuple[str, str, str]:
+    async def verify(self, finding: ClaudeFinding, repo_path: str, *, operator_notes: str = "") -> tuple[str, str, str]:
         """Returns (status, severity, reason) where status is 'real' | 'refuted' | 'unverified'.
         A transient/unparseable verification is 'unverified' — NOT 'refuted' — so real
         candidates are never silently dropped when the verifier session fails."""
         session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
+            **_engine_kwargs(self),
             perms=getattr(self, "perms", None),
             egress_hosts=getattr(self, "egress_hosts", None),
+            allow_web=bool(getattr(self, "web_mode", False)),
+            web_budget=2 if getattr(self, "web_mode", False) else 0,
         )
-        result = await session.run(verify_prompt(finding), repo_path, lens=finding.lens)
+        result = await session.run(
+            verify_prompt(
+                finding,
+                live_web=bool(getattr(self, "web_mode", False)),
+                base_url=str(getattr(self, "base_url", "") or ""),
+                egress_hosts=list(getattr(self, "egress_hosts", []) or []),
+                poc_reldir=str(getattr(self, "poc_reldir", ".p1hunt-poc") or ".p1hunt-poc"),
+                operator_notes=operator_notes,
+            ),
+            repo_path,
+            lens=finding.lens,
+        )
         if not result.ok:
             status, severity, reason = "unverified", finding.severity, f"verifier session failed: {result.error}"
         else:
             verdict = _parse_verdict(result.text)
             v = str(verdict.get("verdict", "")).lower()
-            if v == "real" and verdict.get("reachable", True):
+            attribution_bad = _truthy(verdict.get("relies_on_non_target_behavior", False))
+            if v == "real" and attribution_bad:
+                status = "refuted"
+            elif v == "real" and verdict.get("reachable", True):
                 status = "real"
             elif v == "refuted":
                 status = "refuted"
@@ -612,6 +839,9 @@ class ClaudeVerifier:
                 status = "unverified"  # no parseable verdict (transient) — keep the candidate
             severity = str(verdict.get("severity", finding.severity)).lower()
             reason = str(verdict.get("reason", "verifier returned no parseable verdict"))
+            if attribution_bad:
+                note = str(verdict.get("attribution_notes") or verdict.get("non_target_attribution") or "").strip()
+                reason = "attribution gate failed: " + (note or reason)
         self.on_event(self.agent_name, "message",
                       {"verdict": status, "title": finding.title, "reason": reason[:200]})
         return status, severity, reason
@@ -639,6 +869,8 @@ Rules:
 - A real PoC executes and demonstrates the counterfactual (value moved, check bypassed, invariant
   broken) — not a description, an actual run.
 
+{_ATTRIBUTION_GATE}
+
 Then judge HONESTLY — this is the whole point:
 - PoC reproduces the bug  -> "proven".
 - After a genuine attempt it does NOT reproduce (the code actually guards it, or the behavior is
@@ -649,13 +881,20 @@ Then judge HONESTLY — this is the whole point:
 Reply ONLY with JSON:
 {{"verdict": "proven|not_reproduced|inconclusive",
   "summary": "what you built, what running it showed, and why it proves/disproves the bug",
-  "poc_path": "relative path to your PoC under {poc_reldir}/, or ''"}}"""
+  "poc_path": "relative path to your PoC under {poc_reldir}/, or ''",
+  "target_code_attribution": "the exact in-scope target behavior/file:line/endpoint that owns the defect",
+  "non_target_attribution": "what your harness/mocks/fixtures/external setup supplied",
+  "relies_on_non_target_behavior": true|false,
+  "attribution_notes": "why this is target-owned, or why it is only a harness/setup issue"}}"""
 
 
-def materialize_prompt(f: ClaudeFinding, scaffold: str = "", fork_url: str = "", poc_reldir: str = ".p1hunt-poc") -> str:
+def materialize_prompt(f: ClaudeFinding, scaffold: str = "", fork_url: str = "",
+                       poc_reldir: str = ".p1hunt-poc", operator_notes: str = "") -> str:
     scaffold_block = ("\n\nUse this class-appropriate scaffold as your starting point:\n" + scaffold) if scaffold else ""
     fork_note = (f"\nA local fork is available at {fork_url} (use it if the harness needs real on-chain state)."
                  if fork_url else "")
+    op = ("\n\nPARENT A / OPERATOR DIRECTIVES FOR THIS PROOF STEP:\n"
+          + operator_notes.strip()) if operator_notes and operator_notes.strip() else ""
     return f"""You are an exploit engineer. The finding below passed adversarial review and is BELIEVED real.
 Do NOT judge whether it works — a DETERMINISTIC runner will execute your harness and decide. Your ONE job is
 to MATERIALIZE a real, runnable proof HARNESS on disk that the runner can execute unattended.
@@ -665,34 +904,66 @@ Finding:
 - location: {f.file}:{f.line}
 - root cause: {f.root_cause}
 - counterfactual (what the attacker gains): {f.counterfactual}
-- reproduction idea: {f.reproduction}{scaffold_block}{fork_note}
+- reproduction idea: {f.reproduction}{scaffold_block}{fork_note}{op}
 
 Rules:
 - If a tool you need is missing (forge/anvil, cmake, a compiler, a fuzzer), INSTALL it yourself —
   sudo package manager, pip/cargo/npm/go, or an official installer are all permitted.
 - Actually CREATE the harness file(s) with the Write tool under ./{poc_reldir}/ (this path is already
-  inside the project's build/test tree so the toolchain compiles, discovers, and resolves imports for it —
-  do NOT invent another location). Make a COMPLETE, runnable harness against the REAL in-scope code
-  (compiles/loads, drives the real entrypoints) — not a sketch. For a Foundry target, run it with
-  `forge test --match-path '{poc_reldir}/<file>.t.sol' -vvv`. You MAY run it once locally to shake out
-  build errors; the deterministic runner makes the official verdict.
+	  inside the project's build/test tree so the toolchain compiles, discovers, and resolves imports for it —
+	  do NOT invent another location). Make a COMPLETE, runnable harness against the REAL in-scope code
+	  (compiles/loads, drives the real entrypoints) — not a sketch. For a Foundry target, run it with
+	  `forge test --match-path '{poc_reldir}/<file>.t.sol' -vvv`. You MAY run it once locally to shake out
+	  build errors; the deterministic runner makes the official verdict.
 - Decide the EXPECT semantics precisely: "fail" if a reproduced bug makes the harness test FAIL (invariant /
   property / differential style — the assertion of correctness breaks), or "pass" if a reproduced bug makes
   an exploit assertion PASS (the attack succeeded).
+- Fill `finding_claim` honestly. Reproduction alone proves behavior, not severity. A P1/critical proof must
+  name the attacker, what they control, what they do NOT control, the honest victim/protected resource,
+  the pre-existing valuable target, and the victim-state delta that would not happen absent the bug.
+  If you cannot fill a field truthfully, leave it empty; the severity gate will keep it below critical.
+- Before claiming P1, run this mental check: does the PoC consume a secret/resource the attacker does NOT
+  know or control? If every share, nonce, key, authorization decision, and verified artifact was generated
+  by the attacker/harness, label it reproduced behavior, not critical. A malicious participant may control
+  its OWN protocol share/nonce; that is only P1 evidence when the proof also shows an honest party's
+  protected share/resource is defeated and the victim state changes.
+- Use non-degenerate honest material in severity PoCs. Do not prove top-tier impact only with zero,
+  identity, one, empty, base/default, or otherwise trivial honest secrets/resources unless the target
+  can force exactly that value. Prefer randomized or independently generated honest state, and print/assert
+  the checks that show it is not a trivial fixture.
+- If the exploit artifact is a signature, token, proof, receipt, capability, state root, balance/state
+  delta, or any other "winning" object, verify it with an INDEPENDENT target/spec checker whenever
+  one exists, not only the same combiner/finalizer that produced it. Print/assert the raw checker input
+  and result, plus the pre-committed message/object/state being checked.
+- For protocol or multi-actor targets, include at least one composed chain attempt: attacker poisons or
+  relaxes only what the attacker legitimately controls, an honest actor responds with non-degenerate
+  protected material, and the harness proves the final attacker-win artifact/state against the target or
+  a standard verifier. Do not stop at "the primitive was accepted" if a later honest response is needed
+  to reach the program's top-tier impact.
+
+{_ATTRIBUTION_GATE}
 
 Reply ONLY with a JSON object describing what you materialized (no prose):
 {{"harness_path": "<relative path under {poc_reldir} to the file the runner should execute>",
   "kind": "invariant|fork|differential|call-sequence|exploit|property|policy",
   "expect": "fail|pass",
-  "test_name": "<the specific test/function to target, or ''>",
-  "command": "<the command you would run; advisory only — the runner derives its own>",
-  "notes": "<what the harness does and why its outcome proves the bug>"}}"""
+	  "test_name": "<the specific test/function to target, or ''>",
+	  "command": "<the command you would run; advisory only — the runner derives its own>",
+	  "notes": "<what the harness does and why its outcome proves the bug>",
+	  "target_code_attribution": "the exact in-scope target behavior/file:line/endpoint that owns the defect",
+	  "non_target_attribution": "what your harness/mocks/fixtures/external setup supplied",
+	  "relies_on_non_target_behavior": true|false,
+	  "attribution_notes": "why this is target-owned, or why it is only a harness/setup issue",
+	  {_FINDING_CLAIM_JSON}}}"""
 
 
 def repair_prompt(f: ClaudeFinding, prior_spec: dict, runner_output: str,
-                  scaffold: str = "", fork_url: str = "", poc_reldir: str = ".p1hunt-poc") -> str:
+                  scaffold: str = "", fork_url: str = "", poc_reldir: str = ".p1hunt-poc",
+                  operator_notes: str = "") -> str:
     scaffold_block = ("\n\nClass-appropriate scaffold for reference:\n" + scaffold) if scaffold else ""
     fork_note = (f"\nA local fork is available at {fork_url}." if fork_url else "")
+    op = ("\n\nPARENT A / OPERATOR DIRECTIVES FOR THIS REPAIR STEP:\n"
+          + operator_notes.strip()) if operator_notes and operator_notes.strip() else ""
     prior = str(prior_spec.get("harness_path", "")) if isinstance(prior_spec, dict) else ""
     return f"""You are an exploit engineer ITERATING on a proof harness. Your previous harness did NOT
 reproduce the bug yet. Read the REAL runner output below, find why, and FIX the harness so it
@@ -714,15 +985,25 @@ ran but the bug didn't trigger (wrong setup, didn't reach the sink past a gate, 
 wrong expect semantics) → correct it; the harness tested the wrong thing → rewrite it against the
 REAL in-scope code. Edit/replace the file(s) under ./{poc_reldir}/ with the Write tool. You MAY run it
 once locally to shake out errors; the deterministic runner makes the official verdict.{scaffold_block}{fork_note}
+{op}
 
 If, after a GENUINE fix attempt, the bug truly does NOT reproduce (the code actually guards it), say
-so in notes — that is a valid, useful outcome. Reply ONLY with the updated ReproSpec JSON (same shape):
+so in notes — that is a valid, useful outcome.
+
+	{_ATTRIBUTION_GATE}
+
+	Reply ONLY with the updated ReproSpec JSON (same shape):
 {{"harness_path": "<relative path under {poc_reldir} to the file the runner should execute>",
   "kind": "invariant|fork|differential|call-sequence|exploit|property|policy",
   "expect": "fail|pass",
-  "test_name": "<the specific test/function to target, or ''>",
-  "command": "<advisory only — the runner derives its own>",
-  "notes": "<what you changed and why it now proves the bug, or why it genuinely does not reproduce>"}}"""
+	  "test_name": "<the specific test/function to target, or ''>",
+	  "command": "<advisory only — the runner derives its own>",
+	  "notes": "<what you changed and why it now proves the bug, or why it genuinely does not reproduce>",
+	  "target_code_attribution": "the exact in-scope target behavior/file:line/endpoint that owns the defect",
+	  "non_target_attribution": "what your harness/mocks/fixtures/external setup supplied",
+	  "relies_on_non_target_behavior": true|false,
+	  "attribution_notes": "why this is target-owned, or why it is only a harness/setup issue",
+	  {_FINDING_CLAIM_JSON}}}"""
 
 
 class ClaudePoCProver:
@@ -739,7 +1020,7 @@ class ClaudePoCProver:
         self.max_turns = max_turns
 
     async def materialize(self, finding: ClaudeFinding, repo_path: str, *,
-                          scaffold: str = "", fork_url: str = "") -> dict | None:
+                          scaffold: str = "", fork_url: str = "", operator_notes: str = "") -> dict | None:
         """Write a runnable harness into the sandbox and return a ReproSpec dict (or None on
         failure). The deterministic runner — not this session — decides reproduction."""
         self.on_event(self.agent_name, "message",
@@ -747,11 +1028,13 @@ class ClaudePoCProver:
         session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
+            **_engine_kwargs(self),
             perms=getattr(self, "perms", None),
             egress_hosts=getattr(self, "egress_hosts", None),
         )
         result = await session.run(
-            materialize_prompt(finding, scaffold, fork_url, getattr(self, "poc_reldir", ".p1hunt-poc")),
+            materialize_prompt(finding, scaffold, fork_url, getattr(self, "poc_reldir", ".p1hunt-poc"),
+                               operator_notes=operator_notes),
             repo_path, lens=finding.lens)
         if not result.ok:
             self.on_event(self.agent_name, "lifecycle",
@@ -768,7 +1051,8 @@ class ClaudePoCProver:
         return spec
 
     async def repair(self, finding: ClaudeFinding, prior_spec: dict, runner_output: str,
-                     repo_path: str, *, scaffold: str = "", fork_url: str = "") -> dict | None:
+                     repo_path: str, *, scaffold: str = "", fork_url: str = "",
+                     operator_notes: str = "") -> dict | None:
         """The PoC ITERATION step: the prior harness did NOT reproduce. Feed the real runner output
         back so the prover FIXES the harness (compile error, wrong setup, mis-stated expect, didn't
         reach the sink) and returns an updated ReproSpec — or None if it cannot. This turns one-shot
@@ -778,12 +1062,14 @@ class ClaudePoCProver:
         session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
+            **_engine_kwargs(self),
             perms=getattr(self, "perms", None),
             egress_hosts=getattr(self, "egress_hosts", None),
         )
         result = await session.run(
             repair_prompt(finding, prior_spec, runner_output, scaffold, fork_url,
-                          getattr(self, "poc_reldir", ".p1hunt-poc")), repo_path, lens=finding.lens)
+                          getattr(self, "poc_reldir", ".p1hunt-poc"),
+                          operator_notes=operator_notes), repo_path, lens=finding.lens)
         if not result.ok:
             return None
         spec = _parse_verdict(result.text)
@@ -801,6 +1087,7 @@ class ClaudePoCProver:
         session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
+            **_engine_kwargs(self),
             perms=getattr(self, "perms", None),
             egress_hosts=getattr(self, "egress_hosts", None),
         )
@@ -829,6 +1116,14 @@ def _parse_verdict(text: str) -> dict:
         return json.loads(m.group(0))
     except json.JSONDecodeError:
         return {}
+
+
+def _truthy(v: object) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 # ===========================================================================
@@ -860,14 +1155,15 @@ Reply ONLY JSON: {{"duplicate": true|false, "of": <1-based index of the match, o
 
 
 def exploit_dev_prompt(f: ClaudeFinding, rubric: str, poc_reldir: str = ".p1hunt-poc",
-                       prior_attempts: list | None = None) -> str:
+                       prior_attempts: list | None = None, operator_notes: str = "") -> str:
     """The EXPLOIT-DEVELOPMENT depth phase — the organ that turns a believed PRIMITIVE into a proven
     attacker-WIN (or a rigorous impossibility). This is the long-horizon, sustained-focus job that
-    separates a Medium soundness bug from a Critical: it builds the full multi-step / multi-party /
+    separates an interesting primitive from a Critical: it builds the full multi-step / multi-party /
     cryptanalytic chain and DEMONSTRATES the win against shipped code, measured against the rubric."""
     rub = rubric.strip() if rubric else (
-        "Critical = extract the private key or forge a rogue signature; Medium = leak key bits or "
-        "memory corruption. Count failures/aborts: a smaller abort budget is a higher tier.")
+        "Critical = a deterministic, reproduced attacker win that satisfies the engagement's top "
+        "severity definition. Lower tiers are incomplete chains, bounded impact, or unclosed "
+        "primitives. Measure cost, attempts, prerequisites, and blast radius precisely.")
     # Robust to BOTH ClaudeFinding (.file/.line/.reproduction/.lens) and the promoted Finding
     # (.poc.path, .severity_rationale; no .file/.line) — the depth phase runs on either.
     title = getattr(f, "title", "")
@@ -894,6 +1190,8 @@ def exploit_dev_prompt(f: ClaudeFinding, rubric: str, poc_reldir: str = ".p1hunt
             "primitive -> relax an assumption -> fault/abort oracle). Build on what the failures TAUGHT you. "
             "Do NOT declare exhausted just because a PoC failed — only if you can prove the win is impossible "
             "across ALL remaining angles.")
+    op = ("\n\nPARENT A / OPERATOR DIRECTIVES FOR THIS DEPTH ATTEMPT:\n"
+          + operator_notes.strip()) if operator_notes and operator_notes.strip() else ""
     return f"""You are a WORLD-CLASS exploit developer and cryptanalyst. You are handed ONE believed
 primitive (an anomaly another agent found in the target's shipped code). Spotting it was the easy
 10%. Your job is the hard 90%: BUILD THE FULL EXPLOIT that achieves the program's attacker-WIN — or
@@ -908,7 +1206,7 @@ THE PRIMITIVE:
 - how it was found / repro idea: {repro}
 
 THE BAR (score your result against THIS exactly):
-{rub}{persist}
+{rub}{persist}{op}
 
 METHOD — close the chain end to end, against the REAL shipped code:
  1. MODEL THE FULL ATTACK PATH. From the primitive to the attacker-win: every step, every value the
@@ -919,6 +1217,10 @@ METHOD — close the chain end to end, against the REAL shipped code:
     breaks: re-run/replay the same secret-dependent op and DIFF/COMBINE outputs; differential vs a
     reference/spec; statistical/lattice recovery; multi-party adversarial simulation; driving every
     field to its full value-domain. The exploit is the concrete violation of the promised property.
+    When a primitive is accepted but not itself the win, explicitly try the COMPOSITION step: feed the
+    accepted primitive into the next honest-party/protected-resource operation, let honest target code
+    respond using non-degenerate state the attacker does not know/control, and test whether that response
+    becomes a final winning artifact/state.
  2. BUILD THE REAL ENVIRONMENT. Deploy / drive the ACTUAL library (not a toy). If the protocol is
     multi-party, SIMULATE ALL parties and play the malicious one(s) yourself. Reach PAST the gates
     (real keygen, real signing) into the value-moving logic. Put harnesses under ./{poc_reldir}/.
@@ -927,16 +1229,29 @@ METHOD — close the chain end to end, against the REAL shipped code:
     sessions; run nonce-bias / lattice (LLL/BKZ) / statistical key-bit recovery; build fault/abort
     ORACLES and measure how many aborts a real attacker needs. The deliverable is a NUMBER (key
     recovered, or N bits leaked, in K aborts) — not "this could leak".
- 4. MEASURE against the rubric. Did you EXTRACT the key / FORGE a signature, and within what abort
-    budget? That determines the tier. Half a chain is not a critical.
+ 4. MEASURE against the rubric. Did you achieve the exact top-tier attacker win, under realistic
+    prerequisites and with measured attempts/cost/blast radius? That determines the tier. Half a
+    chain is not a critical.
+ 5. INDEPENDENTLY CHECK THE WIN. If the output is a signature/token/proof/capability/receipt/state
+    transition/balance change, validate the raw final artifact/state with an independent target/spec
+    checker or invariant, not only with the routine that produced it. Print/assert the raw checker input,
+    the fixed message/object/state chosen before the run, and the checker result.
 
 HARD RULES (these are what triage checks — do not fool yourself):
- - The bug MUST be in the library's OWN shipped/compiled code. If your exploit only works because of
-   a concrete implementation YOU wrote for an abstract / pure-virtual (= 0) interface, it is INVALID
-   — you exploited your own mock, not the library. State explicitly that your PoC drives shipped code.
+ - The bug MUST be owned by the in-scope target's own shipped/compiled/runtime behavior. If your
+   exploit only works because of a concrete implementation, fixture, mock, fake service, local
+   config, deployment assumption, account setup, external dependency, or protocol peer behavior that
+   YOU supplied outside the target, it is INVALID — you exploited your own setup, not the target.
+   Pure-virtual (= 0) interfaces are one example, not the only one. State explicitly that your PoC
+   drives target-owned code/behavior and separate every non-target assumption.
  - CORRECT ≠ SAFE, but PRIMITIVE ≠ CRITICAL. Only an actually-demonstrated attacker-win counts. If
    you cannot close it, say so HONESTLY with the exact step that blocks it — a rigorous impossibility
    is a valuable, truthful result. Do NOT inflate a soundness bug into a critical.
+ - Do not rely on degenerate honest state for severity unless the target can force it. Top-tier PoCs
+   should use independently generated/randomized honest secrets/resources and print/assert that the
+   honest material is not a trivial zero/one/identity/default/base fixture.
+
+{_ATTRIBUTION_GATE}
 
 Reply ONLY with JSON:
 {{"achieved": true|false,
@@ -947,8 +1262,11 @@ Reply ONLY with JSON:
   "evidence": "the real run output that proves the win (or the precise step that blocks it)",
   "shipped_code": true|false,
   "shipped_function": "the exact shipped function + file:line where the BUG lives (the real defect, not your harness)",
+  "target_code_attribution": "the exact in-scope target-owned behavior/file:line/endpoint that owns the defect",
+  "non_target_attribution": "what mocks/fixtures/scaffold/external setup/integrator behavior supplied, if anything",
+  "relies_on_non_target_behavior": true|false,
   "relies_on_abstract_interface": true|false,
-  "//attribution": "set relies_on_abstract_interface=TRUE if the win depends on the behavior or the ABSENCE of a guarantee from a pure-virtual (=0) interface the LIBRARY does not implement (the integrator does) — e.g. single-use/consumption of presigned data via the persistency interface, authorization hooks, storage. If your harness supplies its own impl of a =0 method and the 'bug' is that impl's behavior or a missing guarantee that is the integrator's job, it is INVALID (you exploited your own mock, not shipped code) — say true.",
+  "attribution_notes": "set relies_on_non_target_behavior=TRUE if the win depends on behavior outside the in-scope target: harness, mock, fixture, external service, deployment/account assumption, dependency not shipped by target, or pure-virtual/integrator-only implementation. Set relies_on_abstract_interface=TRUE for the pure-virtual subset.",
   "strategy": "the SPECIFIC angle you tried THIS attempt (one line — so the next attempt won't repeat it)",
   "why_failed": "if not achieved: the exact step that blocked THIS angle",
   "next_angle": "if not achieved and NOT impossible: a different, concrete angle worth trying next",
@@ -973,7 +1291,7 @@ class ClaudeExploitDeveloper:
 
     async def develop(self, finding: ClaudeFinding, repo_path: str, *, rubric: str = "",
                       scaffold: str = "", fork_url: str = "",
-                      prior_attempts: list | None = None) -> dict | None:
+                      prior_attempts: list | None = None, operator_notes: str = "") -> dict | None:
         """Run the sustained exploit-development session. Returns a verdict dict (or None on failure):
         achieved/tier/win/aborts/harness_path/evidence/shipped_code/impossibility."""
         _loc = getattr(finding, "file", None) or getattr(getattr(finding, "poc", None), "path", "")
@@ -984,11 +1302,12 @@ class ClaudeExploitDeveloper:
         session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
+            **_engine_kwargs(self),
             perms=getattr(self, "perms", None),
             egress_hosts=getattr(self, "egress_hosts", None),
         )
         prompt = exploit_dev_prompt(finding, rubric, getattr(self, "poc_reldir", ".p1hunt-poc"),
-                                    prior_attempts=prior_attempts)
+                                    prior_attempts=prior_attempts, operator_notes=operator_notes)
         result = await session.run(prompt, repo_path, lens=_lens)
         if not result.ok:
             self.on_event(self.agent_name, "lifecycle",
@@ -997,23 +1316,32 @@ class ClaudeExploitDeveloper:
         v = _parse_verdict(result.text)
         if not v:
             return None
-        # ATTRIBUTION GATE: a win that leans on a pure-virtual (=0) interface the LIBRARY doesn't
-        # implement (single-use/consumption, auth hooks, storage — the integrator's job) is INVALID,
-        # even if the harness "demonstrates" it with its own mock. This stops the recurring
-        # over-confirmation of the presig-reuse / persistency class.
-        abstract = bool(v.get("relies_on_abstract_interface", False))
-        achieved = bool(v.get("achieved")) and bool(v.get("shipped_code", True)) and not abstract
-        if abstract and bool(v.get("achieved")):
+        # ATTRIBUTION GATE: a win that leans on non-target behavior (harness/mock/fixture/fake
+        # service/local config/external dependency/integrator-only implementation) is INVALID, even
+        # if the harness "demonstrates" it. Pure-virtual (=0) interfaces are one example.
+        abstract = _truthy(v.get("relies_on_abstract_interface", False))
+        non_target = _truthy(v.get("relies_on_non_target_behavior", False))
+        missing_target = not str(v.get("target_code_attribution") or v.get("shipped_function") or "").strip()
+        achieved = (
+            _truthy(v.get("achieved"))
+            and _truthy(v.get("shipped_code", True))
+            and not abstract
+            and not non_target
+            and not missing_target
+        )
+        if (abstract or non_target or missing_target) and _truthy(v.get("achieved")):
             self.on_event(self.agent_name, "lifecycle",
                           {"event": "exploit_rejected_attribution", "title": finding.title,
-                           "detail": "win relies on a self-supplied impl of a pure-virtual (=0) interface — "
-                                     "integrator responsibility, not shipped-code bug; not confirmed"})
+                           "detail": "win relies on non-target behavior or lacks target-code attribution; "
+                                     "not confirmed as a target-owned bug"})
         self.on_event(self.agent_name, "lifecycle",
                       {"event": "exploit_developed" if achieved else "exploit_not_closed",
                        "title": finding.title, "tier": v.get("tier", "none"),
                        "win": str(v.get("win", ""))[:160], "aborts": str(v.get("aborts", "")),
-                       "shipped_code": bool(v.get("shipped_code", True)),
+                       "shipped_code": _truthy(v.get("shipped_code", True)),
                        "shipped_function": str(v.get("shipped_function", ""))[:160],
+                       "target_code_attribution": str(v.get("target_code_attribution", ""))[:160],
+                       "relies_on_non_target_behavior": non_target,
                        "relies_on_abstract_interface": abstract,
                        "strategy": str(v.get("strategy", ""))[:160],
                        "exhausted": bool(v.get("exhausted")),
@@ -1040,6 +1368,7 @@ class ClaudeDeduplicator:
         session = make_session(
             agent_name=self.agent_name, model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
+            **_engine_kwargs(self),
             perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))
         res = await session.run(dedup_prompt(finding, existing), repo_path, lens=finding.lens)
         if not res.ok:
@@ -1058,7 +1387,30 @@ class ClaudeDeduplicator:
 # critical, and a judge reads BOTH (plus the code) and rules: uphold | downgrade
 # | reject. This is the final adversarial gate on the highest-stakes findings.
 # ===========================================================================
+def _finding_view(f) -> dict:
+    """Normalize ClaudeFinding and promoted Finding for late pipeline prompts."""
+    poc = getattr(f, "poc", None)
+    _file = getattr(f, "file", None) or getattr(poc, "path", "") or getattr(f, "location", "")
+    _line = getattr(f, "line", "")
+    loc = f"{_file}:{_line}" if _file and _line else (_file or "(see evidence)")
+    return {
+        "title": getattr(f, "title", ""),
+        "severity": getattr(f, "severity", ""),
+        "location": loc,
+        "root_cause": getattr(f, "root_cause", ""),
+        "counterfactual": getattr(f, "counterfactual", ""),
+        "evidence": (
+            getattr(f, "reproduction", "")
+            or getattr(f, "severity_rationale", "")
+            or getattr(poc, "description", "")
+            or ""
+        ),
+        "lens": getattr(f, "lens", "") or "critical-review",
+    }
+
+
 def debate_prompt(f: ClaudeFinding, role: str) -> str:
+    fv = _finding_view(f)
     if role == "prosecutor":
         stance = ("You are the PROSECUTOR. Make the strongest possible case that this CONFIRMED "
                   "critical is WRONG, overstated, unreachable, intended behavior, or only a lower "
@@ -1072,22 +1424,39 @@ def debate_prompt(f: ClaudeFinding, role: str) -> str:
     return f"""{stance}
 
 CONFIRMED critical under debate:
-- title: {f.title}
-- location: {f.file}:{f.line}
-- root cause: {f.root_cause}
-- counterfactual: {f.counterfactual}
-- evidence/repro: {f.reproduction}
+- title: {fv["title"]}
+- location: {fv["location"]}
+- root cause: {fv["root_cause"]}
+- counterfactual: {fv["counterfactual"]}
+- evidence/repro: {fv["evidence"]}
+
+COUNTERFACTUAL-SEVERITY BAR:
+- Reject or downgrade if the proof only shows that the harness can generate inputs, partials, shares,
+  signatures, accounts, messages, or artifacts it already controls.
+- For a critical, identify the honest-held secret/resource/authorization boundary the attacker defeats.
+- State the defender escape hatches: attacker controls every role, needs a victim to run code, out-of-scope
+  integration policy, missing stored state, missing tenant/key binding, no protected asset loss.
+
+{_ATTRIBUTION_GATE}
 
 Investigate the code in the working directory (Read/Grep/Glob/Bash) to ground your argument.
-Reply ONLY JSON: {{"argument": "your strongest case, citing file:line", "severity": "critical|high|medium|low"}}"""
+Reply ONLY JSON: {{"argument": "your strongest case, citing file:line",
+  "severity": "critical|high|medium|low",
+  "honest_secret_or_resource": "what protected value/resource the attacker defeats, or ''",
+  "attacker_controls_all_material_inputs": true|false,
+  "defender_escape_hatches": "strongest objections a defender can raise",
+  "target_code_attribution": "the target-owned behavior/file:line/endpoint that owns the defect, or ''",
+  "relies_on_non_target_behavior": true|false,
+  "attribution_notes": "why this is target-owned or why it is only harness/setup behavior"}}"""
 
 
 def debate_judge_prompt(f: ClaudeFinding, prosecution: str, defense: str) -> str:
+    fv = _finding_view(f)
     return f"""You are the JUDGE. Two researchers debated a CONFIRMED critical. Weigh BOTH arguments
 against the actual code and rule impartially. Prefer truth over either side; do not rubber-stamp.
 
-Finding: {f.title}  ({f.file}:{f.line})
-Root cause: {f.root_cause}
+Finding: {fv["title"]}  ({fv["location"]})
+Root cause: {fv["root_cause"]}
 
 PROSECUTION (argues invalidate/downgrade):
 {prosecution[:1500]}
@@ -1095,9 +1464,20 @@ PROSECUTION (argues invalidate/downgrade):
 DEFENSE (argues genuine critical):
 {defense[:1500]}
 
+{_ATTRIBUTION_GATE}
+
 Rule: 'uphold' (stays a confirmed critical), 'downgrade' (real but lower severity — give it), or
-'reject' (not a valid finding / false positive). Reply ONLY JSON:
+'reject' (not a valid finding / false positive). Reject if the win is owned by non-target behavior
+or the target-owned defect is not attributable. Also reject/downgrade if the PoC lacks an honest-held
+protected secret/resource or authorization boundary and only proves a self-controlled artifact.
+Reply ONLY JSON:
 {{"verdict": "uphold|downgrade|reject", "severity": "critical|high|medium|low",
+  "honest_secret_or_resource": "what protected value/resource the attacker defeats, or ''",
+  "attacker_controls_all_material_inputs": true|false,
+  "defender_escape_hatches": "strongest objections a defender can raise",
+  "target_code_attribution": "the target-owned behavior/file:line/endpoint that owns the defect, or ''",
+  "relies_on_non_target_behavior": true|false,
+  "attribution_notes": "why this is target-owned or why it is only harness/setup behavior",
   "reason": "the deciding evidence from the code"}}"""
 
 
@@ -1116,25 +1496,37 @@ class ClaudeDebate:
         session = make_session(
             agent_name=f"{self.agent_name}:{role}", model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
+            **_engine_kwargs(self),
             perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))
-        res = await session.run(debate_prompt(finding, role), repo_path, lens=finding.lens)
+        res = await session.run(debate_prompt(finding, role), repo_path, lens=_finding_view(finding)["lens"])
         return str(_parse_verdict(res.text).get("argument", res.text))[:1800] if res.ok else ""
 
     async def adjudicate(self, finding: ClaudeFinding, repo_path: str) -> tuple[str, str, str]:
-        self.on_event(self.agent_name, "message", {"phase": "debate", "title": finding.title})
+        fv = _finding_view(finding)
+        self.on_event(self.agent_name, "message", {"phase": "debate", "title": fv["title"]})
         prosecution = await self._argue(finding, "prosecutor", repo_path)
         defense = await self._argue(finding, "defender", repo_path)
         judge = make_session(
             agent_name=f"{self.agent_name}:judge", model=self.model, on_event=self.on_event,
             guard_check=self.guard_check, max_turns=self.max_turns,
+            **_engine_kwargs(self),
             perms=getattr(self, "perms", None), egress_hosts=getattr(self, "egress_hosts", None))
-        res = await judge.run(debate_judge_prompt(finding, prosecution, defense), repo_path, lens=finding.lens)
+        res = await judge.run(debate_judge_prompt(finding, prosecution, defense), repo_path, lens=fv["lens"])
         d = _parse_verdict(res.text) if res.ok else {}
-        verdict = str(d.get("verdict", "uphold")).lower().strip()
+        if not d:
+            raise RuntimeError("debate judge returned no parseable verdict")
+        verdict = str(d.get("verdict", "")).lower().strip()
         if verdict not in ("uphold", "downgrade", "reject"):
-            verdict = "uphold"  # a failed/unparseable judge never silently drops a confirmed critical
+            raise RuntimeError(f"debate judge returned invalid verdict: {verdict or '<empty>'}")
+        if verdict == "uphold" and _truthy(d.get("relies_on_non_target_behavior", False)):
+            verdict = "reject"
+        if verdict == "uphold" and _truthy(d.get("attacker_controls_all_material_inputs", False)):
+            verdict = "downgrade"
         severity = str(d.get("severity", finding.severity)).lower().strip()
         reason = str(d.get("reason", ""))
+        if verdict == "reject" and _truthy(d.get("relies_on_non_target_behavior", False)):
+            note = str(d.get("attribution_notes") or "").strip()
+            reason = "attribution gate failed: " + (note or reason)
         self.on_event(self.agent_name, "message",
                       {"verdict": f"debate:{verdict}", "title": finding.title, "reason": reason[:160]})
         return verdict, severity, reason

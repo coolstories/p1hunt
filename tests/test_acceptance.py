@@ -6,6 +6,7 @@ Each test maps to a §16 bullet. Run: python3 -m unittest discover -s tests -v
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,7 +54,15 @@ def _run_demo(tmp: str, *, rounds: int = 8, scope: Scope | None = None, kind: st
     cfg = Config.from_env()
     cfg.use_claude = False  # hermetic: force the deterministic brain (no live Claude SDK) in tests
     cfg.engagements_root = str(Path(tmp) / "engagements")
-    return asyncio.run(run_engagement(scope, target, config=cfg, rounds=rounds))
+    prev = os.environ.get("P1HUNT_LEGACY_STATIC_SIGNALS")
+    os.environ["P1HUNT_LEGACY_STATIC_SIGNALS"] = "1"
+    try:
+        return asyncio.run(run_engagement(scope, target, config=cfg, rounds=rounds))
+    finally:
+        if prev is None:
+            os.environ.pop("P1HUNT_LEGACY_STATIC_SIGNALS", None)
+        else:
+            os.environ["P1HUNT_LEGACY_STATIC_SIGNALS"] = prev
 
 
 class IntakeAndScope(unittest.TestCase):
@@ -360,7 +369,15 @@ class HumanReviewAndGoal(unittest.TestCase):
             cfg = Config.from_env()
             cfg.use_claude = False  # hermetic: deterministic brain only
             cfg.engagements_root = str(t / "eng")
-            result = asyncio.run(run_engagement(scope, str(t), config=cfg, rounds=10))[0]
+            prev = os.environ.get("P1HUNT_LEGACY_STATIC_SIGNALS")
+            os.environ["P1HUNT_LEGACY_STATIC_SIGNALS"] = "1"
+            try:
+                result = asyncio.run(run_engagement(scope, str(t), config=cfg, rounds=10))[0]
+            finally:
+                if prev is None:
+                    os.environ.pop("P1HUNT_LEGACY_STATIC_SIGNALS", None)
+                else:
+                    os.environ["P1HUNT_LEGACY_STATIC_SIGNALS"] = prev
             self.assertTrue(result.confirmed_critical)
             self.assertGreater(result.rounds_run, 1, "should take more than one round")
             self.assertGreater(result.reframes, 0, "should have reframed at least once")

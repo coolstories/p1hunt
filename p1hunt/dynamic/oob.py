@@ -1,11 +1,11 @@
-"""Out-of-band interaction listener — confirms BLIND vulnerabilities (spec §10).
+"""Out-of-band interaction listener — confirms callback-based behavior (spec §10).
 
-Blind SSRF, blind injection, XXE, and webhook/callback bugs leave no trace in the HTTP response;
-the proof is that the *target* reached back out to an attacker-controlled endpoint. This module
+Some server-side behaviors leave no trace in the HTTP response; the proof is that the *target*
+reached back out to an attacker-controlled endpoint. This module
 runs a tiny loopback HTTP server (127.0.0.1 only) that records every callback it receives, keyed
 by the unique token embedded in the path. A harness gives the target an OOB URL carrying a token,
 performs the action, then asserts (via the shipped client's ``oob_received``) that the token was
-hit — turning a blind bug into a deterministically reproduced one.
+hit.
 
 Loopback-only and append-only: it never makes an outbound request and stores only the callback's
 path/time/source (least-data, §9). Offline-graceful — if it cannot bind, arming continues without

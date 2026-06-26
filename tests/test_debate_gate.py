@@ -9,10 +9,27 @@ import types
 import unittest
 
 from p1hunt.agents.claude_swarm import ClaudeSwarm
+from p1hunt.models import ArtifactRef, Finding
 
 
 def _f(title, severity="critical", file="src/x.cpp"):
     return types.SimpleNamespace(title=title, severity=severity, file=file)
+
+
+def _promoted(title, severity="critical", path="poc.cpp"):
+    return Finding(
+        id="F1",
+        hypothesis_id="H1",
+        title=title,
+        root_cause="rc",
+        poc=ArtifactRef(id="A1", kind="repro", path=path, description="", reproduced=True),
+        severity=severity,
+        severity_rationale="r",
+        counterfactual="c",
+        remediation="fix",
+        safe_harbor_attestation="att",
+        verified=True,
+    )
 
 
 class _Shim:
@@ -62,6 +79,17 @@ class TestDebateGate(unittest.TestCase):
         s = _Shim()
         self.assertEqual(s._finding_key(_f("ABC", file="a.cpp")), s._finding_key(_f("abc", file="a.cpp")))
         self.assertNotEqual(s._finding_key(_f("ABC", file="a.cpp")), s._finding_key(_f("ABC", file="b.cpp")))
+
+    def test_promoted_finding_key_uses_poc_path(self):
+        s = _Shim()
+        self.assertEqual(
+            s._finding_key(_promoted("ABC", path="a.cpp")),
+            s._finding_key(_promoted("abc", path="a.cpp")),
+        )
+        self.assertNotEqual(
+            s._finding_key(_promoted("ABC", path="a.cpp")),
+            s._finding_key(_promoted("ABC", path="b.cpp")),
+        )
 
 
 if __name__ == "__main__":

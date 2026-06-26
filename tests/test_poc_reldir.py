@@ -1,6 +1,6 @@
 """PoC-harness placement: harnesses must land where the target's toolchain can RUN them.
 
-Root cause of the Seaport run finding nothing: PoCs were written to `.p1hunt-poc/`, which is outside
+Root cause of a prior Foundry run finding nothing: PoCs were written to `.p1hunt-poc/`, which is outside
 a Foundry project's `src`/`test` tree, so `forge test` reported "No tests found" and remappings broke
 — every PoC silently never executed. `_poc_reldir` now nests PoCs inside the project's configured
 `test` dir for Foundry targets, and the prompts embed that path.
@@ -37,7 +37,7 @@ class TestPocReldir(unittest.TestCase):
         self.assertEqual(_poc_reldir(tempfile.mkdtemp()), ".p1hunt-poc")
 
     def test_first_test_key_is_default_profile(self):
-        # Seaport-like: multiple profiles; the default profile's test path must win.
+        # Multiple profiles: the default profile's test path must win.
         d = tempfile.mkdtemp()
         Path(d, "foundry.toml").write_text(
             "[profile.default]\nsrc='contracts'\ntest='test/foundry'\n"

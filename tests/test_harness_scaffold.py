@@ -136,7 +136,7 @@ class TestScaffoldBlock(unittest.TestCase):
         self.assertIn("evm-unchecked-call", block)
         self.assertIn("fulfillOrder", block)
         # NOTHING PRESET: no protocol name, no marketplace/order-shape assumption
-        self.assertNotIn("Seaport", block)
+        self.assertNotIn("KnownProductA", block)
         self.assertNotIn("ORDER-BASED MARKETPLACE", block)
         for preset in ("consideration", "numerator", "_buildOrder", "_merkleRoot"):
             self.assertNotIn(preset, block, f"preset marketplace term leaked: {preset}")
@@ -167,8 +167,7 @@ class TestScaffoldBlock(unittest.TestCase):
         self.assertIn("WEB_API", block)
 
     def test_scaffold_includes_fee_on_transfer_mock(self) -> None:
-        # The highest-yield accounting bug class (declared != received) must be scaffolded so it is
-        # reachable WITHOUT a fork.
+        # The accounting edge harness remains available without a fork.
         block = scaffold_block("EVM_CONTRACT", "core", ["src/Market.sol"])
         self.assertIn("MockFeeOnTransferERC20", block)
         self.assertIn("fee-on-transfer", block.lower())
@@ -186,15 +185,17 @@ class TestNonEvmScaffolds(unittest.TestCase):
         _write(Path(d), name, body)
         return d
 
-    def test_web_auth_idor_pytest_pass_cue(self) -> None:
+    def test_web_access_boundary_pytest_pass_cue(self) -> None:
         repo = self._web_repo("auth_routes.py", "def login(): pass  # oauth jwt session bearer token")
         block = scaffold_block("WEB_API", "accounts", ["src/auth_routes.py"], repo_path=repo)
         self.assertIn("pytest", block)
         self.assertIn("requests", block)
         # expect="pass" semantics stated explicitly: unauthorized access SUCCEEDING => bug => FAIL.
         self.assertIn('expect="pass"', block)
-        for needle in ("IDOR", "TOKEN_A", "TOKEN_B", "test_authz.py"):
+        for needle in ("cross-principal", "TOKEN_A", "TOKEN_B", "test_authz.py"):
             self.assertIn(needle, block)
+        self.assertNotIn("IDOR", block)
+        self.assertNotIn("BOLA", block)
         self.assertNotIn("vm.sign", block)
 
     def test_web_payment_idempotency_pytest_pass_cue(self) -> None:
@@ -279,7 +280,7 @@ class TestNonEvmScaffolds(unittest.TestCase):
                           ("SUPPLY_CHAIN", ["package.json"]), ("INFRA", ["main.tf"]),
                           ("MOBILE_APP", ["AndroidManifest.xml"])):
             block = scaffold_block(tc, "s", files)
-            for banned in ("Seaport", "Uniswap", "Stripe Inc", "AWS account 123"):
+            for banned in ("KnownProductA", "KnownProductB", "Example Inc", "cloud account 123"):
                 self.assertNotIn(banned, block)
 
 

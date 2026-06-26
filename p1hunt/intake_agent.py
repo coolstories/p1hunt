@@ -1,9 +1,9 @@
 """Intake agent — finds the bug-bounty program and reads the rules (spec §2.1, §2.3).
 
-A real Claude session with web access (WebFetch/WebSearch) that — given a program NAME (+ platform)
-or an explicit URL — locates the official program page, reads the safe-harbor rules and severity
-taxonomy, and extracts the IN-SCOPE source repositories and the OUT-OF-SCOPE assets. Returns a
-structured scope brief the launcher confirms before any hunting begins.
+An engine-agnostic live AI session with web access that — given a program NAME (+ platform) or an
+explicit URL — locates the official program page, reads the safe-harbor rules and severity taxonomy,
+and extracts the IN-SCOPE source repositories and the OUT-OF-SCOPE assets. Returns a structured
+scope brief the launcher confirms before any hunting begins.
 
 NOTHING PRESET (spec §1): there is no built-in program/scope database. Everything is researched
 live from the program's own page; if it can't be confirmed, the brief says so and stays empty
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import tempfile
 
-from .agents.claude_session import ClaudeSession
+from .agents.claude_session import make_session
 from .agents.claude_swarm import _parse_json_object
 
 
@@ -64,14 +64,17 @@ Return ONLY JSON (no prose):
 
 
 async def research_program(
-    name: str, url: str, focus: str, *, platform: str = "", model: str | None, on_event=None
+    name: str, url: str, focus: str, *, platform: str = "", model: str | None, on_event=None,
+    engine: str | None = None, codex_model: str | None = None, codex_effort: str | None = None,
 ) -> dict:
     """Run the intake agent. ``url`` may be empty — then the agent searches ``platform`` for the
     program by name. Returns the parsed brief, or a brief with ``_ok=False`` if unavailable."""
     with tempfile.TemporaryDirectory() as tmp:
-        session = ClaudeSession(
+        session = make_session(
             agent_name="intake", model=model, on_event=on_event or (lambda *_a: None),
-            guard_check=None, max_turns=24,
+            guard_check=None, max_turns=24, engine=engine,
+            codex_model=codex_model, effort=codex_effort,
+            allow_web=True, web_budget=8,
         )
         result = await session.run(_prompt(name, url, focus, platform), tmp)
     brief = _parse_json_object(result.text)

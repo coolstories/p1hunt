@@ -261,6 +261,28 @@ class RunGracefulTests(unittest.TestCase):
                 )
         self.assertIn("-k test_x", res.command)
 
+    def test_pytest_cov_arg_error_retries_without_coverage(self):
+        with tempfile.TemporaryDirectory() as d:
+            hp = os.path.join(d, "test_poc.py")
+            with open(hp, "w") as fh:
+                fh.write("def test_x():\n    pass\n")
+            calls = []
+
+            def fake_run(argv, *_a, **_kw):
+                calls.append(list(argv))
+                if "--cov" in argv:
+                    return True, 4, "pytest: error: unrecognized arguments: --cov /tmp/x --cov-report=term-missing"
+                return True, 0, "tests/test_poc.py::test_x PASSED\n============================== 1 passed in 0.01s =============================="
+
+            with mock.patch.object(web, "run_command", side_effect=fake_run):
+                res = WebRunner().run(d, _spec(harness_path="test_poc.py", expect="pass"))
+        self.assertTrue(res.ran)
+        self.assertTrue(res.reproduced)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--cov", calls[0])
+        self.assertNotIn("--cov", calls[1])
+        self.assertNotIn("--cov-report=term-missing", calls[1])
+
 
 if __name__ == "__main__":
     unittest.main()

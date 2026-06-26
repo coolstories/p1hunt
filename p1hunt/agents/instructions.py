@@ -113,7 +113,8 @@ class SubTask:
             f"Hypothesis {self.hypothesis_id}: {self.claim}\n"
             f"Context:\n{self.packed_context}\n"
             f"Pursue exactly this path: {self.one_path}\n"
-            f"Return a reproduced artifact or a falsification. Required evidence:\n{ev}\n"
+            f"Return a reproduced artifact or a falsification. The defect must be attributable to "
+            f"the in-scope target, not the harness/mocks/fixtures/external setup. Required evidence:\n{ev}\n"
             f"Safety: local/fork/UAT/owned only; no destructive validation; stop on out-of-scope or third-party data."
         )
 
@@ -140,7 +141,7 @@ def parent_directive(
     mission = (
         f"Find and reproduce a {surface.lens} weakness on {surface.target_asset} that the "
         f"program would classify as critical. Hunt as if a P1 exists — persistence is the "
-        f"job — but promote only on a reproduced artifact."
+        f"job — but promote only on a reproduced, target-attributed artifact."
     )
     return TrackDirective(
         track_id=f"T{track_index:02d}",

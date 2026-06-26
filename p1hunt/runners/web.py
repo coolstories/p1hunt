@@ -1,8 +1,7 @@
 """Web/API reproduction runner — the deterministic verdict layer for WEB_API targets and the
 generic OTHER/unknown fallback (spec §10, §1 NOTHING PRESET).
 
-The gap this closes: a web/authz finding ("an unauthenticated request reached an admin route",
-"an IDOR returned another tenant's record") must not be promoted on a Claude session's say-so. A
+The gap this closes: a live web/API claim must not be promoted on a model session's say-so. A
 prover materializes a runnable harness into the sandbox — a pytest property/exploit script, or a
 Playwright/Node end-to-end script — and this runner DERIVES the toolchain argv itself from the
 harness file (never executing the model-supplied ``spec.command`` — that would be an injection
@@ -50,6 +49,7 @@ _PYTEST_PASS_ID_RE = re.compile(r"^(\S+::\S+)\s+PASSED", re.MULTILINE)
 _COV_TOTAL_RE = re.compile(r"^TOTAL\s+(\d+)\s+(\d+)\s+(\d+)%", re.MULTILINE)
 # pytest-cov per-file line, e.g. "app/routes.py   40   4   90%".
 _COV_FILE_RE = re.compile(r"^([\w./\\-]+\.py)\s+(\d+)\s+(\d+)\s+(\d+)%(?:\s+([\d,\-\s]+))?$", re.MULTILINE)
+_PYTEST_COV_ARG_ERROR_RE = re.compile(r"unrecognized arguments:.*--cov|no such option: --cov", re.I | re.S)
 
 
 def _pytest_counts(output: str) -> dict[str, int]:
@@ -228,8 +228,8 @@ def _select_toolchain(harness: Path, spec: ReproSpec) -> tuple[str, list[str], t
         argv = ["pytest", "-q", path_str]
         if spec.test_name:
             argv += ["-k", spec.test_name]
-        # Best-effort coverage of the harness's package dir; pytest ignores --cov gracefully if the
-        # plugin is absent only when it IS installed, so this is purely opportunistic.
+        # Best-effort coverage of the harness's package dir. If pytest-cov is absent, run() retries
+        # without these args so the proof does not fail for an optional telemetry plugin.
         argv += ["--cov", str(harness.parent), "--cov-report=term-missing"]
         return "pytest", argv, ("pytest",)
     # Anything else (.js/.mjs/.cjs/...) runs as a plain node script.
@@ -268,6 +268,15 @@ class WebRunner:
             argv, workdir, timeout=timeout, tools_required=tools_required,
             on_event=on_event, runner=self.name,
         )
+        if tool == "pytest" and ran and exit_code != 0 and _PYTEST_COV_ARG_ERROR_RE.search(output or ""):
+            argv = [a for a in argv if a != "--cov-report=term-missing"]
+            if "--cov" in argv:
+                i = argv.index("--cov")
+                del argv[i:i + 2]
+            ran, exit_code, output = run_command(
+                argv, workdir, timeout=timeout, tools_required=tools_required,
+                on_event=on_event, runner=self.name,
+            )
         command = " ".join(argv)
         if not ran:
             return ReproResult(

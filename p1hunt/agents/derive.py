@@ -1,22 +1,15 @@
-"""Derivation engine (spec §6) — Parent A's first action on every engagement.
+"""Minimal engagement derivation.
 
-Replaces ALL presets. Given the ``Scope`` and the acquired artifacts, it classifies the
-target, selects only the appropriate toolset, ranks the surface by reachability -> impact
-*for this target*, seeds emergent hypothesis classes, derives the ScopeGuard policy, and
-returns the ``EngagementPlan``. Feeding three different scopes MUST yield three materially
-different plans (§6 acceptance, §16).
-
-The only things baked in are *derivation rules* (class -> candidate toolset; generic
-detector -> lens). No surface list, hypothesis list, or per-target playbook is hardcoded.
+This layer is execution plumbing only: classify enough of the acquired artifact to choose a runner
+and safety posture. It must not seed failure modes, target names, surfaces, hypotheses, or priorities;
+Parent A derives those live from the repository during cold reconnaissance.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
+from pathlib import Path
 
 from ..classify.classifier import classify_artifacts
-from ..classify.evm_signals import scan_combined
-from ..classify.signals import SignalHit
 from ..models import (
     EngagementPlan,
     ImpactSurface,
@@ -53,9 +46,8 @@ _ENV_BY_CLASS: dict[TargetClass, str] = {
 def derive_plan(scope: Scope, artifact_dir: str) -> EngagementPlan:
     target_class = classify_artifacts(artifact_dir, scope)
     toolset = list(_TOOLSET_BY_CLASS.get(target_class, _TOOLSET_BY_CLASS[TargetClass.OTHER]))
-    hits = scan_combined(artifact_dir)
-    surfaces = _rank_surfaces(target_class, hits, scope)
-    hypothesis_seeds = _seed_hypotheses(surfaces)
+    surfaces = _repo_surfaces(artifact_dir, target_class, scope)
+    hypothesis_seeds: list[str] = []
     policy = derive_scopeguard_policy(scope, target_class)
     impact_definition = _impact_definition(scope)
 
@@ -69,71 +61,43 @@ def derive_plan(scope: Scope, artifact_dir: str) -> EngagementPlan:
     )
 
 
-def _rank_surfaces(
-    target_class: TargetClass, hits: list[SignalHit], scope: Scope
-) -> list[ImpactSurface]:
-    by_lens: dict[str, list[SignalHit]] = defaultdict(list)
-    for hit in hits:
-        by_lens[hit.signal.lens].append(hit)
-
+def _repo_surfaces(artifact_dir: str, target_class: TargetClass, scope: Scope) -> list[ImpactSurface]:
+    """Create neutral file-cluster placeholders when a legacy caller needs an EngagementPlan."""
     env = _ENV_BY_CLASS.get(target_class, "local")
     fallback_asset = scope.in_scope[0].value if scope.in_scope else "local source snapshot"
-
-    if not by_lens:
-        return [
-            ImpactSurface(
-                id="SURF-BASELINE",
-                title="No critical signal matched yet — keep mapping trust boundaries",
-                lens="business-logic",
-                target_asset=fallback_asset,
-                trust_boundary="To be derived from routes, roles, and protected objects.",
-                safe_validation_environment=env,
-                criticality_rationale="Continue mapping high-value boundaries before validation.",
-                priority=5,
-            )
-        ]
-
-    # Lens weight: asset-custody and authorization boundaries rank highest for P1.
-    lens_weight = {
-        "asset-custody": 1,
-        "authorization-boundary": 1,
-        "trusted-execution": 2,
-        "confidentiality": 3,
-        "business-logic": 3,
-        "availability-if-allowed": 4,
-    }
-    ordered = sorted(by_lens.items(), key=lambda kv: (lens_weight.get(kv[0], 9), -len(kv[1])))
-
+    root = Path(artifact_dir)
+    counts: dict[str, int] = {}
+    for p in root.rglob("*"):
+        if not p.is_file() or any(part.startswith(".") for part in p.parts):
+            continue
+        try:
+            rel = p.relative_to(root)
+        except ValueError:
+            continue
+        if not rel.parts:
+            continue
+        key = rel.parts[0] if len(rel.parts) > 1 else rel.stem
+        if key.lower() in {"test", "tests", "mock", "mocks", "example", "examples", "build", "dist"}:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:6]
+    if not ordered:
+        ordered = [("repo", 0)]
     surfaces: list[ImpactSurface] = []
-    for index, (lens, lens_hits) in enumerate(ordered, start=1):
-        top = lens_hits[0]
+    for index, (component, count) in enumerate(ordered, start=1):
         surfaces.append(
             ImpactSurface(
                 id=f"SURF-{index:03d}",
-                title=f"{_label(lens)} surface in {target_class.value}",
-                lens=lens,
+                title=f"Repository component: {component}",
+                lens=f"component:{component}",
                 target_asset=fallback_asset,
-                trust_boundary=f"{top.signal.rationale} (e.g. {top.file}:{top.line})",
+                trust_boundary="To be derived by Parent A from code-level entrypoints and actors.",
                 safe_validation_environment=env,
-                criticality_rationale=(
-                    f"{len(lens_hits)} derived signal(s) map to {_label(lens).lower()} impact."
-                ),
-                priority=lens_weight.get(lens, 9),
+                criticality_rationale=f"Neutral component placeholder from repository structure ({count} files).",
+                priority=index,
             )
         )
     return surfaces
-
-
-def _seed_hypotheses(surfaces: list[ImpactSurface]) -> list[str]:
-    seeds: list[str] = []
-    for surface in surfaces:
-        if surface.id == "SURF-BASELINE":
-            continue
-        seeds.append(
-            f"A reachable {surface.lens} weakness on {surface.target_asset} "
-            f"({surface.trust_boundary}) may produce critical impact."
-        )
-    return seeds
 
 
 def _impact_definition(scope: Scope) -> str:
@@ -150,10 +114,6 @@ def _impact_definition(scope: Scope) -> str:
         f"P1 under {scope.program}: use the program's own critical-severity definition; "
         "promotion requires reproduced impact that the program would classify as critical."
     )
-
-
-def _label(lens: str) -> str:
-    return " ".join(part.capitalize() for part in lens.split("-"))
 
 
 def make_hypothesis_id() -> str:

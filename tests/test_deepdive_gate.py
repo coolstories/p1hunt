@@ -6,6 +6,7 @@ that separates 'found an anomaly' from 'landed a critical'.
 
 import types
 import unittest
+import inspect
 
 from p1hunt.agents.claude_hunter import ClaudeExploitDeveloper, exploit_dev_prompt
 from p1hunt.agents.claude_session import ClaudeFinding
@@ -30,6 +31,22 @@ class _Shim:
         self._exploit_proven = set()
 
 
+class _RubricShim:
+    _rubric_priority_terms = ClaudeSwarm._rubric_priority_terms
+    _candidate_priority_text = ClaudeSwarm._candidate_priority_text
+    _rubric_lead_score = ClaudeSwarm._rubric_lead_score
+
+    def __init__(self):
+        self.scope = types.SimpleNamespace(
+            severity_taxonomy={
+                "Critical": "account takeover or fund withdrawal from protected assets",
+                "High": "limited account impact",
+            },
+            scope_note="Prioritize proof of direct asset loss.",
+            safe_harbor_text="",
+        )
+
+
 class TestDeepDiveGate(unittest.TestCase):
     def test_primitive_not_confirmed_until_exploit_proven(self):
         s = _Shim()
@@ -52,6 +69,50 @@ class TestDeepDiveGate(unittest.TestCase):
         s._debate_rejected.add(s._finding_key(f))             # reject overrides everything
         self.assertEqual(s._confirmed_crits([f]), [])
 
+    def test_deepdive_priority_is_derived_from_program_rubric(self):
+        s = _RubricShim()
+        terms = s._rubric_priority_terms()
+        asset_loss = types.SimpleNamespace(
+            title="Fund withdrawal invariant bypass",
+            severity="high",
+            root_cause="missing authorization on asset withdrawal",
+            counterfactual="attacker withdraws protected assets",
+        )
+        generic = types.SimpleNamespace(
+            title="Cache invalidation edge case",
+            severity="high",
+            root_cause="stale metadata",
+            counterfactual="minor user confusion",
+        )
+        self.assertIn("withdrawal", terms)
+        self.assertGreater(s._rubric_lead_score(asset_loss, terms),
+                           s._rubric_lead_score(generic, terms))
+
+    def test_exploit_depth_is_backgrounded_not_round_blocking(self):
+        src = inspect.getsource(ClaudeSwarm.hunt)
+        self.assertIn("self._exploit_tasks", src)
+        self.assertIn("asyncio.create_task(_run_exploit_depth", src)
+        self.assertIn("exploit_background_started", src)
+
+    def test_fastlane_does_not_cancel_child_discovery_by_default(self):
+        src = inspect.getsource(ClaudeSwarm.hunt)
+        self.assertIn('P1HUNT_FASTLANE_CUT_DISCOVERY", "0"', src)
+        self.assertIn("child discovery continues", src)
+
+    def test_fuzz_campaigns_are_backgrounded_not_child_round_blocking(self):
+        src = inspect.getsource(ClaudeSwarm.hunt)
+        self.assertIn("fuzz_background_started", src)
+        self.assertIn("self._fuzz_tasks", src)
+        self.assertIn("self._round_tasks = [asyncio.ensure_future(_run(h)) for h in hunters]", src)
+        self.assertNotIn("self._round_tasks += [asyncio.ensure_future(_run_fuzz", src)
+
+    def test_side_lanes_do_not_consume_child_discovery_slots(self):
+        init_src = inspect.getsource(ClaudeSwarm.__init__)
+        hunt_src = inspect.getsource(ClaudeSwarm.hunt)
+        self.assertIn("self.side_sem", init_src)
+        self.assertIn("P1HUNT_DEEP_DISCOVERY_CONCURRENCY", init_src)
+        self.assertIn("async with self.side_sem", hunt_src)
+
 
 class TestExploitDevPrompt(unittest.TestCase):
     def test_prompt_demands_full_chain_and_attribution(self):
@@ -61,6 +122,22 @@ class TestExploitDevPrompt(unittest.TestCase):
         for must in ("exploit developer", "attacker-win", "cryptanalysis", "lattice",
                      "multi-party", "shipped", "aborts", "impossibility"):
             self.assertIn(must, p)
+
+    def test_prompt_demands_composition_and_independent_win_check_without_presets(self):
+        f = ClaudeFinding(title="t", severity="medium", file="src/x.cpp", line=1, root_cause="r",
+                          counterfactual="c", reproduction="x", lens="trusted-execution", confidence="high")
+        p = exploit_dev_prompt(f, "Critical=top-tier target impact", ".p1hunt-poc").lower()
+        for must in (
+            "composition step",
+            "honest target code",
+            "non-degenerate",
+            "independently check",
+            "raw checker input",
+            "fixed message/object/state",
+        ):
+            self.assertIn(must, p)
+        for banned in ("fireblocks", "eddsa", "mta", "seaport", "paillier"):
+            self.assertNotIn(banned, p)
 
     def test_prompt_robust_to_promoted_Finding_type(self):
         # The promoted Finding has NO .file/.line/.reproduction/.lens (those are ClaudeFinding's).

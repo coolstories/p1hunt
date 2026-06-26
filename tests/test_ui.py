@@ -54,10 +54,10 @@ class Theme(unittest.TestCase):
         self.assertIn("CANDIDATE", card)
 
     def test_report_card_leads_with_p1(self) -> None:
-        rc = T.report_card(program="Fireblocks MPC", status="REPORT_READY", rounds=6, reframes=5,
+        rc = T.report_card(program="Example Program", status="REPORT_READY", rounds=6, reframes=5,
                            p1_count=1, candidate_count=12, tokens_total=1_240_000, cost=4.1,
                            elapsed_s=742, target_class="CRYPTO_LIB", color=False)
-        self.assertIn("Fireblocks MPC", rc)
+        self.assertIn("Example Program", rc)
         self.assertIn("P1 found   1 confirmed", rc)
         self.assertIn("CRYPTO_LIB", rc)
 
@@ -106,7 +106,7 @@ class CockpitCards(unittest.TestCase):
     def test_findings_tab_emits_aligned_card(self) -> None:
         from p1hunt.ui.tui_app import TuiState
 
-        s = TuiState("Fireblocks MPC")
+        s = TuiState("Example Program")
         s.ingest("parent_a", "finding", {"id": "F1", "title": "Forged proof", "severity": "critical",
                                          "location": "src/mta.cpp:9", "counterfactual": "key theft",
                                          "remediation": "bind challenge", "reproduced": True})
@@ -121,7 +121,7 @@ class CockpitCards(unittest.TestCase):
     def test_header_leads_with_p1_and_round(self) -> None:
         from p1hunt.ui.tui_app import TuiState
 
-        s = TuiState("Fireblocks MPC")
+        s = TuiState("Example Program")
         s.ingest("parent_a", "message", {"phase": "round", "round": 3})
         s.ingest("parent_a", "finding", {"id": "F1", "title": "x", "severity": "critical"})
         h = s.header()

@@ -33,20 +33,38 @@ class EventLog:
         self.path = Path(path) if path else None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._persisted_path: Path | None = None
+        self._persisted_count = 0
         self.events: list[Event] = []
         self._subscribers: list[Callable[[Event], None]] = []
         self._queues: list[asyncio.Queue[Event]] = []
 
     def redirect(self, path: str | Path) -> None:
         """Point the log at a JSONL file and flush everything emitted so far (so the file is
-        a complete record once the engagement folder is known)."""
-        self.path = Path(path)
+        a complete record once the engagement folder is known). Existing logs are append-only:
+        attaching a helper to a live/resumed engagement must never truncate the history."""
+        new_path = Path(path)
+        same_persisted_path = self._persisted_path is not None and self._persisted_path == new_path
+        start = self._persisted_count if same_persisted_path else 0
+        self.path = new_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as handle:
-            for event in self.events:
+        append = self.path.exists() and self.path.stat().st_size > 0
+        with self.path.open("a" if append else "w", encoding="utf-8") as handle:
+            if append:
+                try:
+                    with self.path.open("rb") as raw:
+                        raw.seek(-1, 2)
+                        needs_newline = raw.read(1) != b"\n"
+                    if needs_newline:
+                        handle.write("\n")
+                except OSError:
+                    pass
+            for event in self.events[start:]:
                 handle.write(json.dumps(
                     {"id": event.id, "ts": event.ts, "agent": event.agent,
                      "kind": event.kind, "data": event.data}, default=_encode) + "\n")
+        self._persisted_path = self.path
+        self._persisted_count = len(self.events)
 
     # Live-only ephemera (token deltas) — streamed to subscribers but not persisted/kept.
     _TRANSIENT = {"stream", "stream_start"}
@@ -68,6 +86,8 @@ class EventLog:
             )
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+            self._persisted_path = self.path
+            self._persisted_count = len(self.events)
         for sub in list(self._subscribers):
             sub(event)
         for queue in list(self._queues):

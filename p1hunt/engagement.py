@@ -59,8 +59,11 @@ def scope_from_dict(d: dict) -> Scope:
         rules=d.get("rules", []),
         rate_limit=d.get("rate_limit", ""),
         source_urls=d.get("source_urls", []),
+        out_of_scope_globs=d.get("out_of_scope_globs", []),
+        scope_note=d.get("scope_note", ""),
         dynamic_targets=[_dynamic_target(t) for t in d.get("dynamic_targets", [])],
         test_identities=[_identity(i) for i in d.get("test_identities", [])],
+        captured_at=d.get("captured_at", 0.0) or 0.0,
     )
 
 
@@ -77,6 +80,8 @@ def scope_to_dict(scope: Scope) -> dict:
         "rules": scope.rules,
         "rate_limit": scope.rate_limit,
         "source_urls": scope.source_urls,
+        "out_of_scope_globs": scope.out_of_scope_globs,
+        "scope_note": scope.scope_note,
         "dynamic_targets": [dataclasses.asdict(t) for t in scope.dynamic_targets],
         # REDACT live credentials on disk: persist the env-var NAME, never the secret value. The
         # token is re-supplied via the environment at runtime (see TestIdentity.resolve).
@@ -151,6 +156,10 @@ def _write_program_md(path: Path, scope: Scope, status: EngagementStatus) -> Non
         "## Safe harbor",
         "",
         scope.safe_harbor_text or "(missing — blocks intake)",
+        "",
+        "## Scope / reward note",
+        "",
+        scope.scope_note or "(none)",
         "",
         "## Severity taxonomy (program's own)",
         "",

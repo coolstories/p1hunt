@@ -10,6 +10,7 @@ program's own critical definition. Never auto-submits.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from ..classify.evm_signals import scan_combined
@@ -135,7 +136,9 @@ class ParentA:
     # --- §7 delegation ----------------------------------------------------
     def setup_tracks(self, max_tracks: int = 6) -> list[ChildB]:
         assert self.plan is not None and self.guard is not None, "call derive() first"
-        self._hits = scan_combined(self.artifact_dir)
+        # Legacy deterministic signal scanning is opt-in only. Default runs must not seed Parent A
+        # with preset failure modes; live/Codex hunts derive tracks and hypotheses from recon.
+        self._hits = scan_combined(self.artifact_dir) if os.environ.get("P1HUNT_LEGACY_STATIC_SIGNALS") == "1" else []
         self.falsifier = Falsifier(self.reasoner, self.bb, self.log)
         self.bus.register(self.falsifier.name, "falsifier")
 
@@ -180,9 +183,9 @@ class ParentA:
         self._reframes += 1
         surfaces = [s for s in (self.plan.surface_ranking if self.plan else []) if s.id != "SURF-BASELINE"]
         if not surfaces:
-            return "deepen analysis on the current surface"
+            return f"deepen analysis on the current surface (pass {self._reframes})"
         nxt = surfaces[self._reframes % len(surfaces)]
-        return f"rotate to {nxt.lens} surface ({nxt.title}); deepen, do not escalate aggressiveness"
+        return f"rotate to {nxt.lens} surface ({nxt.title}); deepen pass {self._reframes}, do not escalate aggressiveness"
 
     # --- §8 + §10 the hunt ------------------------------------------------
     async def hunt(self, max_rounds: int = 8) -> HuntResult:
