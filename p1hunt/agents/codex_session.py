@@ -563,7 +563,9 @@ class CodexSession:
             return SessionResult(ok=False, text=text, error="rate_limited", tool_calls=self.tool_calls)
         except Exception as exc:  # pragma: no cover - defensive
             _read_and_unlink(last_msg_file)
-            return SessionResult(ok=False, text="\n".join(acc), error=str(exc), tool_calls=self.tool_calls)
+            err = str(exc)
+            tag = "output_overflow" if _looks_output_overflow(err) else err
+            return SessionResult(ok=False, text="\n".join(acc), error=tag, tool_calls=self.tool_calls)
 
         text = _read_and_unlink(last_msg_file) or "\n".join(acc)
         rc = proc.returncode or 0

@@ -206,6 +206,11 @@ class TestModelFailover(unittest.TestCase):
         self.assertTrue(_looks_output_overflow("Separator is not found, and chunk exceed the limit"))
         self.assertFalse(_looks_output_overflow("You've hit your usage limit"))
 
+    def test_raw_output_overflow_exception_is_retryable(self):
+        import inspect
+        src = inspect.getsource(CodexSession._run_once)
+        self.assertIn('tag = "output_overflow" if _looks_output_overflow(err) else err', src)
+
     def test_io_discipline_enforces_reasoned_bounded_code_reads(self):
         wrapped = _with_io_discipline("hunt this code", retry=True)
         self.assertIn("Reason your way to the code", wrapped)
