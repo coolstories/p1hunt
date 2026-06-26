@@ -304,8 +304,9 @@ def _discover_link_flags(root: Path, *, max_libs: int = 8) -> list[str]:
     """Discover libraries the build actually produced under ``root`` and return link flags
     (``-L``/``-l``/``-Wl,-rpath``) so a native harness can link the REAL in-scope library. Pure
     discovery of what's on disk — no per-target names. Shared libs (preferred) carry their own
-    NEEDED deps, so linking ``libcosigner.so`` transitively pulls crypto/zstd/etc. Empty when the
-    build produced nothing to link (then a harness must be self-contained, exactly as before)."""
+    NEEDED deps, so linking the built target library can pull its transitive dependencies. Empty
+    when the build produced nothing to link (then a harness must be self-contained, exactly as
+    before)."""
     names: list[str] = []
     libdirs: list[str] = []
     try:
@@ -421,7 +422,7 @@ class CryptoRunner:
         # objects/libs land for linking.
         includes = [f"-I{root}", f"-I{root / 'include'}", f"-I{root / 'src'}", f"-I{root / 'build'}"]
         # Link any library the build actually produced (generic discovery — NOTHING preset), with
-        # rpath, so a harness that exercises the in-scope library (e.g. libcosigner) links + runs.
+        # rpath, so a harness that exercises the in-scope library links + runs.
         # Shared libs carry their own NEEDED deps (crypto/zstd/...); this is what lets a real
         # lib-dependent PoC deterministically CONFIRM instead of only compiling toy reimplementations.
         link = _discover_link_flags(root)

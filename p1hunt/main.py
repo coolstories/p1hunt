@@ -943,8 +943,8 @@ def main(argv: list[str] | None = None) -> int:
     hunt.add_argument("--live-env", dest="live_env", default=None,
                       choices=["uat", "owned", "testnet", "staging", "local", "bounty"],
                       help="Environment class of the live target (default uat). 'bounty' = an authorized "
-                           "public bug-bounty program whose safe harbor permits in-scope live testing "
-                           "(e.g. T-Mobile on HackerOne). The bare label 'production' is never allowed.")
+                           "public bug-bounty program whose safe harbor permits in-scope live testing. "
+                           "The bare label 'production' is never allowed.")
     hunt.add_argument("--web", action="store_true",
                       help="Black-box WEB-APP pentest of a live authorized target: recon the "
                            "in-scope hosts, derive attacker-win hypotheses from observed app behavior, "
