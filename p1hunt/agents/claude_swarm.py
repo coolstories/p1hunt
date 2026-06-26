@@ -1745,6 +1745,34 @@ class ClaudeSwarm:
         """Preset-free mode: static scanner hits are never injected as hunter leads."""
         return []
 
+    def _parent_recon_brief(self, scope_plan: dict | None) -> str:
+        """Compact Parent-A-owned baseline for live web children.
+
+        Parent A owns the boring but essential web facts: authorized targets, reachability,
+        observed statuses/errors, scope limits, crown jewels, and top hypothesis. Children should
+        attack from this shared model instead of rediscovering basic transport state on every track.
+        """
+        if not isinstance(scope_plan, dict):
+            return ""
+        parts: list[str] = []
+        summary = str(scope_plan.get("summary", "") or "").strip()
+        if summary:
+            parts.append("Parent A baseline summary: " + summary[:1200])
+        critical = str(scope_plan.get("critical_means", "") or "").strip()
+        if critical:
+            parts.append("Critical bar: " + critical[:700])
+        for label, key, limit in (
+            ("Crown jewels", "crown_jewels", 5),
+            ("Attack surface", "attack_surface", 8),
+        ):
+            vals = [str(x).strip() for x in (scope_plan.get(key) or []) if str(x).strip()][:limit]
+            if vals:
+                parts.append(label + ": " + " | ".join(vals)[:1600])
+        hyp = str(scope_plan.get("top_hypothesis", "") or "").strip()
+        if hyp:
+            parts.append("Parent A top hypothesis: " + hyp[:700])
+        return "\n".join(parts)[:5000]
+
     async def hunt(self, max_rounds: int | None = None) -> HuntResult:
         """Never-stop: hunt round after round until a critical is confirmed or the operator
         stops. ``max_rounds`` is an optional safety cap (None = truly unbounded, §8)."""
@@ -1836,10 +1864,12 @@ class ClaudeSwarm:
                 tracks = (resume.get("tracks") or self._fallback_tracks())[:6]
                 self._known_patterns = []
                 oracle_desc = str(resume.get("oracle_desc", "") or "")
+                parent_recon_brief = ""
             else:
                 # NOTHING PRESET (§1): Parent A performs COLD reconnaissance of the target and
                 # DERIVES the subsystems/invariants/tracks itself from this source tree.
                 scope_plan = await self._scope(guard)
+                parent_recon_brief = self._parent_recon_brief(scope_plan)
                 critical_means = scope_plan.get("critical_means") or plan.impact_definition
                 tracks = (scope_plan.get("tracks") or self._fallback_tracks())[:6]
                 self._known_patterns = []
@@ -1911,6 +1941,13 @@ class ClaudeSwarm:
                     h._ruled_out = list(tr.get("ruled_out", []) or [])
                     h._directive = str(tr.get("directive", "") or "")
                     h._model = str(tr.get("model", "") or "")  # restore the accumulated model (skips re-map)
+                elif h.web_mode and parent_recon_brief:
+                    h._model = parent_recon_brief
+                    h._directive = (
+                        "Start from Parent A's baseline model. Do not redo broad reachability, "
+                        "route, or status probing unless your track needs one narrow confirmation. "
+                        "Spend your turns on the track-specific attacker-win question."
+                    )
                 hunters.append(h)
                 self._emit(self.name, "message",
                            {"to": name, "kind": "assign", "lens": h.theme, "mission": h.subsystem,
@@ -1942,6 +1979,12 @@ class ClaudeSwarm:
                 so.oob_available = self._oob is not None
                 so.scope_note = (getattr(self.scope, "scope_note", "")
                                  or getattr(self.scope, "safe_harbor_text", "") or "")
+                if so.web_mode and parent_recon_brief:
+                    so._model = parent_recon_brief
+                    so._directive = (
+                        "Start from Parent A's baseline model. Do not redo broad reachability, "
+                        "route, or status probing unless one narrow confirmation is necessary."
+                    )
                 hunters.append(so)
                 self._emit(self.name, "lifecycle",
                            {"event": "second_opinion", "subsystem": so.subsystem,

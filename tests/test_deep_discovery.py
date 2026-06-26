@@ -28,6 +28,7 @@ class _ReconShim:
     _has_live_web_targets = ClaudeSwarm._has_live_web_targets
     _dynamic_target_payload = ClaudeSwarm._dynamic_target_payload
     _live_web_scope_prompt = ClaudeSwarm._live_web_scope_prompt
+    _parent_recon_brief = ClaudeSwarm._parent_recon_brief
     _scope_prompt = ClaudeSwarm._scope_prompt
     _scope_guidance = lambda self: ""
 
@@ -113,6 +114,24 @@ class TestParentAReconMode(unittest.TestCase):
         import inspect
         src = inspect.getsource(ClaudeSwarm._scope)
         self.assertIn("allow_web=self._has_live_web_targets()", src)
+
+    def test_parent_recon_brief_carries_web_baseline_to_children(self):
+        brief = _ReconShim("active")._parent_recon_brief({
+            "summary": "GET /flag timed out; no HTTP status observed.",
+            "critical_means": "retrieve protected proof artifact",
+            "crown_jewels": ["flag endpoint"],
+            "attack_surface": ["GET exact URL timed out", "HEAD exact URL timed out"],
+            "top_hypothesis": "resolve transport reachability before app-layer claims",
+        })
+        self.assertIn("Parent A baseline summary", brief)
+        self.assertIn("GET /flag timed out", brief)
+        self.assertIn("Attack surface", brief)
+
+    def test_web_children_are_seeded_from_parent_baseline(self):
+        import inspect
+        src = inspect.getsource(ClaudeSwarm.hunt)
+        self.assertIn("h.web_mode and parent_recon_brief", src)
+        self.assertIn("Start from Parent A's baseline model", src)
 
 
 class TestRuntimeKnobs(unittest.TestCase):
