@@ -29,6 +29,7 @@ class _ReconShim:
     _dynamic_target_payload = ClaudeSwarm._dynamic_target_payload
     _live_web_scope_prompt = ClaudeSwarm._live_web_scope_prompt
     _parent_recon_brief = ClaudeSwarm._parent_recon_brief
+    _live_web_recon_blocker = ClaudeSwarm._live_web_recon_blocker
     _scope_prompt = ClaudeSwarm._scope_prompt
     _scope_guidance = lambda self: ""
 
@@ -132,6 +133,39 @@ class TestParentAReconMode(unittest.TestCase):
         src = inspect.getsource(ClaudeSwarm.hunt)
         self.assertIn("h.web_mode and parent_recon_brief", src)
         self.assertIn("Start from Parent A's baseline model", src)
+
+    def test_live_web_timeout_only_recon_blocks_before_children(self):
+        shim = _ReconShim("active")
+        shim._target_class = "WEB_API"
+        shim.scope = Scope(
+            program="web",
+            dynamic_targets=[DynamicTarget("http://192.0.2.10/flag.txt", "bounty", "generic")],
+        )
+        blocker = shim._live_web_recon_blocker({
+            "summary": "GET /flag.txt timed out; no HTTP status/headers/body observed.",
+            "attack_surface": ["GET exact URL status=none marker=curl timeout"],
+            "top_hypothesis": "No concrete app URL or token was observed; fetch composition is blocked.",
+            "tracks": [{"investigate": ["Needs reachable in-scope app URL before testing trusted-origin fetch."]}],
+        })
+        self.assertIn("transport/vantage blocker", blocker)
+
+    def test_live_web_recon_blocker_allows_real_response_or_surface(self):
+        shim = _ReconShim("active")
+        shim._target_class = "WEB_API"
+        shim.scope = Scope(
+            program="web",
+            dynamic_targets=[DynamicTarget("https://app.example.test/api", "bounty", "rest")],
+        )
+        self.assertEqual(shim._live_web_recon_blocker({
+            "summary": "GET /api status=401 with WWW-Authenticate header.",
+            "attack_surface": ["GET https://app.example.test/api status=401"],
+            "tracks": [{"investigate": ["Map auth flow and object authorization."]}],
+        }), "")
+        self.assertEqual(shim._live_web_recon_blocker({
+            "summary": "Flag endpoint timed out, but an in-scope app URL exposes an import webhook.",
+            "attack_surface": ["GET exact URL timeout", "POST /import accepts attacker URL"],
+            "tracks": [{"investigate": ["Test server-side fetch callback safely."]}],
+        }), "")
 
 
 class TestRuntimeKnobs(unittest.TestCase):

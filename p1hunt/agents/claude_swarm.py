@@ -1795,6 +1795,63 @@ class ClaudeSwarm:
             parts.append("Parent A top hypothesis: " + hyp[:700])
         return "\n".join(parts)[:5000]
 
+    def _live_web_recon_blocker(self, scope_plan: dict | None) -> str:
+        """Return a blocker when a live-web run has no actionable surface to hand to children.
+
+        Exact live targets that only time out are not a security hypothesis. If Parent A found no
+        HTTP response, no app/API/auth URL, no credentials, and no trusted-origin/fetch primitive,
+        spawning children just burns turns re-measuring transport. This gate is deliberately
+        evidence-based and generic: any observed response or concrete app surface keeps the run open.
+        """
+        if not self._has_live_web_targets() or not isinstance(scope_plan, dict):
+            return ""
+        import re
+
+        fields: list[str] = []
+        for key in ("summary", "threat_model", "critical_means", "top_hypothesis", "target_subclass"):
+            fields.append(str(scope_plan.get(key, "") or ""))
+        for key in ("crown_jewels", "attack_surface"):
+            fields.extend(str(x) for x in (scope_plan.get(key) or []))
+        for tr in (scope_plan.get("tracks") or []):
+            if isinstance(tr, dict):
+                fields.extend(str(x) for x in (tr.get("investigate") or []))
+                fields.extend(str(x) for x in (tr.get("focus_files") or []))
+        text = "\n".join(fields).lower()
+        if not text.strip():
+            return ""
+
+        has_transport_blocker = any(
+            marker in text
+            for marker in (
+                "timed out", "timeout", "connect timeout", "connection timed", "no http status",
+                "no status/headers/body", "no http response", "transport blocker",
+            )
+        )
+        observed_response = bool(re.search(r"\bstatus\s*[=: ]\s*[1-5]\d\d\b", text) or "http/1." in text)
+        concrete_surface = any(
+            marker in text
+            for marker in (
+                "accepts attacker url", "accepts attacker-controlled url", "attacker-controlled url",
+                "exposes an import", "webhook", "url-fetch", "server-side fetch", "callback endpoint",
+                "posted url", "url parameter", "import endpoint",
+            )
+        )
+        missing_surface = any(
+            marker in text
+            for marker in (
+                "no concrete app", "no concrete web", "no tenant/app url", "not observed/provided",
+                "not observed in authorized", "no p1hunt_token", "no identities", "no token",
+                "no reachable", "missing in-scope", "absent concrete app",
+            )
+        )
+        if has_transport_blocker and not observed_response and not concrete_surface and missing_surface:
+            return (
+                "live web transport/vantage blocker: Parent A observed only timeout/no-response "
+                "behavior and no concrete in-scope app/API/auth/fetch primitive to compose into a P1. "
+                "Provide a reachable in-scope app URL, authorized test identity, or routed vantage."
+            )
+        return ""
+
     async def hunt(self, max_rounds: int | None = None) -> HuntResult:
         """Never-stop: hunt round after round until a critical is confirmed or the operator
         stops. ``max_rounds`` is an optional safety cap (None = truly unbounded, §8)."""
@@ -1881,6 +1938,7 @@ class ClaudeSwarm:
             # candidates + round instead of re-running cold reconnaissance (no progress lost).
             resume = self._load_resume_state()
             oracle_desc = ""  # Parent A's own characterization of the differential oracle (generic)
+            scope_plan = None
             if resume:
                 critical_means = resume.get("critical_means") or plan.impact_definition
                 tracks = (resume.get("tracks") or self._fallback_tracks())[:6]
@@ -2104,6 +2162,26 @@ class ClaudeSwarm:
             seen: set[str] = set()
             prior_titles: list[str] = []
             start_depth = 0
+            if not resume:
+                blocker = self._live_web_recon_blocker(scope_plan)
+                if blocker:
+                    self._emit(self.name, "lifecycle", {
+                        "event": "live_web_blocked",
+                        "reason": blocker,
+                        "next_action": "Provide a reachable in-scope app/API URL, authorized test identity, or routed vantage before relaunching.",
+                    })
+                    self._write_findings_json(findings, all_candidates, needs_human)
+                    watchdog.cancel()
+                    self._stop_fork()
+                    return self._result(
+                        EngagementStatus.BLOCKED_NEEDS_HUMAN_SCOPE_DECISION,
+                        plan,
+                        guard,
+                        findings,
+                        all_candidates,
+                        0,
+                        needs_human,
+                    )
             if resume:  # restore the candidate set + dedup keys + round counter
                 for cd in resume.get("candidates", []):
                     try:
