@@ -23,50 +23,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from range_app import DECOYS, PLANTED, Range  # noqa: E402
+# The matcher is shared with the EXECUTION scorer (bench/run_exec.py). Both numbers get
+# read side by side, so they have to agree on what "this is about defect X" means; see
+# bench/truth.py for why that lives in its own module.
+from truth import norm_path as _norm_path  # noqa: E402
+from truth import stem as _stem  # noqa: E402
 
 from p1hunt.dynamic import recon as R  # noqa: E402
 from p1hunt.dynamic import triage as T  # noqa: E402
 from p1hunt.dynamic.browser import Browser  # noqa: E402
-
-
-def _norm_path(target: str) -> str:
-    """A plan target -> a comparable path template.
-
-    A model names a target the way a person would, so the string often carries a trailing
-    clause: "/share/{id} - default host versus X-Range-Host: m.range". The first version
-    fed that whole string through templatize, so the identifier segment no longer looked
-    like a UUID, the template never matched, and a CORRECTLY FOUND defect was scored as a
-    miss while being listed as an unrelated target. Keep only the leading URL-ish token.
-    """
-    t = (target or "").strip()
-    # ORDER MATTERS. Strip the method verb FIRST, then truncate at whitespace. Doing it
-    # the other way round reduces "GET /api/v1/accounts/{id}" to "GET", which scored a
-    # perfectly good plan as zero recall.
-    for verb in ("GET ", "POST ", "PUT ", "PATCH ", "DELETE ", "ANY ", "HEAD ", "OPTIONS ",
-                 "GRAPHQL ", "FLOW: "):
-        if t.upper().startswith(verb):
-            t = t[len(verb):].strip()
-            break
-    # Then cut any trailing prose clause: a model names a target the way a person would
-    # ("/share/{id} - default host versus X-Range-Host: m.range").
-    import re as _re
-    t = _re.split(r"\s+[\u2014\u2013-]\s+|\s*\(|\s{2,}|,\s|\s+(?:with|using|vs\.?|versus|then|followed)\s+",
-                  t, maxsplit=1)[0].strip()
-    t = t.split()[0] if t.split() else t
-    if "://" in t:
-        import urllib.parse
-        t = urllib.parse.urlsplit(t).path or t
-    t = t.split("?")[0].split("#")[0].strip()
-    tpl, _ = R.templatize(t)
-    # :id / <id> style placeholders too
-    return (tpl.replace("/:id", "/{id}").replace("/<id>", "/{id}").rstrip("/") or "/")
-
-
-def _stem(path: str) -> str:
-    """The distinctive leading segments, for a looser second-chance match."""
-    p = _norm_path(path)
-    parts = [x for x in p.split("/") if x and x != "{id}"]
-    return "/" + "/".join(parts[:3])
 
 
 def score(plan: list[dict]) -> dict:

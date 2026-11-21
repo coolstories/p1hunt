@@ -187,8 +187,23 @@ def render_snapshot(event_log: EventLog, blackboard: Blackboard, bus: MessageBus
     for e in evs:
         d = e.data if isinstance(e.data, dict) else {}
         if e.kind == "usage":
-            tok["total"] += d.get("total", 0); tok["input"] += d.get("input", 0)
-            tok["output"] += d.get("output", 0); tok["cost"] += d.get("cost", 0) or 0
+            # `d.get(k, 0)` returns None when the key EXISTS with a null value, which a
+            # usage event legitimately carries when the provider reported no breakdown.
+            # That crashed the final snapshot render with "unsupported operand type(s)
+            # for +=: 'int' and 'NoneType'" -- killing the process with exit 1 AFTER a
+            # completed hunt, so the run looked like a failure and the report never
+            # printed. Coalesce every field, not just cost.
+            def _num(key: str, default: float = 0) -> float:
+                val = d.get(key)
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    try:
+                        return type(default)(str(val))
+                    except (TypeError, ValueError):
+                        return default
+                return val
+
+            tok["total"] += int(_num("total")); tok["input"] += int(_num("input"))
+            tok["output"] += int(_num("output")); tok["cost"] += _num("cost", 0.0)
         elif e.kind == "reframe":
             reframes += 1
         elif e.kind == "message" and d.get("phase") == "round":

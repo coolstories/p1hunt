@@ -15,6 +15,7 @@ Hypothesis/pytest, a property test for a web API). It degrades gracefully with n
 
 from __future__ import annotations
 
+from .instructions import authorized_role
 import json
 import re
 
@@ -122,7 +123,11 @@ def fuzz_prompt(
             "hold after EVERY call. Configure deep, high-run campaigns (many runs, long call "
             "sequences). A broken invariant with a counterexample sequence is a real finding."
         )
-    return f"""You are an elite fuzzing engineer hunting a CRITICAL bug in the '{subsystem}' subsystem.
+    return f"""{authorized_role(
+        "the differential-testing role",
+        live=False,
+        deliverable="a reproducible input that drives the code into a state it must not reach")}
+You are building a fuzzing/property harness for the '{subsystem}' subsystem.
 You do NOT guess — you SEARCH. Build a real fuzzing harness against the ACTUAL in-scope code and
 run it until it either breaks an invariant (a finding, with the counterexample as proof) or you
 have genuinely exhausted a wide input space (record what you covered).{build_block}

@@ -30,3 +30,9 @@ data/
 .env.*
 *.pem
 *.key
+
+# Live engagement write-ups. These hold real submission material for a real program:
+# live share IDs, account identifiers, session/token LENGTHS, and the submission posture
+# notes. This repo has a public remote, so a blanket `git add -A` would publish all of it.
+# Ignored at the top level so that cannot happen by accident.
+Cyber/

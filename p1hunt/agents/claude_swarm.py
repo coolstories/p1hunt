@@ -190,6 +190,9 @@ class ClaudeSwarm:
         # testing authorized", so arming state and confinement can never be conflated again.
         self._egress_hosts: list[str] = []
         self._dynamic_armed: bool = False
+        # Latch so the HIGH-severity refusal warning is stated once per run, not once per
+        # round -- a repeated warning gets scrolled past, which defeats the point.
+        self._refusal_announced: bool = False
         self._base_url: str = ""                 # the primary authorized dynamic target base URL
         self._oob = None                         # running loopback OOB interaction listener
         self._dynamic_env_keys: list[str] = []   # env vars _arm_dynamic exported (cleared on exit)
@@ -1683,16 +1686,32 @@ class ClaudeSwarm:
         self._live_surface = None
         if self._base_url and (self._egress_hosts or []):
             try:
-                from ..dynamic.browser import Browser
-                from ..dynamic.recon import discover
-
                 pages = int(os.environ.get("P1HUNT_RECON_PAGES", "10") or 10)
                 scripts = int(os.environ.get("P1HUNT_RECON_SCRIPTS", "20") or 20)
-                with Browser(allowlist=list(self._egress_hosts or []),
-                             base_url=self._base_url) as _b:
-                    self._live_surface = discover(_b, [self._base_url],
-                                                  max_pages=max(1, pages),
-                                                  max_scripts=max(0, scripts))
+                # OFF THE EVENT LOOP THREAD. Playwright's SYNC api refuses to start when
+                # an asyncio loop is running in the calling thread ("It looks like you are
+                # using Playwright Sync API inside the asyncio loop"). This method is
+                # synchronous, but it is CALLED from async code, so a loop IS running here
+                # -- and the direct `with Browser(...)` therefore threw on EVERY live hunt
+                # and was swallowed by the degrade-gracefully handler below.
+                #
+                # The consequence was total and silent: self._live_surface was always None
+                # in the product, the planner got no facts to reason over, and black-box
+                # discovery -- the whole point of the browser and the recon miner -- never
+                # happened at all. It passed its own tests because those call discover()
+                # from a sync context, and so does bench/run_range.py, which is why the
+                # measured planning numbers were real while the product got nothing.
+                #
+                # A plain worker thread, not asyncio.to_thread: there is no `await`
+                # available in a sync method. A fresh thread has no loop of its own, which
+                # is exactly what the sync api needs, and the timeout keeps a slow crawl
+                # from stalling every agent queued behind arming.
+                import concurrent.futures as _cf
+
+                with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                    self._live_surface = _pool.submit(
+                        self._discover_live_surface, max(1, pages), max(0, scripts)
+                    ).result(timeout=_env_float("P1HUNT_RECON_TIMEOUT", 300.0, minimum=10.0))
             except Exception as exc:
                 self._live_surface = None
                 self._emit(self.name, "lifecycle",
@@ -1709,6 +1728,19 @@ class ClaudeSwarm:
                     "shipped": dict(ship_report),
                     "browser_shipped": ship_report.get("p1hunt_browser.py", False)
                                        and ship_report.get("htmlctx.py", False)})
+
+    def _discover_live_surface(self, pages: int, scripts: int) -> dict:
+        """Crawl the authorized base URL and mine its surface. SYNCHRONOUS on purpose.
+
+        Must be called off the event loop (see the to_thread call in _arm_dynamic):
+        Playwright's sync api raises if a loop is running in the calling thread.
+        """
+        from ..dynamic.browser import Browser
+        from ..dynamic.recon import discover
+
+        with Browser(allowlist=list(self._egress_hosts or []),
+                     base_url=self._base_url) as browser:
+            return discover(browser, [self._base_url], max_pages=pages, max_scripts=scripts)
 
     async def _plan_live_attack(self) -> None:
         """Ask the engine what to attack on THIS target, given the live surface.
@@ -2171,6 +2203,18 @@ class ClaudeSwarm:
                            {"phase": "scoped", "summary": str(scope_plan.get("summary", ""))[:400],
                             "critical_means": str(critical_means)[:300], "tracks": len(tracks),
                             "known_patterns": 0})
+
+            # CAN A PROOF EVEN RUN? Asked once, before any model time is spent, because
+            # `reproduced=True` from a class runner is the ONLY thing that promotes a
+            # finding — so a broken toolchain is a hard ceiling of zero confirmed
+            # findings while every other part of the run looks healthy.
+            #
+            # This is the same failure SHAPE as a provider-side refusal of the planning
+            # brief, and it gets the same volume. It was found by a measurement run: a
+            # stale pytest plugin on the author's own machine killed every harness before
+            # collection, and the per-finding classification was correct and therefore
+            # invisible (one broken harness looks like a bad harness, not a bad machine).
+            await self._preflight_runner_toolchain()
 
             # Arm the environment ONCE before any round: BUILD the target (submodules + compile) so
             # harnesses can deploy it, start a local mainnet fork when configured, and open the
@@ -3179,9 +3223,19 @@ class ClaudeSwarm:
                 # (or whose sessions errored as rate-limited) means we're throttled — do NOT spin empty
                 # rounds hammering the API. Sleep with exponential backoff so the limit can recover.
                 round_dur = _t.monotonic() - round_start
+                # A REFUSAL IS NOT A RATE LIMIT, and treating it as one is actively harmful.
+                # A provider-side safety refusal returns in ~6 seconds with an error, so a
+                # refused round looks exactly like a throttled one: fast, empty, errored.
+                # The backoff path then slept up to 15 minutes and retried something that
+                # can NEVER succeed by waiting -- burning the engagement's wall clock on a
+                # permanent condition. Classify first.
+                refusals = self._count_refusals(round_errors)
+                if refusals:
+                    self._report_refused_roles(refusals, len(round_errors), depth)
                 throttled = any(("rate" in str(e).lower() or "limit" in str(e).lower() or "usage" in str(e).lower())
-                                for e in round_errors)
-                if throttled or (round_dur < 45 and not fresh and round_errors):
+                                for e in round_errors) and refusals < len(round_errors)
+                if throttled or (round_dur < 45 and not fresh and round_errors
+                                 and refusals < len(round_errors)):
                     self._rl_strikes = getattr(self, "_rl_strikes", 0) + 1
                     backoff = min(900, 30 * (2 ** min(self._rl_strikes - 1, 5)))  # 30s→…→15min cap
                     self._emit(self.name, "lifecycle",
@@ -3900,6 +3954,87 @@ class ClaudeSwarm:
         )
         self.bb.add_hypothesis(hyp)
         self._hyp_by_finding[id(cf)] = hyp
+
+    @staticmethod
+    def _count_refusals(errors: list[str]) -> int:
+        """How many of this round's session errors were provider-side SAFETY refusals?
+
+        Reuses the planner's marker list so one definition answers "was this refused"
+        everywhere; a second copy would drift and then disagree about whether the run was
+        dead.
+        """
+        from ..dynamic import triage as _triage
+
+        count = 0
+        for err in errors or []:
+            if _triage.classify_failure("", str(err)) == _triage.REASON_REFUSED:
+                count += 1
+        return count
+
+    def _report_refused_roles(self, refusals: int, total: int, depth: int) -> None:
+        """SHOUT when the hunting layer was refused. See instructions.authorized_role.
+
+        A measured end-to-end run had every hunter and the fuzzer refused, so the hunt
+        reported a clean zero that said nothing at all about the target. The condition is
+        permanent for the run -- it will not recover by retrying -- so it has to be stated
+        in terms the operator cannot misread as a result.
+        """
+        if refusals <= 0 or self._refusal_announced:
+            return
+        self._refusal_announced = True
+        everything = refusals >= max(1, total)
+        self._emit(self.name, "lifecycle", {
+            "event": "hunter_roles_refused", "severity": "HIGH",
+            "refused_sessions": refusals, "errored_sessions": total, "round": depth,
+            "impact": ("EVERY hunting session this round was refused by the provider's safety "
+                       "classifier, so this round searched for NOTHING"
+                       if everything else
+                       f"{refusals} of {total} hunting sessions were refused by the provider's "
+                       f"safety classifier, so those tracks searched for nothing"),
+            "why_it_matters": "a refused session returns no findings, which is indistinguishable "
+                              "from a clean result. Do NOT read this run as evidence the target "
+                              "is sound -- it is evidence the engine would not do the work",
+            "fix": "this engine/model will not accept the hunting role for this workload. Route "
+                   "these roles to an engine authorized for defensive security testing "
+                   "(P1HUNT_ENGINE=claude), or select a different model "
+                   "(P1HUNT_CODEX_MODEL). Confirm the engagement authorization is stated in "
+                   "the scope note either way. Retrying the same engine will not help: a "
+                   "refusal is permanent for the run, not a transient limit",
+        })
+
+    async def _preflight_runner_toolchain(self) -> None:
+        """Check the class runner can execute a harness at all, and SHOUT if it cannot.
+
+        Never raises and never blocks the hunt: a run on a broken toolchain still has
+        value (the reasoning, the ledger, the candidate queue all still work) and the
+        operator may knowingly want it. What it must not do is look like a clean result.
+        """
+        try:
+            from ..runners.base import toolchain_preflight
+            pre = await asyncio.to_thread(toolchain_preflight, self._target_class,
+                                          self._subclass)
+        except Exception as exc:  # a diagnostic must never take down the hunt
+            self._emit(self.name, "lifecycle",
+                       {"event": "toolchain_preflight_failed", "error": str(exc)[:200]})
+            return
+        if pre.get("ok"):
+            self._emit(self.name, "lifecycle",
+                       {"event": "toolchain_preflight", "ok": True,
+                        "checked": bool(pre.get("checked")),
+                        "tool": pre.get("tool", ""), "detail": pre.get("detail", "")[:200]})
+            return
+        self._emit(self.name, "lifecycle", {
+            "event": "toolchain_broken", "severity": "HIGH",
+            "tool": pre.get("tool", ""),
+            "broken_plugin": pre.get("broken_plugin", ""),
+            "impact": "NO finding can be deterministically reproduced on this machine, so the "
+                      "hunt's confirmed-critical count is capped at zero regardless of what it "
+                      "finds. Candidates will still accumulate; every one of them will report an "
+                      "infrastructure error instead of a verdict. Do NOT read a clean result "
+                      "from this run as 'no bugs here'",
+            "detail": pre.get("detail", "")[:300],
+            "fix": pre.get("fix", "")[:300],
+        })
 
     # --- deterministic reproduction + severity gate (§10, §1 NOTHING PRESET) ----------
     async def _reproduce(self, cf: ClaudeFinding, spec_dict: dict | None):

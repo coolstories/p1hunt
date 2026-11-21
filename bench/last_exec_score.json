@@ -1,0 +1,164 @@
+{
+  "planted": 9,
+  "decoys": 5,
+  "claims": 0,
+  "planted_outcomes": [
+    {
+      "id": "idor-account",
+      "class": "idor",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "idor-invoice",
+      "class": "idor",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "authz-admin",
+      "class": "authz",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "gate-host",
+      "class": "render_gate",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "xss-reflect",
+      "class": "injection",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "xss-dom",
+      "class": "dom_injection",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "redirect-open",
+      "class": "redirect",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "ssrf-fetch",
+      "class": "ssrf",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "secret-session",
+      "class": "secret",
+      "outcome": "MISSED",
+      "claim": "",
+      "location": "",
+      "detail": "",
+      "ledger": {}
+    }
+  ],
+  "decoy_outcomes": [
+    {
+      "id": "decoy-scoped",
+      "why_safe": "scoped to the caller",
+      "outcome": "UNTOUCHED",
+      "claim": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "decoy-admin",
+      "why_safe": "enforces a role properly",
+      "outcome": "UNTOUCHED",
+      "claim": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "decoy-attr",
+      "why_safe": "raw <> in a quoted attribute is inert",
+      "outcome": "UNTOUCHED",
+      "claim": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "decoy-redirect",
+      "why_safe": "only accepts a relative path",
+      "outcome": "UNTOUCHED",
+      "claim": "",
+      "detail": "",
+      "ledger": {}
+    },
+    {
+      "id": "decoy-url",
+      "why_safe": "url param is echoed, never fetched",
+      "outcome": "UNTOUCHED",
+      "claim": "",
+      "detail": "",
+      "ledger": {}
+    }
+  ],
+  "runs": {
+    "harness_runs_executed": 0,
+    "runs_reporting_reproduced": 0,
+    "harnesses_materialized": 0,
+    "repair_attempts": 0,
+    "by_runner": {}
+  },
+  "ledger_records": 0,
+  "confirmed": 0,
+  "exec_recall": 0.0,
+  "proven_gated": 0,
+  "claimed_unproven": 0,
+  "located_only": 0,
+  "attempted": 0,
+  "falsely_refuted": 0,
+  "missed": 9,
+  "decoys_refuted": 0,
+  "decoys_untouched": 5,
+  "decoys_claimed": 0,
+  "decoys_left_open": 0,
+  "decoy_false_confirms": 0,
+  "run": {
+    "exit_code": 1,
+    "seconds": 315.4,
+    "timed_out": false,
+    "log": "/Users/nirvaangoel/Desktop/Cyber/bench/last_exec_run.log",
+    "toolchain": {
+      "ok": true,
+      "addopts": "-p no:anchorpy",
+      "detail": "pytest was broken by the 'anchorpy' plugin (ModuleNotFoundError: No module named 'solders.rpc'); working around it with -p no:anchorpy"
+    }
+  },
+  "mode": "real-engine",
+  "rounds_requested": 1
+}

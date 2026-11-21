@@ -83,6 +83,24 @@ _ACCOUNTS = {
 }
 _SESSION_COOKIE = "range_session"
 
+# REAL PRINCIPALS. The first version of this range had no notion of a caller at all --
+# every endpoint answered anyone -- which made the IDOR defects trivially "provable"
+# without ever establishing two identities. That is the one thing a real authorization
+# proof must do, so a confirmed IDOR here would have meant nothing.
+#
+# A principal is now named by either `Cookie: range_session=<user>` or
+# `Authorization: Bearer <user>`. The bearer form exists so the pipeline's existing
+# P1HUNT_TOKEN_A / P1HUNT_TOKEN_B identity plumbing and the web authz harness scaffold
+# plug in unchanged.
+#
+# NONE OF THE PLANTED DEFECTS OR DECOYS CHANGED. /api/v1/accounts/{id} still has no
+# ownership check; what changed is that a harness can now SHOW the crossing, by
+# establishing which account the caller owns and reading a different one.
+_PRINCIPALS = {
+    "alice": "550e8400-e29b-41d4-a716-446655440000",
+    "bob": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+}
+
 
 def _esc(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -114,7 +132,24 @@ class Handler(BaseHTTPRequestHandler):
         return qs.get(name, [default])[0]
 
     def _has_session(self):
+        # Presence only, deliberately: this is what the gate-host defect keys on, and it
+        # is the real behaviour being modelled -- an edge worker routing on the mere
+        # presence of a cookie whose value it never validates.
         return _SESSION_COOKIE in (self.headers.get("Cookie") or "")
+
+    def _principal(self):
+        """The authenticated user, or "" for anonymous. Bearer OR session cookie."""
+        auth = (self.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            tok = auth[7:].strip()
+            if tok in _PRINCIPALS:
+                return tok
+        cookie = self.headers.get("Cookie") or ""
+        for part in cookie.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == _SESSION_COOKIE and v.strip() in _PRINCIPALS:
+                return v.strip()
+        return ""
 
     def _is_mobile_host(self):
         # The range fakes "a sibling host" with a header, because a loopback server
@@ -139,6 +174,7 @@ class Handler(BaseHTTPRequestHandler):
                 '<a href="/profile?name=me">profile</a> '
                 '<a href="/preview">preview</a> '
                 '<a href="/share/550e8400-e29b-41d4-a716-446655440000">a share</a> '
+                '<a href="/login?user=alice">sign in</a> '
                 '<a href="/go?next=/">continue</a> '
                 '<a href="/logout?next=/">logout</a>'
                 '<form action="/api/v1/pay" method="post">'
@@ -153,6 +189,7 @@ class Handler(BaseHTTPRequestHandler):
                 'export const getInvoice=(n)=>fetch("/api/v1/invoices/"+n);'
                 'export const myOrder=(id)=>fetch("/api/v1/me/orders/"+id);'
                 'export const session=()=>fetch("/api/v1/session");'
+                'export const me=()=>fetch("/api/v1/me");'
                 'export const grab=(u)=>fetch("/api/v1/fetch?url="+encodeURIComponent(u));'
                 'const ADMIN="/internal/admin/users", REPORTS="/admin/reports";'
                 'const SHARELINK="/share/link";'
@@ -162,6 +199,23 @@ class Handler(BaseHTTPRequestHandler):
                 'mutation TransferFunds($to:ID,$amt:Float){ok}'
             )
             return self._send(js, 200, "application/javascript; charset=utf-8")
+
+        # Sign in as a named principal. Not a defect: it is how a harness establishes
+        # the two identities an authorization proof needs.
+        if page == "/login":
+            who = self._q("user")
+            if who not in _PRINCIPALS:
+                return self._json({"error": "unknown user", "users": sorted(_PRINCIPALS)}, 400)
+            return self._send(self._page(f"<p>signed in as {_esc(who)}</p>"), 200,
+                              "text/html; charset=utf-8",
+                              {"Set-Cookie": f"{_SESSION_COOKIE}={who}; Path=/"})
+
+        # Who am I, and which account do I own? The baseline a crossing is measured against.
+        if page == "/api/v1/me":
+            who = self._principal()
+            if not who:
+                return self._json({"error": "unauthenticated"}, 401)
+            return self._json({"user": who, "account_id": _PRINCIPALS[who]})
 
         # PLANTED idor-account: no check that the session owns this account.
         if page.startswith("/api/v1/accounts/"):
@@ -179,11 +233,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"invoice": int(n), "owner": "alice" if int(n) % 2 else "bob",
                                "amount": "120.00", "card_last4": "4242"})
 
-        # DECOY decoy-scoped: same shape, but scoped to the caller.
+        # DECOY decoy-scoped: same shape as the IDOR above, but CORRECTLY scoped. Order
+        # ids are "<user>-<n>", and the server refuses one that is not the caller's. A
+        # keyword matcher cannot tell this apart from /api/v1/accounts/{id}; only an
+        # actual two-principal request can.
         if page.startswith("/api/v1/me/orders/"):
-            if not self._has_session():
+            who = self._principal()
+            if not who:
                 return self._json({"error": "unauthenticated"}, 401)
-            return self._json({"order": page.rsplit("/", 1)[-1], "owner": "self"})
+            oid = page.rsplit("/", 1)[-1]
+            if not oid.startswith(who + "-"):
+                return self._json({"error": "forbidden"}, 403)
+            return self._json({"order": oid, "owner": who})
 
         # PLANTED authz-admin: privileged data with no authentication.
         if page == "/internal/admin/users":

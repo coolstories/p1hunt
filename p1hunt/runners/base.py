@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
@@ -305,3 +307,103 @@ def select_runner(target_class: str, subclass: str = "") -> ReproductionRunner |
             except Exception:
                 continue
     return None
+
+
+# --- toolchain preflight ------------------------------------------------------------------
+#
+# WHY THIS EXISTS, AND WHY IT IS LOUD
+#
+# `reproduced=True` from a class runner is the ONLY thing in this package that promotes a
+# finding to confirmed. So if the runner's toolchain cannot execute a harness at all, the
+# hunt has a hard ceiling of zero confirmed findings — and nothing else looks wrong. The
+# agents reason, the harnesses get written, the runner is invoked, and every result comes
+# back ran=False with an infrastructure detail buried in one event's payload.
+#
+# That is not hypothetical. It was found by a measurement run on the author's own machine:
+# a stale `anchorpy` pytest plugin, whose `solders` dependency no longer exports the module
+# it imports, made `pytest` exit 1 during plugin loading. Every harness would have died
+# before collecting a single test. The per-finding classification was CORRECT
+# (INFRASTRUCTURE ERROR, ran=False, stays a candidate — see runners/web.py), which is
+# exactly what made it invisible: a careful reader of one finding sees a broken harness,
+# not a broken machine.
+#
+# This is the same failure SHAPE as a provider-side refusal of the planning brief: one
+# layer is dead, everything else is healthy, and the run reports an honest-looking nothing.
+# Those get a HIGH-severity warning, so this does too.
+
+_PYTEST_PLUGIN_RE = re.compile(r"site-packages[/\\]([A-Za-z0-9_]+)[/\\]__init__\.py")
+
+
+def preflight_pytest(*, timeout: float = 120.0) -> dict:
+    """Execute a trivial passing test and report whether the pytest path works.
+
+    Returns ``{ok, tool, detail, fix, broken_plugin}``. Never raises: a preflight that
+    throws would take down a hunt over a diagnostic.
+    """
+    out = {"ok": False, "tool": "pytest", "detail": "", "fix": "", "broken_plugin": ""}
+    if not tool_available("pytest"):
+        out["detail"] = "pytest is not on PATH"
+        out["fix"] = "install pytest in the environment that runs the hunt"
+        return out
+    try:
+        with tempfile.TemporaryDirectory(prefix="p1hunt_preflight_") as box:
+            probe = Path(box) / "test_p1hunt_preflight.py"
+            probe.write_text("def test_preflight():\n    assert True\n", encoding="utf-8")
+            proc = subprocess.run(
+                ["pytest", "-q", str(probe)], cwd=box, text=True,
+                capture_output=True, timeout=timeout,
+            )
+            text = (proc.stdout or "") + (proc.stderr or "")
+            if proc.returncode == 0:
+                out["ok"] = True
+                out["detail"] = "pytest executed a trivial test cleanly"
+                return out
+            # A plugin that raises on import names its own package in the traceback.
+            plugins = list(dict.fromkeys(_PYTEST_PLUGIN_RE.findall(text)))
+            tail = next((ln.strip() for ln in reversed(text.splitlines())
+                         if ln.strip() and "rror" in ln), text.strip()[-160:])
+            out["detail"] = (f"pytest could not run a trivial test (exit {proc.returncode}): "
+                             f"{tail[:200]}")
+            if plugins:
+                out["broken_plugin"] = plugins[0]
+                out["fix"] = (
+                    f"a pytest plugin ('{plugins[0]}') raises on import, so every harness dies "
+                    f"before collection. Repair or remove that package, or run the hunt with "
+                    f"PYTEST_ADDOPTS='-p no:{plugins[0]}'."
+                )
+            else:
+                out["fix"] = ("repair the pytest installation in the environment that runs the "
+                              "hunt; until then no finding can be deterministically reproduced")
+    except (OSError, subprocess.SubprocessError) as exc:
+        out["detail"] = f"pytest preflight could not run: {exc}"
+        out["fix"] = "check the pytest installation and the sandbox's exec permissions"
+    return out
+
+
+# Classes whose runners drive the pytest path (web.py, and the OTHER fallback).
+_PYTEST_CLASSES = {"WEB_API", "OTHER", "", "CRYPTO_LIB", "INFRA", "SUPPLY_CHAIN", "MOBILE_APP"}
+
+
+def toolchain_preflight(target_class: str, subclass: str = "", *,
+                        timeout: float = 120.0) -> dict:
+    """Can THIS target class's runner actually execute a proof? See the note above.
+
+    Only the pytest path is probed, because that is what the web/generic/crypto/infra
+    runners drive. A class whose runner uses a different toolchain reports
+    ``checked=False`` rather than a reassuring ``ok=True`` — claiming a toolchain is
+    healthy because it was never tested is the exact error this function exists to
+    prevent.
+    """
+    cls = (target_class or "").upper()
+    if select_runner(target_class, subclass) is None:
+        return {"checked": False, "ok": False, "tool": "",
+                "detail": f"no deterministic runner for class {cls or '(unset)'} — "
+                          f"nothing can be reproduced for it",
+                "fix": "", "broken_plugin": ""}
+    if cls not in _PYTEST_CLASSES:
+        return {"checked": False, "ok": True, "tool": "",
+                "detail": f"class {cls} does not use the pytest path; not probed",
+                "fix": "", "broken_plugin": ""}
+    res = preflight_pytest(timeout=timeout)
+    res["checked"] = True
+    return res
