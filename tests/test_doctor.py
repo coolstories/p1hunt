@@ -147,6 +147,68 @@ class TestRoleAcceptanceIsReadNeverAssumed(unittest.TestCase):
         self.assertEqual(D.check_engine_roles("codex", Path(tmp.name)).verdict, D.UNCHECKED)
 
 
+class TestAStaleProbeArtifactIsNotTrusted(unittest.TestCase):
+    """Acceptance is a property of (prompt, provider), so a probe taken before the prompts
+    were edited says nothing about the prompts that will actually be sent.
+
+    Reporting confidently from an outdated artifact is the same error this module exists
+    to prevent, one level up: health claimed rather than verified. And it is not a
+    hypothetical -- framing the prove-chain prompts moved `materialize` and `repair` from
+    TRUNCATED to ACCEPTED, so a doctor reading the pre-framing artifact would have called
+    them broken and sent the operator switching engines for no reason.
+    """
+
+    def _artifact(self, rows, *, age_seconds: float) -> Path:
+        import json
+        import os
+        import time
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(rows, tmp)
+        tmp.close()
+        path = Path(tmp.name)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        when = time.time() - age_seconds
+        os.utime(path, (when, when))
+        return path
+
+    def test_an_artifact_older_than_the_prompts_is_unchecked(self):
+        """One year old: every prompt source is certainly newer."""
+        path = self._artifact([{"prompt": "web_hunt", "verdict": "ACCEPTED"}],
+                              age_seconds=365 * 24 * 3600)
+        c = D.check_engine_roles("claude", path)
+        self.assertEqual(c.verdict, D.UNCHECKED)
+        self.assertIn("predates a prompt change", c.detail)
+        self.assertIn("probe_refusal.py", c.fix)
+
+    def test_staleness_outranks_a_clean_recorded_result(self):
+        """A stale ALL-ACCEPTED artifact is the dangerous case: it reads as reassurance."""
+        path = self._artifact([{"prompt": "web_hunt", "verdict": "ACCEPTED"},
+                               {"prompt": "materialize", "verdict": "ACCEPTED"}],
+                              age_seconds=365 * 24 * 3600)
+        self.assertNotEqual(D.check_engine_roles("claude", path).verdict, D.OK)
+
+    def test_a_fresh_artifact_is_used(self):
+        path = self._artifact([{"prompt": "web_hunt", "verdict": "ACCEPTED"}],
+                              age_seconds=0)
+        self.assertEqual(D.check_engine_roles("claude", path).verdict, D.OK)
+
+    def test_the_staleness_check_names_every_prompt_building_module(self):
+        """If a new prompt module appears and is not listed, staleness silently stops
+        working for it -- which is worse than not checking at all, because the report
+        still looks authoritative."""
+        import inspect
+
+        from p1hunt.agents import claude_hunter, fuzz_engine, instructions
+        from p1hunt.dynamic import triage
+        listed = set(D._PROMPT_SOURCES)
+        for mod in (claude_hunter, fuzz_engine, instructions, triage):
+            rel = "/".join(Path(inspect.getfile(mod)).parts[-2:])
+            self.assertIn(rel, listed, f"{rel} builds prompts but is not watched")
+
+    def test_a_missing_artifact_timestamp_does_not_crash(self):
+        self.assertEqual(D._prompts_newer_than(Path("/definitely/not/here.json")), [])
+
+
 class TestTheToolchainCheckActuallyExecutes(unittest.TestCase):
     def test_a_broken_pytest_is_fatal_with_its_cost_stated(self):
         broken = {"ok": False, "detail": "exit 1: ModuleNotFoundError", "fix": "repair it",

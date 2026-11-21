@@ -229,6 +229,24 @@ def check_engine_roles(engine: str, probe_file: Path | None = None) -> Check:
     except (OSError, ValueError) as exc:
         return Check("engine: role acceptance", UNCHECKED,
                      f"could not read {path.name}: {exc}", fix=f"re-run: {cmd}")
+    # IS THE ARTIFACT STALE? Acceptance is a property of (prompt, provider), so a probe
+    # taken before the prompts were edited says nothing about the prompts that will
+    # actually be sent. Reporting confidently from an outdated artifact is the same error
+    # this whole module exists to prevent, one level up: health claimed, not verified.
+    #
+    # Measured proof that this matters: framing the prove-chain prompts moved materialize
+    # and repair from TRUNCATED to ACCEPTED. A doctor reading the pre-framing artifact
+    # would have reported them broken and sent you switching engines for no reason.
+    stale = _prompts_newer_than(path)
+    if stale:
+        return Check(
+            "engine: role acceptance", UNCHECKED,
+            f"{path.name} predates a prompt change ({', '.join(stale[:3])}) -- acceptance "
+            f"was measured against prompts that are no longer the ones being sent",
+            fix=f"re-run: {cmd}",
+            impact="unknown. The recorded verdicts may be better OR worse than reality; "
+                   "either way they are not about the current prompts",
+        )
     bad = [r for r in rows if r.get("verdict") not in (None, "ACCEPTED")]
     names = ", ".join(f"{r['prompt']}={r['verdict']}" for r in bad)
     if not bad:
@@ -247,6 +265,34 @@ def check_engine_roles(engine: str, probe_file: Path | None = None) -> Check:
                 "finding and will report a clean-looking nothing"
                 if fatal else "those roles contribute nothing; the rest of the hunt still runs"),
     )
+
+
+# Every module that builds a model-facing prompt. If one of these is newer than a probe
+# artifact, that artifact describes prompts that no longer exist.
+_PROMPT_SOURCES = (
+    "agents/claude_hunter.py",
+    "agents/fuzz_engine.py",
+    "agents/instructions.py",
+    "dynamic/triage.py",
+)
+
+
+def _prompts_newer_than(artifact: Path) -> list[str]:
+    """Prompt source files modified after ``artifact`` was written."""
+    try:
+        cutoff = artifact.stat().st_mtime
+    except OSError:
+        return []
+    here = Path(__file__).resolve().parent
+    newer = []
+    for rel in _PROMPT_SOURCES:
+        src = here / rel
+        try:
+            if src.stat().st_mtime > cutoff:
+                newer.append(rel.rsplit("/", 1)[-1])
+        except OSError:
+            continue
+    return newer
 
 
 def check_engagements_root(root: str) -> Check:
