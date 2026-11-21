@@ -271,3 +271,162 @@ class TestThisControlIsHonestAboutItsEnvironment(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheHarnessPathIsResolvedTheWayAProverReportsIt(unittest.TestCase):
+    """The single missing path prefix that made every proof unreachable.
+
+    A measured end-to-end run got all the way through: the hunters wrote eight real
+    harnesses, the verifier called the finding real citing live request evidence, and the
+    prover materialized a harness. Then the runner reported
+
+        "harness missing or outside the sandbox — finding stays a candidate"
+
+    and the whole chain produced nothing. The cause was one line: the prover reported the
+    FILENAME it had just written ("test_bola_idor.py"), while the runner resolved against
+    the workspace ROOT, where the file lives at ".p1hunt-poc/test_bola_idor.py".
+
+    Resolving the bare name in the runner is the right place for the fix. Requiring a
+    model to get a path prefix exactly right, in every role, every time, is a worse
+    contract than looking in the one directory harnesses are written to -- and the failure
+    mode of getting it wrong is silent and total.
+
+    The containment property is NOT relaxed by any of this, which the escape tests below
+    exist to hold: whatever is returned is inside the workspace.
+    """
+
+    def setUp(self):
+        self.box = Path(tempfile.mkdtemp(prefix="harness_path_"))
+        self.addCleanup(shutil.rmtree, self.box, True)
+        self.poc = self.box / ".p1hunt-poc"
+        self.poc.mkdir()
+        (self.poc / "test_h.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+
+    def test_a_bare_filename_resolves_into_the_poc_directory(self):
+        """Exactly what the prover reported in the measured run."""
+        from p1hunt.runners.base import safe_harness_path
+        found = safe_harness_path(str(self.box), "test_h.py")
+        self.assertIsNotNone(found, "a bare filename must resolve")
+        self.assertEqual(found.name, "test_h.py")
+        self.assertTrue(str(found).endswith(".p1hunt-poc/test_h.py"))
+
+    def test_the_documented_relative_path_still_resolves(self):
+        from p1hunt.runners.base import safe_harness_path
+        for spelling in (".p1hunt-poc/test_h.py", "./.p1hunt-poc/test_h.py"):
+            with self.subTest(path=spelling):
+                self.assertIsNotNone(safe_harness_path(str(self.box), spelling))
+
+    def test_a_harness_in_a_subdirectory_is_found_by_name(self):
+        from p1hunt.runners.base import safe_harness_path
+        nested = self.poc / "web"
+        nested.mkdir()
+        (nested / "test_deep.py").write_text("def test_y():\n    pass\n", encoding="utf-8")
+        found = safe_harness_path(str(self.box), "test_deep.py")
+        self.assertIsNotNone(found, "a bare name must be found recursively under the PoC dir")
+        self.assertEqual(found.name, "test_deep.py")
+
+    def test_a_foundry_style_poc_directory_also_resolves(self):
+        from p1hunt.runners.base import safe_harness_path
+        alt = self.box / "test" / "p1hunt"
+        alt.mkdir(parents=True)
+        (alt / "Probe.t.sol").write_text("// x\n", encoding="utf-8")
+        self.assertIsNotNone(safe_harness_path(str(self.box), "Probe.t.sol"))
+
+    def test_a_genuinely_missing_harness_is_still_none(self):
+        """The laxity must not swallow the real 'no harness' case."""
+        from p1hunt.runners.base import safe_harness_path
+        self.assertIsNone(safe_harness_path(str(self.box), "test_does_not_exist.py"))
+        self.assertIsNone(safe_harness_path(str(self.box), ""))
+
+    def test_a_directory_is_not_a_harness(self):
+        from p1hunt.runners.base import safe_harness_path
+        self.assertIsNone(safe_harness_path(str(self.box), ".p1hunt-poc"))
+
+    def test_containment_still_holds_absolutely(self):
+        """The security property the function exists for. Relaxing resolution must not
+        relax this: a runner must never be pointable at a host file."""
+        from p1hunt.runners.base import safe_harness_path
+        for escape in ("/etc/passwd", "../../../../etc/passwd",
+                       ".p1hunt-poc/../../../../etc/passwd",
+                       "/tmp/../etc/passwd"):
+            with self.subTest(path=escape):
+                self.assertIsNone(safe_harness_path(str(self.box), escape),
+                                  f"{escape!r} escaped the workspace")
+
+    def test_a_symlink_out_of_the_workspace_is_refused(self):
+        from p1hunt.runners.base import safe_harness_path
+        outside = Path(tempfile.mkdtemp(prefix="outside_"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        target = outside / "evil.py"
+        target.write_text("print('x')\n", encoding="utf-8")
+        link = self.poc / "test_link.py"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            self.skipTest("symlinks unavailable")
+        self.assertIsNone(safe_harness_path(str(self.box), "test_link.py"),
+                          "a symlink leaving the workspace must be refused")
+
+
+@unittest.skipIf(_SKIP, _SKIP or "")
+class TestTheHuntersOwnHarnessReproduces(unittest.TestCase):
+    """End to end, with no model in the loop: a harness a REAL hunt wrote, re-executed.
+
+    bench/harnesses_from_run/ holds the harnesses a live hunt against this range actually
+    produced. This replays the one whose ReproSpec the event stream recorded
+    (test_bola_idor.py, expect="pass") through the real runner, using the exact BARE
+    FILENAME the prover reported -- the input that used to resolve to nothing.
+
+    Only that one is asserted. The others' declared `expect` is not in the artifacts, and
+    `expect` cannot be searched for: under expect="fail" ANY failing test counts as "bug
+    demonstrated", so trying both values and keeping whichever reproduces manufactures a
+    result. The prover declares it; the scorer does not get to choose it.
+    """
+
+    HARNESS_DIR = Path(__file__).resolve().parents[1] / "bench" / "harnesses_from_run"
+
+    def test_the_recorded_harness_reproduces_from_a_bare_filename(self):
+        from p1hunt.runners.base import ReproSpec, select_runner
+
+        harness = self.HARNESS_DIR / "test_bola_idor.py"
+        if not harness.is_file():
+            self.skipTest("no preserved harness from a live run")
+        box = Path(tempfile.mkdtemp(prefix="hunter_harness_"))
+        self.addCleanup(shutil.rmtree, box, True)
+        shutil.copytree(self.HARNESS_DIR, box / ".p1hunt-poc")
+        # The shipped client the harness imports.
+        import p1hunt.dynamic.client as _c
+        shutil.copy2(_c.__file__, box / ".p1hunt-poc" / "p1hunt_dyn.py")
+
+        rng = Range()
+        rng.__enter__()
+        self.addCleanup(rng.__exit__)
+        prior = {k: os.environ.get(k) for k in
+                 ("P1HUNT_BASE_URL", "P1HUNT_EGRESS_ALLOWLIST",
+                  "P1HUNT_TOKEN_A", "P1HUNT_TOKEN_B")}
+
+        def _restore():
+            for k, v in prior.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.addCleanup(_restore)
+        os.environ.update({"P1HUNT_BASE_URL": rng.base,
+                           "P1HUNT_EGRESS_ALLOWLIST": "127.0.0.1",
+                           "P1HUNT_TOKEN_A": "alice", "P1HUNT_TOKEN_B": "bob"})
+
+        spec = ReproSpec(
+            harness_path="test_bola_idor.py",     # BARE, as the prover reported it
+            expect="pass",                         # as the prover declared it
+            kind="differential",
+            target_code_attribution="GET /api/v1/accounts/{uuid} has no ownership check",
+            non_target_attribution="only the two scope-provided test identities",
+        )
+        res = select_runner("WEB_API").run(str(box), spec, timeout=180.0)
+        self.assertTrue(res.ran, f"the harness did not run: {res.detail}")
+        self.assertTrue(res.reproduced,
+                        f"the hunt's own proof did not reproduce: {res.detail}\n"
+                        f"{res.stdout_excerpt[-600:]}")
+        self.assertIn("pytest", res.command)

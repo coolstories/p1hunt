@@ -66,7 +66,8 @@ DECOYS = [
     # Looks like the IDOR above; actually scoped to the caller.
     {"id": "decoy-scoped", "path": "/api/v1/me/orders/{id}", "why": "scoped to the caller"},
     # Path says admin, but it enforces a role.
-    {"id": "decoy-admin", "path": "/admin/reports", "why": "enforces a role properly"},
+    {"id": "decoy-admin", "path": "/admin/reports",
+     "why": "enforces a role from the AUTHENTICATED PRINCIPAL, not from a client header"},
     # Reflects input, but into a quoted attribute with the quote escaped: INERT.
     {"id": "decoy-attr", "path": "/profile", "why": "raw <> in a quoted attribute is inert"},
     # A redirect parameter that only accepts relative paths.
@@ -100,6 +101,8 @@ _PRINCIPALS = {
     "alice": "550e8400-e29b-41d4-a716-446655440000",
     "bob": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 }
+# Roles belong to the PRINCIPAL, never to a request header. See the decoy-admin note.
+_ROLES = {"alice": "admin", "bob": "user"}
 
 
 def _esc(s: str) -> str:
@@ -252,9 +255,26 @@ class Handler(BaseHTTPRequestHandler):
                                           "email": "a@example.invalid"},
                                          {"u": "bob", "role": "user"}]})
 
-        # DECOY decoy-admin: enforces a role.
+        # DECOY decoy-admin: enforces a role PROPERLY, from the authenticated principal.
+        #
+        # THIS WAS A BUG IN THE RANGE, NOT IN THE HUNT, and a real run found it. The first
+        # version authorized on `X-Role: admin` -- a CLIENT-SUPPLIED HEADER -- so anyone
+        # could send it and get in. A hunter reported exactly that ("trusts spoofable
+        # X-Role: admin header ... every real principal is refused") and it was correct:
+        # the endpoint was genuinely vulnerable, so it was never a valid decoy, and
+        # scoring that report as a false positive would have penalized the tool for being
+        # right. A decoy has to actually be safe, or it measures nothing.
+        #
+        # The role now comes from the principal the request authenticated as, which is not
+        # attacker-controlled. The endpoint still LOOKS like the authz-admin defect at
+        # /internal/admin/users -- admin in the path, privileged-sounding data -- so it
+        # still does its job against a keyword matcher. Only an actual two-principal
+        # request can tell them apart.
         if page == "/admin/reports":
-            if (self.headers.get("X-Role") or "") != "admin":
+            who = self._principal()
+            if not who:
+                return self._json({"error": "unauthenticated"}, 401)
+            if _ROLES.get(who) != "admin":
                 return self._json({"error": "forbidden"}, 403)
             return self._json({"reports": []})
 
@@ -282,8 +302,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(self._page(f'<h2>Results for {q}</h2><p>none</p>'))
 
         # DECOY decoy-attr: raw <> inside a quoted attribute with the quote escaped.
+        #
+        # `<` and `>` are left RAW on purpose -- inside a quoted attribute value they are
+        # ordinary characters, not tag syntax, so this is inert and a naive `<script>`
+        # probe "succeeds" here while proving nothing. That is the whole point of the decoy.
+        #
+        # ORDER MATTERS, and it was wrong. The first version replaced '"' before '&', so
+        # the ampersand it had just introduced got re-escaped and a supplied quote came
+        # out as the literal text `&amp;quot;`. Harmless in this direction -- MORE escaped,
+        # not less -- but wrong, and worth fixing because the same mistake in the other
+        # order is a real double-decode bypass: escape the quote first and then DECODE
+        # later, and a supplied `&quot;` becomes a real quote that closes the attribute.
         if page == "/profile":
-            name = self._q("name").replace('"', "&quot;").replace("&", "&amp;")
+            name = self._q("name").replace("&", "&amp;").replace('"', "&quot;")
             return self._send(self._page(f'<input id=n value="{name}" readonly>'))
 
         # PLANTED xss-dom: client script writes the query into innerHTML.

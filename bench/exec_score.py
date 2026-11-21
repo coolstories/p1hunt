@@ -313,11 +313,24 @@ def score_execution(eng_dir: str | Path) -> dict:
         best = {"id": p["id"], "class": p["class"], "outcome": "MISSED",
                 "claim": "", "location": "", "detail": ""}
         for c in claims:
-            # The claim's own location field is the evidence. The title is a FALLBACK and
-            # only its path-like tokens count -- see truth.locations_in for the bug that
-            # taught me not to match on bare words.
+            # Where the evidence can come from, loosest-last:
+            #   1. the claim's own location field -- the primary source;
+            #   2. path-like tokens in its title;
+            #   3. path-like tokens anywhere in its body.
+            #
+            # (3) exists because a real run produced ONE finding covering three endpoints:
+            # "cross-tenant disclosure of account financials, invoice card_last4, and
+            # admin users", whose `location` named only /api/v1/accounts/{id}. Two planted
+            # defects it had genuinely found would have scored as MISSED. Models group
+            # related defects the way a person writing a report does, and a scorer that
+            # only reads the location field punishes that.
+            #
+            # Safe to be loose HERE because the mechanism gate below still has to pass --
+            # naming a path in passing is not enough. It is deliberately NOT applied to
+            # decoys, where there is no mechanism gate to hold the line: see below.
             if not (paths_match(c["location"], p["path"])
-                    or mentions_path(c["title"], p["path"])):
+                    or mentions_path(c["title"], p["path"])
+                    or mentions_path(c["text"], p["path"])):
                 continue
             right_mech = mechanism_matches(c["text"], p)
             verdict = c["runner_verdict"]
@@ -351,7 +364,13 @@ def score_execution(eng_dir: str | Path) -> dict:
                "claim": "", "detail": ""}
         # No mechanism check here on purpose: a decoy has no defect to describe, so any
         # claim naming its location is a false positive on it. That makes the location
-        # test the ONLY gate, which is exactly why it has to be strict.
+        # test the ONLY gate, which is why it stays STRICT -- location and title only,
+        # never the body.
+        #
+        # The asymmetry with the planted matching above is deliberate. A thorough finding
+        # often mentions a safe endpoint in passing, precisely to say it is safe ("unlike
+        # /admin/reports, which checks the principal's role"), and counting that as a
+        # false positive would penalize exactly the careful reasoning worth rewarding.
         matched = [c for c in claims
                    if paths_match(c["location"], d["path"])
                    or mentions_path(c["title"], d["path"])]

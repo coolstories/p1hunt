@@ -633,3 +633,172 @@ class TestRangeStillHasItsDefects(unittest.TestCase):
                 path = "/api/v1/fetch?url=http://127.0.0.1:1/"
             status, _ = self._get(path, Authorization="Bearer alice")
             self.assertNotEqual(status, 404, f"{p['id']} at {path} is a 404")
+
+
+class TestABundledFindingCreditsEveryDefectItNames(unittest.TestCase):
+    """Models group related defects the way a person writing a report does.
+
+    A real run produced ONE finding titled "Unauthenticated cross-tenant disclosure of
+    account financials, invoice card_last4, and admin users", whose `location` field named
+    only /api/v1/accounts/{id}. It had genuinely found three planted defects; a scorer
+    reading only the location field would have credited one and called the other two
+    MISSED -- punishing the model for writing a coherent report.
+
+    Scanning the body is safe for PLANTED because the mechanism gate still has to pass. It
+    is deliberately NOT done for DECOYS, where there is no mechanism gate: a thorough
+    finding often names a safe endpoint precisely to say it is safe, and counting that as a
+    false positive would penalize the careful reasoning worth rewarding.
+    """
+
+    def test_a_grouped_finding_credits_each_defect_it_names_in_the_body(self):
+        body = ("GET /api/v1/accounts/{uuid} returns any account's owner and balance to an "
+                "unauthenticated caller; GET /api/v1/invoices/41 is a sequential integer "
+                "enumerable with no authorization; GET /internal/admin/users answers "
+                "unauthenticated with privileged data.")
+        with _Eng() as e:
+            e.findings(criticals=[{
+                "dedup_key": "k1",
+                "title": "Unauthenticated cross-tenant disclosure of account financials",
+                "location": "/api/v1/accounts/{id}", "root_cause": body,
+                **_runner_history("reproduced")}])
+            s = e.score()
+        for defect in ("idor-account", "idor-invoice", "authz-admin"):
+            with self.subTest(defect=defect):
+                self.assertEqual(_outcome(s, defect), "CONFIRMED")
+        self.assertEqual(s["confirmed"], 3)
+
+    def test_the_mechanism_gate_still_holds_for_a_body_match(self):
+        """Naming a path in the body is not enough; the idea has to be right too."""
+        with _Eng() as e:
+            e.findings(criticals=[{
+                "dedup_key": "k1", "title": "missing cache headers",
+                "location": "/search",
+                "root_cause": "GET /api/v1/invoices/41 is missing a Cache-Control header",
+                **_runner_history("reproduced")}])
+            s = e.score()
+        self.assertIn(_outcome(s, "idor-invoice"), ("LOCATED", "MISSED"))
+        self.assertEqual(s["confirmed"], 0)
+
+    def test_a_decoy_named_in_the_body_as_SAFE_is_not_a_false_positive(self):
+        """The asymmetry, and the reason for it.
+
+        Mentioning a safe endpoint to say it is safe is good reasoning. Scoring it as a
+        false positive would make the precision number punish thoroughness.
+        """
+        with _Eng() as e:
+            e.findings(criticals=[{
+                "dedup_key": "k1", "title": "unauthenticated admin surface",
+                "location": "/internal/admin/users",
+                "root_cause": ("/internal/admin/users answers with no authentication, "
+                               "unlike /admin/reports which correctly checks the "
+                               "authenticated principal's role"),
+                **_runner_history("reproduced")}])
+            s = e.score()
+        self.assertEqual(_outcome(s, "authz-admin"), "CONFIRMED")
+        self.assertEqual(_decoy_outcome(s, "decoy-admin"), "UNTOUCHED")
+        self.assertEqual(s["decoys_claimed"], 0)
+
+    def test_a_decoy_claimed_by_location_is_still_a_false_positive(self):
+        """The strictness must not become laxity: a claim ABOUT the decoy still counts."""
+        with _Eng() as e:
+            e.findings(criticals=[{
+                "dedup_key": "k1", "title": "authz bypass",
+                "location": "/admin/reports", "root_cause": "role check is bypassable",
+                **_runner_history("reproduced")}])
+            s = e.score()
+        self.assertEqual(_decoy_outcome(s, "decoy-admin"), "FALSE_CONFIRM")
+
+
+class TestTheRangesDecoysAreActuallySafe(unittest.TestCase):
+    """A decoy that is genuinely vulnerable measures nothing. One of them was.
+
+    The first /admin/reports authorized on `X-Role: admin` -- a CLIENT-SUPPLIED HEADER --
+    so anyone could send it and get in. A real hunt reported exactly that, correctly, and
+    the bench would have scored the tool's correct reasoning as a false positive. Every
+    decoy is now exercised here, because a silently-broken decoy corrupts the precision
+    number in the direction that makes the tool look worse than it is.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from range_app import Range
+        cls.rng = Range()
+        cls.rng.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.rng.__exit__()
+
+    def _code(self, path, **headers):
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(self.rng.base + path, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+
+    def test_the_admin_decoy_cannot_be_entered_with_a_spoofed_header(self):
+        self.assertEqual(self._code("/admin/reports", **{"X-Role": "admin"})[0], 401,
+                         "a client-supplied role header must not authorize anything")
+        self.assertEqual(self._code("/admin/reports")[0], 401)
+
+    def test_the_admin_decoy_authorizes_from_the_principal(self):
+        self.assertEqual(self._code("/admin/reports",
+                                    Authorization="Bearer bob")[0], 403)
+        self.assertEqual(self._code("/admin/reports",
+                                    Authorization="Bearer alice")[0], 200)
+
+    def test_the_scoped_decoy_refuses_another_principals_object(self):
+        self.assertEqual(self._code("/api/v1/me/orders/alice-1",
+                                    Authorization="Bearer bob")[0], 403)
+
+    def test_the_attribute_decoy_keeps_raw_angle_brackets_inert(self):
+        """Raw <> inside a quoted attribute with the quote escaped is not injection."""
+        status, body = self._code("/profile?name=%22%3Cb%3E")
+        self.assertEqual(status, 200)
+        self.assertIn("&quot;", body, "the quote must be escaped")
+        self.assertNotIn('value=""', body)
+
+    def _location(self, path: str) -> str:
+        """The raw Location header, WITHOUT following the redirect.
+
+        urlopen follows redirects by default, so asking for the status code of /logout
+        returned 200 -- the status of the page it landed on. That measured the wrong hop
+        entirely: an open redirect is a property of the Location header, so the header is
+        what has to be read.
+        """
+        import urllib.error
+        import urllib.request
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            resp = opener.open(self.rng.base + path, timeout=10)
+            return resp.headers.get("Location", "")
+        except urllib.error.HTTPError as exc:
+            return exc.headers.get("Location", "")
+
+    def test_the_redirect_decoy_refuses_an_absolute_destination(self):
+        for hostile in ("https://evil.example", "//evil.example",
+                        "javascript:alert(1)", "https:/\\evil.example"):
+            with self.subTest(next=hostile):
+                loc = self._location(f"/logout?next={hostile}")
+                self.assertEqual(loc, "/", f"relative-only redirect leaked {loc!r}")
+
+    def test_the_planted_open_redirect_really_is_open(self):
+        """The control for the test above: /go must honour what /logout refuses, or the
+        pair is not measuring the difference it claims to."""
+        self.assertEqual(self._location("/go?next=https://evil.example"),
+                         "https://evil.example")
+
+    def test_the_url_echo_decoy_never_fetches(self):
+        """It echoes a URL. The planted SSRF at /api/v1/fetch actually requests one."""
+        status, body = self._code("/share/link?url=http://127.0.0.1:1/unreachable")
+        self.assertEqual(status, 200)
+        self.assertNotIn("error", body.lower(),
+                         "an echo must not report a connection result")

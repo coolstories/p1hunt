@@ -171,22 +171,71 @@ def tool_available(tool: str) -> bool:
         return False
 
 
+# Where a harness is written, relative to the workspace root. Kept here rather than
+# imported from the swarm so the runners stay standalone (they are unit-tested without it).
+_POC_DIRS = (".p1hunt-poc", "test/p1hunt", "tests/p1hunt", "src/test/p1hunt")
+
+
 def safe_harness_path(workdir: str, harness_path: str) -> Path | None:
-    """Resolve ``harness_path`` against ``workdir`` and return it ONLY if it stays inside the
-    workdir (the workspace/sandbox) and exists. Prevents a runner from being pointed at an
-    arbitrary out-of-workspace file. Returns None otherwise."""
+    """Resolve ``harness_path`` to a real file INSIDE ``workdir``, or None.
+
+    The containment property is the point and is never relaxed: whatever is returned is
+    inside the workspace, so a runner can never be pointed at an arbitrary host file.
+
+    WHY IT ALSO LOOKS IN THE PoC DIRECTORY. The prover reports the path of the harness it
+    just wrote, and a model naturally reports the FILENAME ("test_bola_idor.py") while the
+    runner resolves against the workspace ROOT -- where the file is at
+    ".p1hunt-poc/test_bola_idor.py". A measured end-to-end run died exactly there: the
+    hunters wrote nine real harnesses, the verifier called the finding real with live
+    request evidence, the prover materialized a harness, and the runner reported "harness
+    missing or outside the sandbox" and the whole chain produced nothing. One missing path
+    prefix, and no proof could ever be executed.
+    
+    Resolving the bare name here is the right place for the fix: asking the model to get a
+    path prefix right every time, in every role, is a worse contract than looking in the
+    one directory harnesses are written to.
+    """
     if not harness_path:
         return None
     root = Path(workdir).resolve()
-    p = Path(harness_path)
-    if not p.is_absolute():
-        p = root / p
-    try:
-        p = p.resolve()
-        p.relative_to(root)          # must stay within the workspace
-    except (OSError, ValueError):
-        return None
-    return p if p.exists() else None
+
+    def _inside(candidate: Path) -> Path | None:
+        try:
+            c = (candidate if candidate.is_absolute() else root / candidate).resolve()
+            c.relative_to(root)      # must stay within the workspace
+        except (OSError, ValueError):
+            return None
+        return c if c.is_file() else None
+
+    # 1. Exactly as reported (the documented contract).
+    direct = _inside(Path(harness_path))
+    if direct is not None:
+        return direct
+    # 2. Under a PoC directory, for a path reported relative to it (or a bare filename).
+    rel = Path(harness_path)
+    if not rel.is_absolute():
+        for poc in _POC_DIRS:
+            found = _inside(Path(poc) / rel)
+            if found is not None:
+                return found
+    # 3. Last resort: a BOUNDED search for that exact basename inside a PoC directory.
+    #    Bounded on purpose -- an unbounded walk of a large repo is both slow and a way to
+    #    match some unrelated file with a common name.
+    # NOTE: this runs for a BARE filename too. An earlier version guarded it with
+    # `name != str(rel)` to avoid repeating step 2 -- but step 2 only checks the TOP level
+    # of each PoC directory, while this searches it recursively, so the guard excluded the
+    # single most likely input ("test_foo.py", written into a subdirectory).
+    name = rel.name
+    if name:
+        for poc in _POC_DIRS:
+            base = root / poc
+            if not base.is_dir():
+                continue
+            for cand in sorted(base.rglob(name))[:8]:
+                found = _inside(cand)
+                if found is not None:
+                    return found
+    return None
 
 
 def excerpt(text: str, limit: int = 4000) -> str:
