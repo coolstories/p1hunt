@@ -911,10 +911,65 @@ challenge or a 503 reads as a perfectly enforced authorization boundary. `assert
 runner maps that to ran=False, a non-result, instead of a verdict. A bare 403 with no WAF markers
 is still a genuine refusal and still counts as one.
 
-The egress jail confines every request to the in-scope host(s); a request elsewhere raises. Set
-ReproSpec expect="fail" for these harnesses: they assert the SECURE behavior (the forbidden
-request IS refused), so a reproduced bug makes the targeted test FAIL — an authz/forbidden
-assertion that does NOT hold is the bypass. Only contact {target_url} and loopback."""
+A REAL BROWSER is also shipped, as `p1hunt_browser.py` (+ `htmlctx.py`). Use it whenever the
+target renders HTML. `Client` cannot execute JavaScript, so with it alone a single-page app, a
+DOM sink, a `postMessage` handler and every client-side route are invisible to you.
+
+    from p1hunt_browser import Browser, CONTROL_MARKER, PROBE_MARKER
+    from htmlctx import PROBE                       # "p1hZ<>\"'`&/=;:p1hZ"
+    with Browser() as b:                            # scope + rate limit from env
+        obs = b.goto('/share/abc')
+        obs.raw_html    # the bytes the SERVER sent   -> server-side escaping
+        obs.dom_html    # the document AFTER scripts  -> DOM-based injection
+        obs.executed, obs.execution_proof            # script RAN (observed, not inferred)
+        obs.sinks, obs.message_listeners, obs.blocked, obs.console
+
+WORK BY COMPARISON FIRST, NOT BY PAYLOAD GUESSING. The strongest web findings come from two
+renders of ONE resource that differ in what they expose, and that needs no payload at all:
+
+    d = b.differential('/share/abc', [
+        {{'name': 'anon'}},
+        {{'name': 'host-m',  'host': 'm.target.tld'}},        # same path, sibling host
+        {{'name': 'victim',  'cookies': [...]}},              # same URL, different session
+    ])
+    d['diffs']   # status / title / raw_differs / executed / request-set deltas
+
+A render that differs by HOST is a gate applied on one host and missed on another. A render
+that differs by SESSION is an authorization decision made at render time. Both are routinely
+critical and neither requires you to guess an escape.
+
+THEN probe escaping, and let the analyzer judge the CONTEXT — do not judge it yourself:
+
+    out = b.escaping_differential(
+        lambda mk: put_marker_in_the_app_and_render(mk),   # YOU know the injection point
+        CONTROL_MARKER, PROBE_MARKER)                      # benign control, then metachars
+    out['confirmed']        # only landings the control does not already explain
+
+Judging escaping by eye is where this goes wrong, in BOTH directions, so do not do it:
+  • a raw `<` in a text node is a tag injection;
+  • a raw `<` inside a double-quoted attribute is completely INERT — not a finding;
+  • `&quot;` inside `<script>` is six literal characters: RAWTEXT never decodes entities;
+  • but a raw `&` in an attribute where the app emits its own `&quot;`-encoded structure means
+    an entity YOU supply decodes to a real quote — a true finding a `<`-only check misses;
+  • an unquoted attribute value needs no quote at all: one space adds `onfocus=`.
+`htmlctx.census()` applies the per-context rule and reports `verdict` + `why`. Report its
+verdict, not your impression of the HTML.
+
+For a DOM sink use `b.dom_injection(marker)`, NOT a census of `dom_html`: `dom_html` is a
+SERIALIZATION, and serializing a text node re-escapes `<`, so the absence of character
+evidence there proves nothing. `dom_injection` asks the live document whether your input
+became ELEMENTS or created an ATTRIBUTE NAME, which survives serialization.
+
+A finding is not proven by escaping analysis alone — `obs.executed` is. An escape that does
+not execute is a lead, not a critical.
+
+The egress jail confines every request to the in-scope host(s); a request elsewhere raises. The
+browser is jailed at the same chokepoint, and that includes SUBRESOURCES: an out-of-scope image
+or script a page names is aborted and listed in `obs.blocked`, so a non-empty `blocked` is
+normal on a third-party-heavy page and is not itself a finding. Set ReproSpec expect="fail" for
+these harnesses: they assert the SECURE behavior (the forbidden request IS refused), so a
+reproduced bug makes the targeted test FAIL — an authz/forbidden assertion that does NOT hold
+is the bypass. Only contact {target_url} and loopback."""
 
 
 def scaffold_block(

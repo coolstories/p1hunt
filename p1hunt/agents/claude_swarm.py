@@ -1647,20 +1647,37 @@ class ClaudeSwarm:
         except Exception:
             self._oob = None
         self._dynamic_env_keys = keys
-        # Ship the scope-enforced client into the PoC sandbox so harnesses can `import p1hunt_dyn`.
-        shipped = False
-        try:
-            from ..dynamic import client as _client_mod
-            src = Path(_client_mod.__file__).read_text(encoding="utf-8")
-            (self.poc_dir / "p1hunt_dyn.py").write_text(src, encoding="utf-8")
-            shipped = True
-        except Exception:
-            shipped = False
+        # Ship the scope-enforced interaction modules into the PoC sandbox so a harness can
+        # `import p1hunt_dyn` (HTTP) and `import p1hunt_browser` (a real browser).
+        #
+        # Each file is copied, not imported from the package: the harness runs as a separate
+        # pytest process with no `p1hunt` on sys.path. browser.py falls back to a bare
+        # `import htmlctx`, so htmlctx MUST land beside it under that exact name or the
+        # browser module raises at import (it refuses to run without its analyzer).
+        #
+        # Reported per file. A single `shipped` bool hid which module was missing, and a
+        # harness that cannot import the browser silently loses the whole DOM bug class.
+        ship_report: dict[str, bool] = {}
+        for mod_path, dest in (("..dynamic.client", "p1hunt_dyn.py"),
+                               ("..dynamic.browser", "p1hunt_browser.py"),
+                               ("..dynamic.htmlctx", "htmlctx.py")):
+            try:
+                import importlib
+                mod = importlib.import_module(mod_path, package=__package__)
+                src = Path(mod.__file__).read_text(encoding="utf-8")
+                (self.poc_dir / dest).write_text(src, encoding="utf-8")
+                ship_report[dest] = True
+            except Exception:
+                ship_report[dest] = False
+        shipped = ship_report.get("p1hunt_dyn.py", False)
         idents = [i.name for i in self.scope.test_identities if i.resolve()]
         self._emit(self.name, "lifecycle",
                    {"event": "dynamic_armed", "base_url": self._base_url,
                     "egress": list(self._egress_hosts or []), "identities": idents,
-                    "oob": bool(self._oob), "client_shipped": shipped})
+                    "oob": bool(self._oob), "client_shipped": shipped,
+                    "shipped": dict(ship_report),
+                    "browser_shipped": ship_report.get("p1hunt_browser.py", False)
+                                       and ship_report.get("htmlctx.py", False)})
 
     def _stop_fork(self) -> None:
         """Tear down the local fork (no-op when none was started). Called at every hunt exit.
