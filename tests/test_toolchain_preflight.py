@@ -33,13 +33,26 @@ class TestPreflightProbesForReal(unittest.TestCase):
         res = B.preflight_pytest()
         # This machine's pytest may legitimately be broken (that is how this was found),
         # so assert the SHAPE and the self-consistency, not the verdict.
+        #
+        # Three self-consistent outcomes, not two: the preflight now also tries a
+        # `-p no:<plugin>` workaround and VERIFIES it, so "ok" can mean either "pytest was
+        # already fine" or "pytest is broken but a verified workaround makes it run".
+        # Those must be distinguishable, because the second one still carries a durable
+        # fix that belongs to the operator.
         self.assertIn("ok", res)
         self.assertEqual(res["tool"], "pytest")
-        if res["ok"]:
+        if res["ok"] and not res["addopts"]:
             self.assertEqual(res["fix"], "")
+            self.assertEqual(res["broken_plugin"], "")
+        elif res["ok"]:
+            self.assertTrue(res["addopts"].startswith("-p no:"), res["addopts"])
+            self.assertTrue(res["broken_plugin"])
+            self.assertIn(res["broken_plugin"], res["addopts"])
+            self.assertTrue(res["fix"], "a self-healed break still needs the real fix stated")
         else:
             self.assertTrue(res["fix"], "a failure must come with a fix the operator can act on")
             self.assertTrue(res["detail"])
+            self.assertEqual(res["addopts"], "", "a failure must not advertise a workaround")
 
     def test_it_actually_executes_a_test_rather_than_checking_the_binary_exists(self):
         """`pytest --version` succeeds on the broken install. Only running a test catches it."""
@@ -66,8 +79,14 @@ class TestPreflightProbesForReal(unittest.TestCase):
         self.assertIn("PATH", res["detail"])
         self.assertTrue(res["fix"])
 
-    def test_a_plugin_that_raises_on_import_is_named_with_its_workaround(self):
-        """The operator needs the plugin's NAME; 'pytest is broken' is not actionable."""
+    def test_a_plugin_that_raises_on_import_is_named(self):
+        """The operator needs the plugin's NAME; 'pytest is broken' is not actionable.
+
+        Here the workaround does NOT help -- every invocation fails, including the one
+        with `-p no:anchorpy`. So the preflight must report FAILURE and must not advertise
+        an addopts flag it could not verify: applying an unverified flag to a harness
+        process could silently change what that harness measures.
+        """
         fake = subprocess.CompletedProcess(
             args=["pytest"], returncode=1, stdout="",
             stderr=('File "/x/lib/python3.11/site-packages/anchorpy/__init__.py", line 6\n'
@@ -76,8 +95,40 @@ class TestPreflightProbesForReal(unittest.TestCase):
             res = B.preflight_pytest()
         self.assertFalse(res["ok"])
         self.assertEqual(res["broken_plugin"], "anchorpy")
-        self.assertIn("-p no:anchorpy", res["fix"])
+        self.assertEqual(res["addopts"], "", "an unverified workaround must not be offered")
+        self.assertIn("did NOT fix the run", res["fix"])
         self.assertIn("solders.rpc", res["detail"])
+
+    def test_a_plugin_whose_workaround_works_is_self_healed_and_verified(self):
+        """The common case: disabling the plugin makes a trivial test pass.
+
+        The flag is only reported because a SECOND run proved it works. run_command then
+        applies it to p1hunt's harness subprocesses only -- never to the operator's
+        environment -- which is why it has to be verified rather than guessed.
+        """
+        calls = []
+        broken = subprocess.CompletedProcess(
+            args=["pytest"], returncode=1, stdout="",
+            stderr=('File "/x/site-packages/anchorpy/__init__.py", line 6\n'
+                    "ModuleNotFoundError: No module named 'solders.rpc'\n"))
+        fixed = subprocess.CompletedProcess(args=["pytest"], returncode=0,
+                                            stdout="1 passed", stderr="")
+
+        def _run(argv, **kw):
+            addopts = (kw.get("env") or {}).get("PYTEST_ADDOPTS", "")
+            calls.append(addopts)
+            return fixed if "no:anchorpy" in addopts else broken
+
+        with mock.patch.object(B.subprocess, "run", _run):
+            res = B.preflight_pytest()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["addopts"], "-p no:anchorpy")
+        self.assertEqual(res["broken_plugin"], "anchorpy")
+        # VERIFIED, not assumed: there must have been a bare run and then a flagged one.
+        self.assertIn("", calls)
+        self.assertTrue(any("no:anchorpy" in c for c in calls), calls)
+        # The durable fix still belongs to the operator, so it is still stated.
+        self.assertIn("anchorpy", res["fix"])
 
     def test_a_preflight_that_cannot_run_does_not_raise(self):
         def _boom(*a, **k):

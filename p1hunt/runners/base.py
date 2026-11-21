@@ -26,6 +26,7 @@ so both report ``ran=False`` rather than a verdict. See ``ReproSpec.expect`` bel
 
 from __future__ import annotations
 
+import functools
 import importlib
 import os
 import re
@@ -223,6 +224,27 @@ def run_command(
         env["TMPDIR"] = str(tmpdir)
         env["TEMP"] = str(tmpdir)
         env["TMP"] = str(tmpdir)
+        # SELF-HEAL A BROKEN PYTEST PLUGIN, scoped to this subprocess only.
+        #
+        # A third-party pytest plugin that raises on import kills the harness before it
+        # collects a single test, which caps the whole hunt's confirmed count at zero --
+        # for a reason that has nothing to do with the target. On the development machine
+        # that was a stale `anchorpy` whose `solders` dependency lost a module.
+        #
+        # The workaround is `-p no:<plugin>` and it is applied ONLY to the harness process
+        # p1hunt spawns, never to the operator's environment, and only after the preflight
+        # VERIFIED that it makes a trivial test pass. Disabling someone's plugin is a real
+        # intrusion, so it is narrow, verified, and announced in the event stream rather
+        # than done quietly.
+        fix = _pytest_plugin_workaround()
+        if fix and argv and argv[0] == "pytest":
+            env["PYTEST_ADDOPTS"] = (env.get("PYTEST_ADDOPTS", "") + " " + fix).strip()
+            if on_event:
+                _emit(on_event, runner, {"event": "pytest_plugin_workaround",
+                                         "addopts": fix,
+                                         "detail": "a pytest plugin raises on import; it is "
+                                                   "disabled for p1hunt's harness processes "
+                                                   "only, so harnesses can collect"})
         proc = subprocess.run(  # noqa: S603 — fixed argv (runner-derived), shell=False
             argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, check=False,
             env=env,
@@ -245,6 +267,20 @@ def run_command(
         if on_event:
             _emit(on_event, runner, {"event": "exec_error", "detail": str(exc)})
         return False, 1, f"failed to launch: {exc}"
+
+
+@functools.lru_cache(maxsize=1)
+def _pytest_plugin_workaround() -> str:
+    """The VERIFIED `-p no:<plugin>` flag this machine needs, or "" if pytest is fine.
+
+    Cached: it costs a subprocess, and the answer cannot change inside one run. Returns ""
+    on any failure, so a diagnostic can never stop a harness from being attempted.
+    """
+    try:
+        res = preflight_pytest()
+    except Exception:
+        return ""
+    return res.get("addopts", "") if res.get("ok") else ""
 
 
 def _emit(on_event: EventEmit | None, runner: str, data: dict) -> None:
@@ -340,7 +376,13 @@ def preflight_pytest(*, timeout: float = 120.0) -> dict:
     Returns ``{ok, tool, detail, fix, broken_plugin}``. Never raises: a preflight that
     throws would take down a hunt over a diagnostic.
     """
-    out = {"ok": False, "tool": "pytest", "detail": "", "fix": "", "broken_plugin": ""}
+    out = {"ok": False, "tool": "pytest", "detail": "", "fix": "", "broken_plugin": "",
+           # A `-p no:<plugin>` flag this function VERIFIED makes a trivial test pass. Empty
+           # when pytest is already fine, or when nothing fixed it. run_command applies it to
+           # the harness subprocess only (see _pytest_plugin_workaround): a guess would be
+           # worse than nothing, because silently disabling the wrong plugin could change
+           # what a harness measures.
+           "addopts": ""}
     if not tool_available("pytest"):
         out["detail"] = "pytest is not on PATH"
         out["fix"] = "install pytest in the environment that runs the hunt"
@@ -349,12 +391,20 @@ def preflight_pytest(*, timeout: float = 120.0) -> dict:
         with tempfile.TemporaryDirectory(prefix="p1hunt_preflight_") as box:
             probe = Path(box) / "test_p1hunt_preflight.py"
             probe.write_text("def test_preflight():\n    assert True\n", encoding="utf-8")
-            proc = subprocess.run(
-                ["pytest", "-q", str(probe)], cwd=box, text=True,
-                capture_output=True, timeout=timeout,
-            )
-            text = (proc.stdout or "") + (proc.stderr or "")
-            if proc.returncode == 0:
+
+            def _attempt(addopts: str) -> tuple[int, str]:
+                env = os.environ.copy()
+                if addopts:
+                    env["PYTEST_ADDOPTS"] = (
+                        env.get("PYTEST_ADDOPTS", "") + " " + addopts).strip()
+                proc = subprocess.run(
+                    ["pytest", "-q", str(probe)], cwd=box, text=True,
+                    capture_output=True, timeout=timeout, env=env,
+                )
+                return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+            code, text = _attempt("")
+            if code == 0:
                 out["ok"] = True
                 out["detail"] = "pytest executed a trivial test cleanly"
                 return out
@@ -362,14 +412,30 @@ def preflight_pytest(*, timeout: float = 120.0) -> dict:
             plugins = list(dict.fromkeys(_PYTEST_PLUGIN_RE.findall(text)))
             tail = next((ln.strip() for ln in reversed(text.splitlines())
                          if ln.strip() and "rror" in ln), text.strip()[-160:])
-            out["detail"] = (f"pytest could not run a trivial test (exit {proc.returncode}): "
+            out["detail"] = (f"pytest could not run a trivial test (exit {code}): "
                              f"{tail[:200]}")
+            for name in plugins:
+                # VERIFY, never assume: only a flag that actually makes the trivial test
+                # pass is worth applying to a harness process.
+                fix = f"-p no:{name}"
+                code2, _ = _attempt(fix)
+                if code2 == 0:
+                    out["ok"] = True
+                    out["addopts"] = fix
+                    out["broken_plugin"] = name
+                    out["detail"] = (
+                        f"the '{name}' pytest plugin raises on import ({tail[:120]}); "
+                        f"verified workaround '{fix}' makes a trivial test pass, and it is "
+                        f"applied to p1hunt's harness processes only")
+                    out["fix"] = (f"repair or remove the '{name}' package to clear this; until "
+                                  f"then harnesses run with {fix}")
+                    return out
             if plugins:
                 out["broken_plugin"] = plugins[0]
                 out["fix"] = (
                     f"a pytest plugin ('{plugins[0]}') raises on import, so every harness dies "
-                    f"before collection. Repair or remove that package, or run the hunt with "
-                    f"PYTEST_ADDOPTS='-p no:{plugins[0]}'."
+                    f"before collection, and disabling it did NOT fix the run. Repair or remove "
+                    f"that package."
                 )
             else:
                 out["fix"] = ("repair the pytest installation in the environment that runs the "
@@ -378,6 +444,7 @@ def preflight_pytest(*, timeout: float = 120.0) -> dict:
         out["detail"] = f"pytest preflight could not run: {exc}"
         out["fix"] = "check the pytest installation and the sandbox's exec permissions"
     return out
+
 
 
 # Classes whose runners drive the pytest path (web.py, and the OTHER fallback).

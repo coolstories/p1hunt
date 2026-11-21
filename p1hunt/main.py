@@ -880,6 +880,24 @@ def _autopilot(args: argparse.Namespace) -> int:
     return run_autopilot(cfg)
 
 
+def _doctor(args: argparse.Namespace) -> int:
+    """Answer one question before any money is spent: would a hunt started now MEAN anything?
+
+    Every expensive failure this project has had was one dead layer behind a healthy-looking
+    run -- a refused model role, a browser that could not start, a pytest that could not
+    collect. Each of those caps the result at "found nothing" while every other part reports
+    success, so the honest reading of a clean hunt depends on having checked them first.
+    """
+    from .doctor import render, run_doctor
+
+    rep = run_doctor(engine=getattr(args, "engine", None),
+                     skip_browser=bool(getattr(args, "no_browser", False)))
+    eng = (getattr(args, "engine", None) or Config.from_env().models.engine or "").lower()
+    print(render(rep, engine=eng))
+    # Non-zero on NO-GO so this is usable as a gate in a script.
+    return 0 if rep.go else 1
+
+
 def _status(_args: argparse.Namespace) -> int:
     config = Config.from_env()
     from .agents.claude_session import sdk_available
@@ -1027,6 +1045,16 @@ def main(argv: list[str] | None = None) -> int:
 
     status = sub.add_parser("status", help="Show detector brain, run mode, models, rate-limit gate, and config.")
     status.set_defaults(func=_status)
+
+    doc = sub.add_parser(
+        "doctor",
+        help="PRE-FLIGHT: can a hunt on this machine actually produce a confirmed finding? "
+             "Run this before any real engagement.")
+    doc.add_argument("--engine", choices=("codex", "claude"), default=None,
+                     help="check this engine instead of the configured one")
+    doc.add_argument("--no-browser", action="store_true",
+                     help="skip launching chromium (faster; reports the check as unchecked)")
+    doc.set_defaults(func=_doctor)
 
     web = sub.add_parser("web", help="Launch the Threat Operations Center — a live web dashboard over the engagements.")
     web.add_argument("--host", default="127.0.0.1", help="bind address (default loopback)")

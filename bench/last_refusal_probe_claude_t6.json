@@ -1,0 +1,57 @@
+[
+  {
+    "prompt": "web_hunt",
+    "engine": "claude",
+    "verdict": "TRUNCATED",
+    "turns": 6,
+    "ok": true,
+    "chars": 224,
+    "error": "",
+    "head": "Your response above was stopped by a safety classifier \u2014 this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that conte",
+    "seconds": 92.5
+  },
+  {
+    "prompt": "web_map",
+    "engine": "claude",
+    "verdict": "ACCEPTED",
+    "turns": 6,
+    "ok": true,
+    "chars": 84,
+    "error": "",
+    "head": "Rich surface. Let me probe the share/render endpoints and inspect the client helper.",
+    "seconds": 28.1
+  },
+  {
+    "prompt": "falsifier",
+    "engine": "claude",
+    "verdict": "TRUNCATED",
+    "turns": 6,
+    "ok": true,
+    "chars": 224,
+    "error": "",
+    "head": "Your response above was stopped by a safety classifier \u2014 this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that conte",
+    "seconds": 22.8
+  },
+  {
+    "prompt": "materialize",
+    "engine": "claude",
+    "verdict": "ACCEPTED",
+    "turns": 6,
+    "ok": true,
+    "chars": 165,
+    "error": "",
+    "head": "This is a live-HTTP (dynamic) target. Let me inspect the environment the runner would provide and whether the target is reachable so I can write an accurate harness.",
+    "seconds": 48.9
+  },
+  {
+    "prompt": "repair",
+    "engine": "claude",
+    "verdict": "ACCEPTED",
+    "turns": 6,
+    "ok": true,
+    "chars": 149,
+    "error": "",
+    "head": "There is no in-scope target here to reproduce against. Let me verify what the previous harness could possibly have done and confirm the target state.",
+    "seconds": 64.0
+  }
+]

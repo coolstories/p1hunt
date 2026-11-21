@@ -363,7 +363,12 @@ class TestDedupAndDebate(unittest.TestCase):
         from p1hunt.agents.claude_hunter import dedup_prompt
         p = dedup_prompt(self._cf(title="nonce reuse v2"),
                          [self._finding("nonce reuse", "presig resurrected")])
-        self.assertIn("deduplicator", p.lower())
+        # The prompt must still SAY what job it is. The wording changed from
+        # "finding-triage deduplicator" to "the finding-triage role" when every
+        # model-facing prompt gained its authorization preamble -- the role is identical,
+        # the swagger is gone, and that rewording measurably un-refused other roles.
+        self.assertIn("finding-triage", p.lower())
+        self.assertIn("duplicate/not-duplicate", p.lower())
         self.assertIn("nonce reuse", p)            # existing one listed
         self.assertIn("duplicate", p)
 

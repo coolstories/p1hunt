@@ -7,6 +7,24 @@ fully — derivation, delegation, never-quit hunt, believe-but-verify, total obs
 with **no credentials and no live API calls**. Codex is the default live AI engine when the
 `codex` CLI is installed/authenticated; Claude remains an explicit compatibility engine.
 
+## Before you run anything: `doctor`
+
+```sh
+python3 -m p1hunt.main doctor      # would a hunt started now MEAN anything?
+```
+
+Exits non-zero on **NO-GO**. It exists because every expensive failure this system has had
+was one dead layer behind a healthy-looking run — a model role the provider refused, a
+browser that could not start, a pytest that could not collect — each of which caps the
+result at "found nothing" while everything else reports success. **A clean hunt from a
+machine that fails `doctor` says nothing about the target.** A check it could not perform
+is reported as `skip`, never as `ok`.
+
+For a live web target, read [`RUNBOOK.md`](RUNBOOK.md): the engine choice is not a detail
+(on Codex the entire find-and-prove chain is currently refused by the provider's safety
+classifier, so only reconnaissance runs), and `bench/README.md` records what is measured
+and what is not.
+
 ## Run
 
 ```sh

@@ -127,6 +127,27 @@ _PARTIAL_MARKERS = (
     "response above was stopped",
 )
 
+# WHAT TRUNCATED DOES AND DOES NOT TELL YOU -- a limit of this tool, stated here because
+# acting on it as if it were fatal would be as wrong as ignoring it.
+#
+# The notice is a MID-CONVERSATION interjection: the session continues afterwards, and the
+# model can recover on a later turn. This probe reads the LAST message at the turn cap, so
+# TRUNCATED means "the final turn was cut", which is ambiguous between:
+#
+#   (a) fatally cut -- the role never emits its JSON / never finishes the harness; and
+#   (b) one turn got cut and the session carried on to a usable result.
+#
+# The measured evidence that this is a real ambiguity: web_hunt came back ACCEPTED at
+# max_turns=2 and TRUNCATED at max_turns=6. The longer run did not get worse; it got
+# further, far enough into real probing for a response-level classifier to fire on the
+# model's own in-progress output. Raising the cap changes the answer, which means the
+# answer is about where the cap lands, not only about the role.
+#
+# So TRUNCATED is a flag to go and measure the real thing (bench/run_exec.py), not a
+# verdict that the role is dead. It fails this check because an unresolved ambiguity in
+# the find-and-prove chain should stop you spending money on a long hunt -- not because
+# the role is known to be broken.
+
 
 def _classify(res) -> str:
     """ACCEPTED / REFUSED / TRUNCATED / EMPTY, strongest evidence of failure first.

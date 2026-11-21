@@ -191,11 +191,37 @@ phrasing, and without both. All three were still refused.
 **So this is not a wording bug, and the fix is not more wording.** On this engine the
 reconnaissance and planning roles are permitted and the hunting and proving roles are not.
 That is a capability limit of the engine for this workload. The right response is engine
-selection — route the refused roles to an engine authorized for defensive security testing
-(`P1HUNT_ENGINE=claude`, which needs `claude_agent_sdk` installed) or a different model —
-not further iteration on phrasing to get past a classifier. Chasing that would be working
-around a safety system rather than describing the work accurately, and the honest answer
-when a provider declines a workload is to use a provider that permits it.
+selection, not further iteration on phrasing to get past a classifier: chasing that would
+be working around a safety system rather than describing the work accurately, and the
+honest answer when a provider declines a workload is to use a provider that permits it.
+
+#### The other engine, measured the same way
+
+`claude_agent_sdk` is this project's own declared optional `agent` extra. With it
+installed, `P1HUNT_ENGINE=claude` becomes available and the same probe gives a genuinely
+better but still incomplete picture — on `claude-opus-5-5`, at `max_turns=2`:
+
+| role | verdict |
+|---|---|
+| `web_hunt`, `web_map`, `exploit_dev` | ACCEPTED (began real recon) |
+| `falsifier`, `materialize`, `repair` | **TRUNCATED** — accepted at the gate, response stopped part-way |
+| `src_hunt`, `fuzz` | EMPTY — no text at all |
+
+The hunting role works here, which is the thing Codex would not do. The **proof chain**
+is still compromised, by a different mechanism: three roles were accepted and then cut
+off mid-response, which for a role that must emit parseable JSON or finish writing a
+harness contributes nothing.
+
+**That table is also a correction of this tool.** The probe first reported all eight as
+ACCEPTED, because `res.ok or text` counted a zero-character reply as success and a
+mid-response safety stop came back `ok=True` with real-looking prose — prose which said,
+in words, that it had been cut off. Two bugs, both reporting failure as success, in the
+one tool whose entire job is to say whether the engine will do the work. `TRUNCATED` and
+`EMPTY` are now distinct verdicts and any of them fails the check.
+
+`EMPTY` at `max_turns=2` is **not** a conclusion: a role that spent both turns on tool
+calls and never emitted text looks identical to a blocked one. Re-probe with `--turns`
+before believing it.
 
 ### 2. A refusal was misread as rate-limiting, and waited out
 

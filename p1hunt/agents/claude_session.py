@@ -886,6 +886,35 @@ def parse_findings(text: str, lens_default: str = "") -> list[ClaudeFinding]:
     return []
 
 
+# A response the provider STOPPED PART-WAY, rather than refusing at the gate.
+#
+# This is a THIRD outcome and it is the easiest of the three to miss: the session returns
+# ok=True with real-looking prose, so every naive check reads it as success. The prose
+# itself says it was cut off, and any tool call that had not finished never ran.
+#
+# Measured on the Claude engine against the local range: the hunting and falsifier roles
+# were accepted at the gate and then truncated once they got far enough into real probing.
+# For a role that must emit a parseable JSON block or finish writing a harness, a truncated
+# reply contributes nothing -- so the pipeline sees "no findings", which is exactly what a
+# clean target looks like.
+#
+# It is NOT automatically fatal. The notice is a mid-conversation interjection and the
+# session continues, so a later turn can still deliver the result -- and findings the
+# hunter already posted through the live blackboard tool survive regardless. Hence a
+# warning when it happens with nothing to show for it, not a failure.
+_TRUNCATION_MARKERS = (
+    "stopped by a safety classifier",
+    "the rest of it was withheld",
+    "response above was stopped",
+)
+
+
+def response_truncated(text: str) -> bool:
+    """Did the provider cut this response off part-way?"""
+    low = (text or "").lower()
+    return any(m in low for m in _TRUNCATION_MARKERS)
+
+
 def engine_available(engine: str) -> bool:
     """Is the chosen AI engine runnable? 'codex' needs the codex CLI; 'claude' needs the SDK/CLI."""
     if (engine or "").strip().lower() == "codex":

@@ -10,7 +10,8 @@ through ``make_session``; Codex is the default for every role.
 
 from __future__ import annotations
 
-from .claude_session import ClaudeFinding, ClaudeSession, EventEmit, SessionResult, make_session, parse_ruled_out
+from .claude_session import (ClaudeFinding, ClaudeSession, EventEmit, SessionResult,
+                             make_session, parse_ruled_out, response_truncated)
 from .instructions import authorized_role
 
 
@@ -68,6 +69,52 @@ _ROLE_SRC_HUNT = authorized_role(
     "the code-review role",
     live=False,
     deliverable="a specific, file-anchored weakness with a reproducible demonstration")
+# THE PROVE CHAIN. Added after a measured probe: these four were the only model-facing
+# prompts still opening bare, and three of them (falsifier, materialize, repair) were the
+# three the Claude engine accepted at the gate and then STOPPED PART-WAY -- which for a
+# role that must emit parseable JSON or finish writing a harness contributes nothing.
+#
+# Their old openers also oversold what they are: "exploit engineer", "WORLD-CLASS exploit
+# developer and cryptanalyst". The actual job is narrower and more defensible -- take one
+# believed finding and either break it or produce a harness a deterministic runner can
+# execute -- and saying so plainly is both accurate and what the framing needs.
+_ROLE_FALSIFY = authorized_role(
+    "the verification role",
+    live=True,
+    deliverable="an honest verdict on whether this reported weakness is real, with the "
+                "evidence that settles it either way")
+_ROLE_FALSIFY_SRC = authorized_role(
+    "the verification role",
+    live=False,
+    deliverable="an honest verdict on whether this reported weakness is real, with the "
+                "evidence that settles it either way")
+_ROLE_PROVE = authorized_role(
+    "the proof role",
+    live=False,
+    deliverable="a runnable harness that demonstrates the weakness, so a defender can "
+                "confirm the fix")
+_ROLE_DEPTH = authorized_role(
+    "the proof-depth role",
+    live=False,
+    deliverable="a demonstration of how far this weakness actually reaches, so its "
+                "severity is a measured fact rather than a guess")
+_ROLE_SRC_MAP = authorized_role(
+    "the code-mapping role",
+    live=False,
+    deliverable="an accurate model of this subsystem's entrypoints, state and trust "
+                "boundaries, and the questions worth settling about them")
+# The triage roles. Lower risk -- they weigh an existing finding rather than probe a
+# system -- but framed too, because the cost of being wrong about that is a dead role and
+# the cost of the framing is nothing. Measured by bench/probe_refusal.py like the rest.
+_ROLE_TRIAGE = authorized_role(
+    "the finding-triage role",
+    live=False,
+    deliverable="a correct duplicate/not-duplicate decision, so the same weakness is not "
+                "reported twice")
+_ROLE_JUDGE = authorized_role(
+    "the adjudication role",
+    live=False,
+    deliverable="a defensible severity decision on a finding two reviewers disagree about")
 
 
 def hunt_prompt(
@@ -441,7 +488,8 @@ def map_prompt(
     web = ("\nYou MAY consult the web to understand the SPEC or a primitive for this kind of system "
            "(technique only — never search for this product's prior disclosures). A few searches at most."
            if allow_web else "")
-    return f"""You are a world-class security researcher who will OWN the '{subsystem}' subsystem. This
+    return f"""{_ROLE_SRC_MAP}
+You will OWN the '{subsystem}' subsystem. This
 is the MAP phase — you are NOT attacking yet and NOT writing a PoC. Your ONE deliverable is a
 COMPLETE, durable MODEL of this subsystem that you (and your future rounds) will attack from.
 
@@ -675,7 +723,8 @@ def verify_prompt(
 
     if live_web:
         hosts = ", ".join(egress_hosts or []) or "(authorized host allowlist from environment)"
-        return f"""You are an adversarial Falsifier for a BLACK-BOX live web bounty finding.
+        return f"""{_ROLE_FALSIFY}
+You are the adversarial check on a BLACK-BOX live web finding.
 PRIOR: the reported finding is WRONG until proven, but backend source may NOT be present.
 
 Current working directory is an evidence workspace: harvested JS/OpenAPI/docs and PoCs under ./{poc_reldir}/.
@@ -719,7 +768,8 @@ Reply ONLY with JSON:
 	  {_FINDING_CLAIM_JSON},
 	  "reason": "cite the live request/pytest/OOB evidence for real, or the specific live block for refuted"}}"""
 
-    return f"""You are an adversarial Falsifier. PRIOR: this reported finding is WRONG until proven.
+    return f"""{_ROLE_FALSIFY_SRC}
+You are the adversarial check. PRIOR: this reported finding is WRONG until proven.
 Investigate the code in the current working directory with Read/Grep/Glob/Bash and try to REFUTE it.
 Keep every search bounded: use `rg --files | head -200`, `rg -n -m 50 ...`, or targeted paths.
 Never run an unbounded recursive grep over generated/minified bundles; huge tool output can break the verifier session.
@@ -893,6 +943,19 @@ class ClaudeHunter:
                 keyed.setdefault(f"{f.file}:{f.line}:{f.title.lower()[:40]}", f)
             res = SessionResult(ok=res.ok, text=res.text, findings=list(keyed.values()),
                                 error=res.error, tool_calls=res.tool_calls)
+        # A TRUNCATED REPLY THAT PRODUCED NOTHING is indistinguishable from a clean pass,
+        # so say it out loud. Findings posted mid-session through the blackboard tool
+        # survive truncation (that is what the `live` list above is for), which is why
+        # this only fires when there is genuinely nothing to show.
+        if response_truncated(res.text) and not res.findings:
+            self.on_event(self.agent_name, "lifecycle", {
+                "event": "response_truncated", "severity": "HIGH", "lens": self.theme,
+                "impact": "the provider cut this hunting session off part-way and it "
+                          "produced no findings, which looks exactly like a clean pass. "
+                          "Do NOT read this track as checked",
+                "fix": "re-run this track, or move these roles to an engine that completes "
+                       "them (see `p1hunt doctor` and bench/probe_refusal.py)",
+            })
         # Grow the ruled-out ledger for next round (deduped, capped to avoid prompt bloat).
         for note in parse_ruled_out(res.text):
             if note not in self._ruled_out:
@@ -961,7 +1024,8 @@ class ClaudeVerifier:
 
 
 def poc_prompt(f: ClaudeFinding, poc_reldir: str = ".p1hunt-poc") -> str:
-    return f"""You are an exploit engineer. The finding below has ALREADY PASSED adversarial review
+    return f"""{_ROLE_PROVE}
+The finding below has ALREADY PASSED adversarial review
 and is believed to be a REAL bug. Your job: PROVE it dynamically by building the smallest possible
 proof-of-concept and ACTUALLY RUNNING it against the real target code.
 
@@ -1008,7 +1072,8 @@ def materialize_prompt(f: ClaudeFinding, scaffold: str = "", fork_url: str = "",
                  if fork_url else "")
     op = ("\n\nPARENT A / OPERATOR DIRECTIVES FOR THIS PROOF STEP:\n"
           + operator_notes.strip()) if operator_notes and operator_notes.strip() else ""
-    return f"""You are an exploit engineer. The finding below passed adversarial review and is BELIEVED real.
+    return f"""{_ROLE_PROVE}
+The finding below passed adversarial review and is BELIEVED real.
 Do NOT judge whether it works — a DETERMINISTIC runner will execute your harness and decide. Your ONE job is
 to MATERIALIZE a real, runnable proof HARNESS on disk that the runner can execute unattended.
 
@@ -1078,7 +1143,8 @@ def repair_prompt(f: ClaudeFinding, prior_spec: dict, runner_output: str,
     op = ("\n\nPARENT A / OPERATOR DIRECTIVES FOR THIS REPAIR STEP:\n"
           + operator_notes.strip()) if operator_notes and operator_notes.strip() else ""
     prior = str(prior_spec.get("harness_path", "")) if isinstance(prior_spec, dict) else ""
-    return f"""You are an exploit engineer ITERATING on a proof harness. Your previous harness did NOT
+    return f"""{_ROLE_PROVE}
+You are ITERATING on a proof harness. Your previous harness did NOT
 reproduce the bug yet. Read the REAL runner output below, find why, and FIX the harness so it
 compiles/runs and actually demonstrates the bug. This is normal — real PoCs take a few iterations.
 
@@ -1155,8 +1221,18 @@ class ClaudePoCProver:
             return None
         spec = _parse_verdict(result.text)
         if not spec or not spec.get("harness_path"):
+            # Distinguish "the model could not build a harness" from "the provider cut it
+            # off". They need completely different responses, and lumping them together
+            # sends you debugging the wrong one.
+            cut = response_truncated(result.text)
             self.on_event(self.agent_name, "lifecycle",
-                          {"event": "materialize_empty", "title": finding.title})
+                          {"event": "materialize_empty", "title": finding.title,
+                           "truncated": cut,
+                           "severity": "HIGH" if cut else "",
+                           "detail": ("the provider cut this proof session off part-way, so no "
+                                      "harness was written -- this is not evidence the finding "
+                                      "is unprovable" if cut else
+                                      "the session returned no harness path")})
             return None
         self.on_event(self.agent_name, "message",
                       {"verdict": "harness materialized", "title": finding.title,
@@ -1249,7 +1325,8 @@ def dedup_prompt(f: ClaudeFinding, existing: list) -> str:
     lst = "\n".join(
         f"  {i + 1}. [{e.severity}] {e.title} @ {getattr(e.poc,'path','')} — {e.root_cause[:160]}"
         for i, e in enumerate(existing))
-    return f"""You are a finding-triage deduplicator. A new finding was just CONFIRMED. Decide if it is
+    return f"""{_ROLE_TRIAGE}
+A new finding was just CONFIRMED. Decide if it is
 the SAME underlying vulnerability as one ALREADY confirmed — same ROOT CAUSE and same FIX — even if
 the title, file, or line number differs. Two different symptoms of one root cause = DUPLICATE. A
 genuinely distinct bug (different root cause, needs a separate fix) = NOT a duplicate.
@@ -1305,7 +1382,8 @@ def exploit_dev_prompt(f: ClaudeFinding, rubric: str, poc_reldir: str = ".p1hunt
             "across ALL remaining angles.")
     op = ("\n\nPARENT A / OPERATOR DIRECTIVES FOR THIS DEPTH ATTEMPT:\n"
           + operator_notes.strip()) if operator_notes and operator_notes.strip() else ""
-    return f"""You are a WORLD-CLASS exploit developer and cryptanalyst. You are handed ONE believed
+    return f"""{_ROLE_DEPTH}
+You are handed ONE believed
 primitive (an anomaly another agent found in the target's shipped code). Spotting it was the easy
 10%. Your job is the hard 90%: BUILD THE FULL EXPLOIT that achieves the program's attacker-WIN — or
 prove rigorously that the chain cannot close. Take as many steps as you need; this is deep, sustained
@@ -1534,7 +1612,8 @@ def debate_prompt(f: ClaudeFinding, role: str) -> str:
                   "critical: show the attacker is real and in-model, the impact is real (key/funds/"
                   "control), and the severity is justified. Read the code; cite specifics; pre-empt "
                   "the obvious objections.")
-    return f"""{stance}
+    return f"""{_ROLE_JUDGE}
+{stance}
 
 CONFIRMED critical under debate:
 - title: {fv["title"]}
@@ -1565,7 +1644,8 @@ Reply ONLY JSON: {{"argument": "your strongest case, citing file:line",
 
 def debate_judge_prompt(f: ClaudeFinding, prosecution: str, defense: str) -> str:
     fv = _finding_view(f)
-    return f"""You are the JUDGE. Two researchers debated a CONFIRMED critical. Weigh BOTH arguments
+    return f"""{_ROLE_JUDGE}
+You are the JUDGE. Two reviewers debated a CONFIRMED critical. Weigh BOTH arguments
 against the actual code and rule impartially. Prefer truth over either side; do not rubber-stamp.
 
 Finding: {fv["title"]}  ({fv["location"]})

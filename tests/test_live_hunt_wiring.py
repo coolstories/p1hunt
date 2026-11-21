@@ -364,3 +364,72 @@ class TestTheRefusalProbeClassifiesHonestly(unittest.TestCase):
         sig = inspect.signature(self.P.probe)
         self.assertIn("turns", sig.parameters)
         self.assertIn("Re-probe", inspect.getdoc(self.P.probe) or "")
+
+
+class TestATruncatedSessionIsNotSilence(unittest.TestCase):
+    """A response the provider cut off part-way must not look like a clean pass.
+
+    This is the third outcome, and the easiest of the three to miss. A gate refusal comes
+    back as an error. An empty reply comes back with no text. But a TRUNCATED reply comes
+    back ok=True carrying real-looking prose -- prose which says, in words, that it was cut
+    off and that unfinished tool calls never ran. Measured on the Claude engine: the
+    hunting and falsifier roles were accepted at the gate and then truncated once they got
+    far enough into real probing.
+
+    It is deliberately a WARNING and not a failure, because the notice is a
+    mid-conversation interjection and the session continues: a later turn can still
+    deliver, and findings already posted through the live blackboard tool survive
+    regardless. So the warning fires only when truncation coincided with producing
+    nothing -- which is exactly the case that is indistinguishable from "this track is
+    clean".
+    """
+
+    def test_the_detector_recognises_the_notice(self):
+        from p1hunt.agents.claude_session import response_truncated
+        self.assertTrue(response_truncated(
+            "Your response above was stopped by a safety classifier — this is not a tool "
+            "or API error. The rest of it was withheld"))
+        self.assertTrue(response_truncated("the rest of it was withheld, and tool calls"))
+
+    def test_ordinary_output_is_not_flagged(self):
+        from p1hunt.agents.claude_session import response_truncated
+        self.assertFalse(response_truncated(
+            "Found an IDOR: principal b reads principal a's account. Harness written."))
+        self.assertFalse(response_truncated(""))
+
+    def test_the_hunter_warns_when_truncation_produced_nothing(self):
+        src = self._hunt_source()
+        self.assertIn("response_truncated(res.text) and not res.findings", src)
+        self.assertIn("response_truncated", src)
+
+    def test_the_warning_pre_empts_reading_it_as_a_clean_pass(self):
+        src = self._hunt_source()
+        self.assertIn("looks exactly like a clean pass", src)
+        self.assertIn("Do NOT read this track as checked", src)
+        self.assertIn('"severity": "HIGH"', src)
+
+    def test_a_truncated_session_that_still_posted_findings_does_not_warn(self):
+        """Findings posted mid-session survive truncation, so that is not a failure.
+
+        Warning on it would train the operator to ignore the warning, which is the only
+        thing that makes it useful.
+        """
+        src = self._hunt_source()
+        self.assertIn("and not res.findings", src)
+
+    def test_the_prover_distinguishes_cut_off_from_cannot_build(self):
+        """They need different responses: switch engines versus debug the finding."""
+        import inspect
+
+        from p1hunt.agents.claude_hunter import ClaudePoCProver
+        src = inspect.getsource(ClaudePoCProver.materialize)
+        self.assertIn("response_truncated(result.text)", src)
+        self.assertIn("truncated", src)
+        self.assertIn("not evidence the finding", src)
+
+    @staticmethod
+    def _hunt_source() -> str:
+        import inspect
+
+        from p1hunt.agents.claude_hunter import ClaudeHunter
+        return inspect.getsource(ClaudeHunter.hunt)

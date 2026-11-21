@@ -119,7 +119,11 @@ class TestExploitDevPrompt(unittest.TestCase):
         f = ClaudeFinding(title="t", severity="medium", file="mta.cpp", line=1, root_cause="r",
                           counterfactual="c", reproduction="x", lens="trusted-execution", confidence="high")
         p = exploit_dev_prompt(f, "Critical=key/rogue-sig <1000 aborts", ".p1hunt-poc").lower()
-        for must in ("exploit developer", "attacker-win", "cryptanalysis", "lattice",
+        # "WORLD-CLASS exploit developer and cryptanalyst" became "the proof-depth role"
+        # when every model-facing prompt gained its authorization preamble. The METHOD is
+        # what this test is really protecting, and all of it is still asserted below --
+        # the dropped phrase was swagger that bought nothing and read like a jailbreak.
+        for must in ("proof-depth", "attacker-win", "cryptanalysis", "lattice",
                      "multi-party", "shipped", "aborts", "impossibility"):
             self.assertIn(must, p)
 
