@@ -1,0 +1,141 @@
+You are hunting for CRITICAL vulnerabilities on an AUTHORIZED target: http://127.0.0.1:51712.
+
+Only contact hosts the scope allows; the instruments enforce that for you and a request elsewhere raises rather than leaking.
+
+SCOPE / RULES OF ENGAGEMENT:
+Authorized hosts ONLY: 127.0.0.1. This is a local range the operator owns. A sibling mobile host is simulated with the request header X-Range-Host: m.range (the browser can send it via a header variant), because a loopback server cannot own two real hostnames. Session cookie name: range_session.
+
+FACTS GATHERED FROM THE LIVE TARGET:
+HOSTS SEEN (1): 127.0.0.1
+ENDPOINTS (23 total; 'observed' = the app really called it, 'bundle' = mined from its JavaScript and may be dead code):
+  [observed] 6:
+    GET /search?q=hello   params=q
+    GET /profile?name=me   params=name
+    GET /preview
+    GET /share/550e8400-e29b-41d4-a716-446655440000
+    GET /go?next=/   params=next
+    GET /logout?next=/   params=next
+  [form] 1:
+    POST /api/v1/pay   params=amount,account_id
+  [route] 4:
+    GET /search
+    GET /preview
+    GET /profile
+    GET /share/:id
+  [bundle] 12:
+    GET /api/v1/accounts/{id}
+    GET /api/v1/invoices/{id}
+    GET /api/v1/me/orders/{id}
+    GET /api/v1/session
+    GET /api/v1/fetch?url=
+    GET /internal/admin/users
+    GET /admin/reports
+    GET /share/link
+    GET /search
+    GET /preview
+    GET /profile
+    GET /share/:id
+GRAPHQL OPERATIONS IN THE BUNDLE (2): query AccountSummary, mutation TransferFunds
+FORMS:
+  POST /api/v1/pay  fields=amount,account_id
+PATHS RENDERED DURING RECON (candidates for a cross-host or cross-session comparison): /, /search, /profile, /preview, /share/550e8400-e29b-41d4-a716-446655440000
+RESPONSES THAT NAME CREDENTIAL-LIKE KEYS (unverified):
+  http://127.0.0.1:51712/static/app.js  [bundle] session
+
+TEST IDENTITIES AVAILABLE (use them to compare, not just to authenticate): anon, session
+
+AVAILABLE INSTRUMENTS — what each one MEASURES. Choose; nothing here is a sequence to follow.
+
+  Browser (p1hunt_browser.Browser) — a real browser, scope-jailed.
+    .goto(url)                 -> Observation
+    Observation.raw_html       the bytes the SERVER sent
+    Observation.dom_html       the document AFTER scripts ran (a SERIALIZATION: a text
+                               node's "<" is re-escaped, so the absence of a raw
+                               metacharacter here measures nothing)
+    Observation.executed       whether script actually RAN. Observed, not inferred.
+    Observation.execution_proof what ran, and with what argument
+    Observation.sinks          writes to innerHTML/outerHTML/document.write/
+                               insertAdjacentHTML/iframe.srcdoc, with the value
+    Observation.message_listeners  message handlers the page registered
+    Observation.requests / .blocked / .console / .cookies / .storage
+    .dom_injection(marker)     asks the LIVE document whether your input became ELEMENTS
+                               or created an ATTRIBUTE NAME (survives serialization)
+    .differential(path, variants)
+                               renders ONE resource under several hosts / sessions /
+                               header sets and reports what differs
+    .escaping_differential(render_fn, control_marker, probe_marker)
+                               benign control render vs metacharacter render; reports only
+                               the landings the control does not already explain
+    .click/.fill/.eval_js/.screenshot
+
+  htmlctx — context-aware escaping measurement.
+    census(html, marker)       per landing: the HTML parse context, which characters are
+                               dangerous IN THAT CONTEXT, which survived raw, and a
+                               verdict with its reasoning. A raw "<" is a finding in a
+                               text node and inert inside a quoted attribute; entities do
+                               not decode inside <script>. Report ITS verdict rather than
+                               your reading of the HTML.
+    differential_census(...)   control vs probe, so an application that simply emits one
+                               value into several sinks is not mistaken for an injection
+
+  Client (p1hunt_dyn.Client) — scope-enforced HTTP, multiple identities.
+    .get/.post/...(path, identity=...)   act as a named principal
+    .require_live_baseline(path)         distinguishes DEAD / EDGE-BLOCKED from a real
+                                         application answer. A blanket block satisfies
+                                         every refusal assertion, so an unprobed "403"
+                                         is not evidence of anything
+    .assert_forbidden / .idor_probe      a principal must not reach another's object
+    .oob_url() / .oob_received(token)    turn callback behavior into pass/fail
+
+  Surface facts (dynamic.recon) — already gathered below. Bundle-mined endpoints,
+    observed requests with real parameter shapes, client-side routes, GraphQL operations,
+    forms, sibling hosts. templatize() names the identifier SHAPE of a path segment
+    (uuid / int / hex / objectid / b64 / msisdn), which determines whether another
+    principal's identifier must be obtained or can simply be enumerated.
+
+  Runner — a harness you write is executed and judged. Convention: assert the SECURE
+    behavior with expect="fail", so a reproduced bug makes the test FAIL.
+
+
+HOW THE BEST FINDINGS ACTUALLY ARRIVE — read this before proposing anything.
+
+1. COMPARE BEFORE YOU INJECT. The strongest findings are two renders or two responses of
+   ONE resource that differ in what they expose, and they need no payload at all. Vary
+   ONE thing: the host, the session, a header, the identity, the order of two steps, the
+   casing of a path, whether a step is skipped. Then ask what the difference implies
+   about where the decision is made.
+
+2. A PRECONDITION IS A TARGET, NOT A FOOTNOTE. If something is exploitable only when the
+   victim is signed out, or only on one host, the next question is whether that
+   precondition can be REMOVED. Removing it is often a separate, independently fixable
+   defect, and it is what turns a capped finding into an unconditional one.
+
+3. MEASURE, DO NOT ESTIMATE. Escaping, execution and authorization each have an
+   instrument above. Use it and report what it returned. "Looks escaped" is not a result.
+
+4. PROVE IMPACT SEPARATELY FROM PROVING THE BUG. An injection that does not execute is a
+   lead. A credential you have not confirmed authorizes something is not impact.
+
+5. SAY WHAT WOULD REFUTE YOU. Required for every hypothesis. An idea that cannot be
+   refuted cannot be retired, and the hunt will circle it forever.
+
+Do NOT limit yourself to familiar bug classes, and do not propose a generic checklist.
+Name the specific mechanism, on THIS target, in your own words. A comparison nobody has a
+name for is the most valuable thing you can produce here.
+
+
+Answer with ONE fenced ```json block holding an array of hypotheses, ordered best first.
+Each object:
+
+  {
+    "target":      "the concrete URL, path template, host pair, or flow",
+    "mechanism":   "what you believe is wrong and WHY, in your own words. Not a class name.",
+    "vary":        "the single thing you change between the two observations",
+    "instrument":  "which instrument above you will use, and the call you will make",
+    "confirm_if":  "the specific observation that would CONFIRM it",
+    "refute_if":   "the specific observation that would REFUTE it",
+    "impact_if_true": "what an attacker gains, and what you would still need to prove it",
+    "confidence":  0.0-1.0
+  }
+
+No prose outside the block.

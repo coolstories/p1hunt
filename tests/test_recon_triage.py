@@ -133,6 +133,33 @@ class TestBundleMining(unittest.TestCase):
     def test_a_bare_slash_is_not_a_lead(self):
         self.assertNotIn("/", R.mine_js('const a="/";')["paths"])
 
+    def test_a_path_literal_carrying_its_own_query_is_not_dropped(self):
+        # Regression: "?" was absent from the path character class, so the pattern failed
+        # at the "?" and never reached the closing quote -- dropping the ENTIRE endpoint.
+        # The range exposed it: an SSRF endpoint that appears only as
+        # fetch("/api/v1/fetch?url=" + u) was invisible to recon.
+        m = R.mine_js('fetch("/api/v1/fetch?url="+encodeURIComponent(u));'
+                      'fetch("/api/v2/search?q=x&page=1");')
+        self.assertIn("/api/v1/fetch?url=", m["paths"])
+        self.assertIn("/api/v2/search?q=x&page=1", m["paths"])
+
+    def test_a_query_value_concat_does_not_invent_a_path_segment(self):
+        # `"/api/v1/fetch?url=" + u` concatenates a QUERY VALUE. Inserting {id} would
+        # invent "/api/v1/fetch?url={id}" as if it were a path identifier.
+        paths = R.mine_js('fetch("/api/v1/fetch?url="+u);')["paths"]
+        self.assertIn("/api/v1/fetch?url=", paths)
+        self.assertFalse([p for p in paths if "url={id}" in p], paths)
+
+    def test_an_asset_with_a_cache_buster_is_still_an_asset(self):
+        self.assertEqual(R.mine_js('const s="/static/a.png?v=2";')["paths"], [])
+
+    def test_query_parameters_become_endpoint_params(self):
+        import urllib.parse
+        path = R.mine_js('fetch("/api/v2/search?q=x&page=1");')["paths"][0]
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+        self.assertEqual(sorted(qs), ["page", "q"],
+                         "the parameter names a bundle literal exposes are free surface")
+
 
 class TestSurfaceAssembly(unittest.TestCase):
     def test_merge_deduplicates_across_parts(self):

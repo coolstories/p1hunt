@@ -76,7 +76,14 @@ _ASSET_EXT = re.compile(
 _SEG_CHAR = r"[A-Za-z0-9_\-.~%:@!&()*+,;=]"
 _PLACEHOLDER = r"\$\{[^}]{1,40}\}|\{[A-Za-z0-9_]{1,30}\}"
 _SEG = rf"(?:{_SEG_CHAR}|{_PLACEHOLDER})*"
-_PATH_LITERAL = re.compile(rf"""['"`](/{_SEG}(?:/{_SEG})*)['"`]""")
+# An optional query string. Without it a literal like `fetch("/api/v1/fetch?url=")`
+# matched NOTHING -- "?" is not a path character, so the pattern failed at the "?" and
+# never reached the closing quote, dropping the whole endpoint. That shape
+# (a path literal carrying its own query) is everywhere in real API clients, and the
+# parameter names it exposes are worth having on their own.
+_QUERY_CHAR = r"[A-Za-z0-9_\-.~%:@!&()*+,;=?\[\]]"
+_QUERY = rf"(?:\?(?:{_QUERY_CHAR}|{_PLACEHOLDER})*)?"
+_PATH_LITERAL = re.compile(rf"""['"`](/{_SEG}(?:/{_SEG})*{_QUERY})['"`]""")
 
 # Concatenated paths: `"/accounts/" + id + "/billing"`. This is the dominant shape in a
 # hand-written API client, and extracting the literals separately yields two useless
@@ -101,11 +108,17 @@ def _join_concats(src: str, *, limit: int = 800) -> list[str]:
     seen: set[str] = set()
     for m in _CONCAT.finditer(src or ""):
         left, _expr, right = m.group(1), m.group(2), m.group(3)
-        joined = left if left.endswith("/") else left + "/"
-        joined += "{id}"
-        if right:
-            joined += right if right.startswith("/") else "/" + right
-        joined = re.sub(r"/{2,}", "/", joined)
+        if "?" in left:
+            # `"/api/v1/fetch?url=" + u` concatenates a QUERY VALUE, not a path segment.
+            # Inserting {id} here would invent an endpoint `/api/v1/fetch?url={id}/...`
+            # that does not exist. Keep the path and its parameter names instead.
+            joined = left
+        else:
+            joined = left if left.endswith("/") else left + "/"
+            joined += "{id}"
+            if right:
+                joined += right if right.startswith("/") else "/" + right
+        joined = re.sub(r"(?<!:)/{2,}", "/", joined)
         if joined not in seen and _interesting_path(joined):
             seen.add(joined)
             out.append(joined)
@@ -225,6 +238,8 @@ def _interesting_path(p: str) -> bool:
     if not p or not p.startswith("/") or len(p) > 300 or len(p) < 2:
         return False
     if _ASSET_EXT.search(p.split("?")[0]):
+        return False
+    if p.startswith("?"):
         return False
     if p.startswith(("//",)):
         return False

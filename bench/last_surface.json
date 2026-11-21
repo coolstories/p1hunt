@@ -1,0 +1,218 @@
+{
+  "hosts": [
+    "127.0.0.1"
+  ],
+  "endpoints": [
+    {
+      "path": "/api/v1/pay",
+      "method": "POST",
+      "params": [
+        "amount",
+        "account_id"
+      ],
+      "source": "form",
+      "authenticated": false
+    },
+    {
+      "path": "/search?q=hello",
+      "method": "GET",
+      "params": [
+        "q"
+      ],
+      "source": "observed",
+      "authenticated": false
+    },
+    {
+      "path": "/profile?name=me",
+      "method": "GET",
+      "params": [
+        "name"
+      ],
+      "source": "observed",
+      "authenticated": false
+    },
+    {
+      "path": "/preview",
+      "method": "GET",
+      "params": [],
+      "source": "observed",
+      "authenticated": false
+    },
+    {
+      "path": "/share/550e8400-e29b-41d4-a716-446655440000",
+      "method": "GET",
+      "params": [],
+      "source": "observed",
+      "authenticated": false
+    },
+    {
+      "path": "/go?next=/",
+      "method": "GET",
+      "params": [
+        "next"
+      ],
+      "source": "observed",
+      "authenticated": false
+    },
+    {
+      "path": "/logout?next=/",
+      "method": "GET",
+      "params": [
+        "next"
+      ],
+      "source": "observed",
+      "authenticated": false
+    },
+    {
+      "path": "/api/v1/accounts/{id}",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/api/v1/invoices/{id}",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/api/v1/me/orders/{id}",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/api/v1/session",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/api/v1/fetch?url=",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/internal/admin/users",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/admin/reports",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/share/link",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/search",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/preview",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/profile",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/share/:id",
+      "method": "GET",
+      "params": [],
+      "source": "bundle",
+      "authenticated": false
+    },
+    {
+      "path": "/search",
+      "method": "GET",
+      "params": [],
+      "source": "route",
+      "authenticated": false
+    },
+    {
+      "path": "/preview",
+      "method": "GET",
+      "params": [],
+      "source": "route",
+      "authenticated": false
+    },
+    {
+      "path": "/profile",
+      "method": "GET",
+      "params": [],
+      "source": "route",
+      "authenticated": false
+    },
+    {
+      "path": "/share/:id",
+      "method": "GET",
+      "params": [],
+      "source": "route",
+      "authenticated": false
+    }
+  ],
+  "routes": [
+    "/search",
+    "/preview",
+    "/profile",
+    "/share/:id"
+  ],
+  "graphql": [
+    "query AccountSummary",
+    "mutation TransferFunds"
+  ],
+  "scripts": [
+    "http://127.0.0.1:51712/static/app.js",
+    "http://127.0.0.1:51712/unauth-mweb/light.js"
+  ],
+  "forms": [
+    {
+      "action": "/api/v1/pay",
+      "method": "POST",
+      "fields": [
+        "amount",
+        "account_id"
+      ]
+    }
+  ],
+  "gate_paths": [
+    "/",
+    "/search",
+    "/profile",
+    "/preview",
+    "/share/550e8400-e29b-41d4-a716-446655440000"
+  ],
+  "secretish_responses": [
+    {
+      "url": "http://127.0.0.1:51712/static/app.js",
+      "what": "session",
+      "where": "bundle"
+    }
+  ],
+  "notes": []
+}
