@@ -402,6 +402,7 @@ class TestShippedStandalone(unittest.TestCase):
         self.assertIn('"..dynamic.htmlctx", "htmlctx.py"', swarm)
         self.assertIn('"..dynamic.browser", "p1hunt_browser.py"', swarm)
         self.assertIn('"..dynamic.client", "p1hunt_dyn.py"', swarm)
+        self.assertIn('"..dynamic.recon", "p1hunt_recon.py"', swarm)
         src = self._src("browser")
         self.assertIn("import htmlctx", src)
 

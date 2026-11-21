@@ -1660,7 +1660,8 @@ class ClaudeSwarm:
         ship_report: dict[str, bool] = {}
         for mod_path, dest in (("..dynamic.client", "p1hunt_dyn.py"),
                                ("..dynamic.browser", "p1hunt_browser.py"),
-                               ("..dynamic.htmlctx", "htmlctx.py")):
+                               ("..dynamic.htmlctx", "htmlctx.py"),
+                               ("..dynamic.recon", "p1hunt_recon.py")):
             try:
                 import importlib
                 mod = importlib.import_module(mod_path, package=__package__)
@@ -1670,9 +1671,35 @@ class ClaudeSwarm:
             except Exception:
                 ship_report[dest] = False
         shipped = ship_report.get("p1hunt_dyn.py", False)
+        # DERIVE THE SURFACE FROM THE LIVE TARGET. Bounded, read-only, and entirely
+        # optional: a failure here degrades to the repo-derived surface (empty for a
+        # black-box target) rather than stopping the hunt. It runs once at arm time
+        # because every later mechanism -- coverage steering, the ledger, escalation --
+        # needs something concrete to work on.
+        self._live_surface = None
+        if self._base_url and (self._egress_hosts or []):
+            try:
+                from ..dynamic.browser import Browser
+                from ..dynamic.recon import discover
+
+                pages = int(os.environ.get("P1HUNT_RECON_PAGES", "10") or 10)
+                scripts = int(os.environ.get("P1HUNT_RECON_SCRIPTS", "20") or 20)
+                with Browser(allowlist=list(self._egress_hosts or []),
+                             base_url=self._base_url) as _b:
+                    self._live_surface = discover(_b, [self._base_url],
+                                                  max_pages=max(1, pages),
+                                                  max_scripts=max(0, scripts))
+            except Exception as exc:
+                self._live_surface = None
+                self._emit(self.name, "lifecycle",
+                           {"event": "live_recon_failed", "error": str(exc)[:300]})
+        surf = self._live_surface or {}
         idents = [i.name for i in self.scope.test_identities if i.resolve()]
         self._emit(self.name, "lifecycle",
                    {"event": "dynamic_armed", "base_url": self._base_url,
+                    "recon_endpoints": len(surf.get("endpoints") or []),
+                    "recon_hosts": len(surf.get("hosts") or []),
+                    "recon_graphql": len(surf.get("graphql") or []),
                     "egress": list(self._egress_hosts or []), "identities": idents,
                     "oob": bool(self._oob), "client_shipped": shipped,
                     "shipped": dict(ship_report),
@@ -1730,8 +1757,13 @@ class ClaudeSwarm:
             try:
                 from .surface_enum import entrypoints_for
 
+                # live_surface is what keeps a BLACK-BOX target from resolving to [].
+                # A bounty target has no repository, so every repo-derived source is
+                # empty and the coverage loop has nothing to compound on. A surface
+                # derived from the running target arrives in the same shape.
                 self._entrypoints_by_subsystem[subsystem] = entrypoints_for(
-                    self._target_class, self.repo_path, focus_files
+                    self._target_class, self.repo_path, focus_files,
+                    live_surface=getattr(self, "_live_surface", None),
                 )
             except Exception:
                 self._entrypoints_by_subsystem[subsystem] = []

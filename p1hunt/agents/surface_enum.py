@@ -354,6 +354,8 @@ def entrypoints_for(
     focus_files: Iterable[str] | None = None,
     *,
     limit: int = _DEFAULT_LIMIT,
+    live_surface: dict | None = None,
+    leads: list | None = None,
 ) -> list[str]:
     """The attack surface for ANY target class — the dispatcher the coverage loop should call.
 
@@ -365,6 +367,23 @@ def entrypoints_for(
     name = getattr(target_class, "value", target_class)
     cls = str(name or "").strip().upper()
     focus = list(focus_files or [])
+    # A BLACK-BOX target has no repository, so every source below yields nothing and the
+    # coverage loop starves: there is nothing to mark uncovered, nothing for the ledger to
+    # retire, nowhere for escalation to go. Persistence needs something to be persistent
+    # ABOUT. A surface derived from the LIVE target (dynamic.recon.discover) fills that
+    # gap in the same "METHOD /path" shape, so every existing mechanism works unchanged.
+    #
+    # It is checked FIRST because when it exists it is strictly better evidence than a
+    # repo guess: these are paths the application was observed serving.
+    if live_surface or leads:
+        try:
+            from ..dynamic.recon import entrypoints_from_surface
+
+            live = entrypoints_from_surface(live_surface or {}, limit=limit, leads=leads)
+        except Exception:
+            live = []
+        if live:
+            return live
     if cls == "EVM_CONTRACT":
         try:
             from .harness_scaffold import detect_evm_entrypoints
