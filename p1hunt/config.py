@@ -27,7 +27,12 @@ class Models:
     # stay only as compatibility fields for explicit P1HUNT_ENGINE=claude runs.
     engine: str = "codex"                  # GLOBAL engine for ALL roles ("codex" | "claude")
     discovery_engine: str = "codex"        # discovery hunters; follows engine unless overridden
-    codex_model: str = ""                   # "" = codex account default (ChatGPT auth rejects slugs)
+    # Frontier tier. VERIFIED selectable on ChatGPT-account auth (not just API-key auth):
+    # `codex exec --model gpt-6-astra` returns normally, so the old "ChatGPT auth rejects
+    # slugs" note was wrong. Astra is the most capable tier and this is a reasoning-bound
+    # hunt, not a throughput-bound one. Set P1HUNT_CODEX_MODEL=gpt-6.1-sol to trade depth
+    # for speed/quota, or "" to fall back to whatever ~/.codex/config.toml pins.
+    codex_model: str = "gpt-6-astra"
     codex_effort: str = "xhigh"             # minimal | low | medium | high | xhigh
 
 
