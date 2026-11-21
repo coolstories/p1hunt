@@ -187,8 +187,8 @@
     "mutation TransferFunds"
   ],
   "scripts": [
-    "http://127.0.0.1:51712/static/app.js",
-    "http://127.0.0.1:51712/unauth-mweb/light.js"
+    "http://127.0.0.1:52500/static/app.js",
+    "http://127.0.0.1:52500/unauth-mweb/light.js"
   ],
   "forms": [
     {
@@ -209,7 +209,7 @@
   ],
   "secretish_responses": [
     {
-      "url": "http://127.0.0.1:51712/static/app.js",
+      "url": "http://127.0.0.1:52500/static/app.js",
       "what": "session",
       "where": "bundle"
     }

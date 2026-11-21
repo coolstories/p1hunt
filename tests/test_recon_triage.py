@@ -521,5 +521,90 @@ class TestDiscoverLive(unittest.TestCase):
         self.assertIn("INSTRUMENTS", brief)
 
 
+class TestRefusalIsNotSilence(unittest.TestCase):
+    """A provider-side refusal kills the reasoning layer; an empty plan does not.
+
+    These two look identical downstream -- no hypotheses -- but mean opposite things. If a
+    refusal is treated as "the model had no ideas", the run proceeds on the derived
+    surface, looks healthy, and silently loses every class that needs a comparison nobody
+    enumerated. So the cause has to be named.
+    """
+
+    def test_a_safety_classifier_refusal_is_named_a_refusal(self):
+        self.assertEqual(
+            T.classify_failure("", "codex error: This content was flagged for possible "
+                                   "cybersecurity risk."),
+            T.REASON_REFUSED)
+
+    def test_a_model_decline_is_named_a_refusal(self):
+        for text in ("I can't help with that.", "I cannot help with that request",
+                     "This violates my guidelines", "I won't help with this"):
+            with self.subTest(text=text):
+                self.assertEqual(T.classify_failure(text, ""), T.REASON_REFUSED)
+
+    def test_an_unparseable_reply_is_not_a_refusal(self):
+        self.assertEqual(T.classify_failure("here are some thoughts", ""),
+                         T.REASON_UNPARSEABLE)
+
+    def test_a_transport_error_is_not_a_refusal(self):
+        self.assertEqual(T.classify_failure("", "connection reset by peer"),
+                         T.REASON_ERROR)
+
+    def test_triage_reports_the_reason_when_it_has_no_plan(self):
+        out = asyncio.run(T.triage({}, session=_FakeSession(
+            "I can't help with that.")))
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["reason"], T.REASON_REFUSED)
+
+    def test_triage_reports_no_engine_distinctly(self):
+        out = asyncio.run(T.triage({}))
+        self.assertEqual(out["reason"], T.REASON_NO_ENGINE)
+
+    def test_a_successful_plan_carries_no_failure_reason(self):
+        out = asyncio.run(T.triage({}, session=_FakeSession(_GOOD_PLAN)))
+        self.assertTrue(out["ok"])
+        self.assertNotIn("reason", out)
+
+    def test_an_exception_mentioning_the_classifier_is_still_a_refusal(self):
+        out = asyncio.run(T.triage({}, session=_FakeSession(
+            raises=True)))
+        self.assertIn("reason", out)
+
+
+class TestAuthorizationFraming(unittest.TestCase):
+    """The brief must state its authorization, and must not read as a bare attack request.
+
+    Learned the hard way: a brief that opened with the facts and the instrument catalogue
+    was refused outright by the provider's safety classifier, which made the entire
+    reasoning layer non-functional while 1225 tests -- all using a fake session -- passed.
+    """
+
+    def test_the_role_comes_first(self):
+        b = T.build_brief({"hosts": ["x"]})
+        self.assertTrue(b.lstrip().startswith("You are the planning role"),
+                        b[:120])
+
+    def test_authorization_is_stated(self):
+        b = " ".join(T.build_brief({"hosts": ["x"]}).split())
+        self.assertIn("AUTHORIZED", b)
+        self.assertIn("safe-harbour", b)
+
+    def test_scope_discipline_is_part_of_the_role(self):
+        b = " ".join(T.build_brief({"hosts": ["x"]}).split())
+        self.assertIn("STAY INSIDE THE STATED SCOPE", b)
+        self.assertIn("say so in place of proposing it", b,
+                      "unauthorized scope must be refused, not assumed")
+
+    def test_destructive_planning_is_excluded(self):
+        b = " ".join(T.build_brief({"hosts": ["x"]}).split())
+        self.assertIn("PLAN NOTHING DESTRUCTIVE", b)
+        self.assertIn("denial of service", b)
+        self.assertIn("third party", b)
+
+    def test_the_operator_scope_note_is_still_carried(self):
+        b = T.build_brief({"hosts": ["x"]}, scope_note="only *.example.com")
+        self.assertIn("only *.example.com", b)
+
+
 if __name__ == "__main__":
     unittest.main()

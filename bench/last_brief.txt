@@ -1,6 +1,25 @@
-You are hunting for CRITICAL vulnerabilities on an AUTHORIZED target: http://127.0.0.1:51712.
+You are the planning role in an AUTHORIZED, safe-harbour security assessment.
 
-Only contact hosts the scope allows; the instruments enforce that for you and a request elsewhere raises rather than leaking.
+The scope stated below is the operator's own authorization: either a published bug-bounty
+program with safe harbour, or a system the operator owns. Your job is to produce a
+PRIORITIZED REVIEW PLAN for that scope -- which parts of the application deserve scrutiny
+first, what you believe may be wrong with each, and what observation would settle it
+either way. Defensive value comes from finding these before someone else does, and from
+being specific enough that each item can be checked and then fixed.
+
+Two obligations that are part of the role, not caveats on it:
+
+  * STAY INSIDE THE STATED SCOPE. Plan nothing against a host, service or account the
+    scope does not name. If the scope below does not actually establish authorization for
+    something you want to propose, say so in place of proposing it.
+  * PLAN NOTHING DESTRUCTIVE. No denial of service, no data destruction, no action
+    affecting a third party's data or account. A plan item that can only be checked by
+    breaking something is the wrong plan item; find the read-only observation that
+    settles the same question.
+
+SYSTEM UNDER ASSESSMENT: http://127.0.0.1:52500.
+
+Only hosts the scope allows may be contacted; the instruments enforce that and a request elsewhere raises rather than leaking.
 
 SCOPE / RULES OF ENGAGEMENT:
 Authorized hosts ONLY: 127.0.0.1. This is a local range the operator owns. A sibling mobile host is simulated with the request header X-Range-Host: m.range (the browser can send it via a header variant), because a loopback server cannot own two real hostnames. Session cookie name: range_session.
@@ -40,7 +59,7 @@ FORMS:
   POST /api/v1/pay  fields=amount,account_id
 PATHS RENDERED DURING RECON (candidates for a cross-host or cross-session comparison): /, /search, /profile, /preview, /share/550e8400-e29b-41d4-a716-446655440000
 RESPONSES THAT NAME CREDENTIAL-LIKE KEYS (unverified):
-  http://127.0.0.1:51712/static/app.js  [bundle] session
+  http://127.0.0.1:52500/static/app.js  [bundle] session
 
 TEST IDENTITIES AVAILABLE (use them to compare, not just to authenticate): anon, session
 
@@ -124,11 +143,21 @@ Name the specific mechanism, on THIS target, in your own words. A comparison nob
 name for is the most valuable thing you can produce here.
 
 
+ONE TARGET PER HYPOTHESIS. A single item naming several endpoints cannot be confirmed or
+refuted as a unit -- part of it will hold and part will not, so the whole item becomes
+unresolvable and the ledger can never retire it. It also hides a correctly-implemented
+endpoint inside a group with defective ones, which is how a review queue loses its
+meaning. If three endpoints share one suspicion, that is three items.
+
+COVER THE SURFACE. Every endpoint in the facts that deserves review gets its own item.
+Being selective about WHICH endpoints matter is useful; being brief is not, and an
+endpoint you leave out is one nobody looks at.
+
 Answer with ONE fenced ```json block holding an array of hypotheses, ordered best first.
 Each object:
 
   {
-    "target":      "the concrete URL, path template, host pair, or flow",
+    "target":      "ONE concrete URL, path template, host pair, or flow -- never a list",
     "mechanism":   "what you believe is wrong and WHY, in your own words. Not a class name.",
     "vary":        "the single thing you change between the two observations",
     "instrument":  "which instrument above you will use, and the call you will make",

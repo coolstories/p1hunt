@@ -1,0 +1,160 @@
+{
+  "planted": 9,
+  "decoys": 5,
+  "hypotheses": 25,
+  "found": [
+    {
+      "id": "idor-account",
+      "class": "idor",
+      "target": "GET /api/v1/accounts/{id}",
+      "mechanism": "The account identifier is caller-selected, so account loading may occur without requiring an authenticated owner. The bundle reference establishes a review lead, not that the route is live or defective.",
+      "confidence": 0.45
+    },
+    {
+      "id": "idor-invoice",
+      "class": "idor",
+      "target": "GET /api/v1/invoices/{id}",
+      "mechanism": "Invoice retrieval may trust possession of an invoice identifier without enforcing the invoice owner's visibility policy. Invoice identifiers must come from the operator's own account, regardless of whether their shape is enumerable.",
+      "confidence": 0.43
+    },
+    {
+      "id": "authz-admin",
+      "class": "authz",
+      "target": "GET /internal/admin/users",
+      "mechanism": "An internal administrative route appears in the client bundle. It may rely on being undiscoverable or on an upstream routing distinction instead of enforcing an administrative role.",
+      "confidence": 0.39
+    },
+    {
+      "id": "gate-host",
+      "class": "render_gate",
+      "target": "GET /share/550e8400-e29b-41d4-a716-446655440000",
+      "mechanism": "The shared document may hide owner-only fields in the visible page while leaving the full owner representation in raw HTML, bootstrap JSON or subsequent responses. Anonymous access to an intentionally public share is not itself a defect.",
+      "confidence": 0.4
+    },
+    {
+      "id": "xss-reflect",
+      "class": "injection",
+      "target": "GET /search?q={q}",
+      "mechanism": "The observed q parameter may enter server markup or a client HTML sink with escaping that does not match its actual landing context.",
+      "confidence": 0.4
+    },
+    {
+      "id": "xss-dom",
+      "class": "dom_injection",
+      "target": "GET /preview",
+      "mechanism": "The mobile preview renderer may omit the access check used by the default renderer and embed private preview content or editing capabilities in an anonymous response.",
+      "confidence": 0.29
+    },
+    {
+      "id": "redirect-open",
+      "class": "redirect",
+      "target": "GET /go?next={next}",
+      "mechanism": "The observed redirect endpoint may pass next directly to navigation without canonicalizing and restricting the destination's scheme and authority.",
+      "confidence": 0.35
+    },
+    {
+      "id": "ssrf-fetch",
+      "class": "ssrf",
+      "target": "GET /api/v1/fetch?url={url}",
+      "mechanism": "The URL fetcher may turn an anonymous request into a privileged internal read by attaching ambient credentials or accessing a protected route through a different trust boundary.",
+      "confidence": 0.36
+    },
+    {
+      "id": "secret-session",
+      "class": "secret",
+      "target": "GET /api/v1/session",
+      "mechanism": "The bundle exposes a session-inspection endpoint that may serialize a server-held or previously authenticated session when the caller supplies no valid range_session cookie.",
+      "confidence": 0.45
+    }
+  ],
+  "located_only": [],
+  "missed": [],
+  "false_positives": [
+    {
+      "id": "decoy-scoped",
+      "target": "GET /api/v1/me/orders/{id}",
+      "why_safe": "scoped to the caller",
+      "claimed": "The me prefix implies principal-bound retrieval, but the handler may resolve the supplied order ID independently of the current principal."
+    },
+    {
+      "id": "decoy-admin",
+      "target": "GET /admin/reports",
+      "why_safe": "enforces a role properly",
+      "claimed": "The reports route may protect navigation in the interface while leaving the report response or its embedded data accessible to a non-administrative caller."
+    },
+    {
+      "id": "decoy-attr",
+      "target": "GET /profile?name={name}",
+      "why_safe": "raw <> in a quoted attribute is inert",
+      "claimed": "The observed name parameter may be safe in one reflected location but unsafe in another, such as an attribute, bootstrap script or client-rendered heading."
+    },
+    {
+      "id": "decoy-redirect",
+      "target": "GET /logout?next={next}",
+      "why_safe": "only accepts a relative path",
+      "claimed": "Logout may validate next differently from the general redirect endpoint, allowing an unrestricted post-logout destination even if /go is correctly constrained."
+    },
+    {
+      "id": "decoy-url",
+      "target": "GET /share/link",
+      "why_safe": "url param is echoed, never fetched",
+      "claimed": "The share-link endpoint may return an existing private bearer link without checking who may obtain it. The static route also deserves verification against the neighboring /share/:id route so a route m"
+    }
+  ],
+  "unscored_targets": [
+    "GET http://127.0.0.1:52500/",
+    "GraphQL query AccountSummary",
+    "POST /api/v1/pay",
+    "GET /profile?name=me",
+    "Flow: GET /logout?next=/search?q={marker} followed by the search render",
+    "GraphQL mutation TransferFunds",
+    "GET /static/app.js",
+    "POST /api/v1/pay"
+  ],
+  "recall": 1.0,
+  "precision": 0.409,
+  "at_k": {
+    "5": {
+      "planted_in_top_k": 3,
+      "decoys_in_top_k": 1,
+      "precision_at_k": 0.6,
+      "recall_at_k": 0.333
+    },
+    "9": {
+      "planted_in_top_k": 6,
+      "decoys_in_top_k": 1,
+      "precision_at_k": 0.667,
+      "recall_at_k": 0.667
+    },
+    "15": {
+      "planted_in_top_k": 8,
+      "decoys_in_top_k": 4,
+      "precision_at_k": 0.533,
+      "recall_at_k": 0.889
+    },
+    "25": {
+      "planted_in_top_k": 9,
+      "decoys_in_top_k": 5,
+      "precision_at_k": 0.36,
+      "recall_at_k": 1.0
+    }
+  },
+  "planted_rank": {
+    "secret-session": 0,
+    "idor-account": 1,
+    "idor-invoice": 3,
+    "gate-host": 5,
+    "xss-reflect": 6,
+    "authz-admin": 7,
+    "ssrf-fetch": 10,
+    "redirect-open": 13,
+    "xss-dom": 22
+  },
+  "decoy_rank": {
+    "decoy-scoped": 2,
+    "decoy-attr": 9,
+    "decoy-admin": 11,
+    "decoy-url": 14,
+    "decoy-redirect": 17
+  }
+}

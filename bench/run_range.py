@@ -6,7 +6,8 @@ whether it finds bugs, precision says whether its output is worth triaging. A to
 reports every endpoint scores 100% recall and is useless.
 
 Usage:
-  python3 bench/run_range.py              # recon + real engine plan + score
+  python3 bench/run_range.py              # BLACK BOX: engine gets an empty cwd (default)
+  python3 bench/run_range.py --whitebox   # engine may read range_app.py (comparison only)
   python3 bench/run_range.py --recon-only # no model call (free, offline)
 """
 
@@ -29,12 +30,29 @@ from p1hunt.dynamic.browser import Browser  # noqa: E402
 
 
 def _norm_path(target: str) -> str:
-    """A plan target -> a comparable path template."""
+    """A plan target -> a comparable path template.
+
+    A model names a target the way a person would, so the string often carries a trailing
+    clause: "/share/{id} - default host versus X-Range-Host: m.range". The first version
+    fed that whole string through templatize, so the identifier segment no longer looked
+    like a UUID, the template never matched, and a CORRECTLY FOUND defect was scored as a
+    miss while being listed as an unrelated target. Keep only the leading URL-ish token.
+    """
     t = (target or "").strip()
-    for verb in ("GET ", "POST ", "PUT ", "PATCH ", "DELETE ", "ANY ", "HEAD ", "OPTIONS "):
+    # ORDER MATTERS. Strip the method verb FIRST, then truncate at whitespace. Doing it
+    # the other way round reduces "GET /api/v1/accounts/{id}" to "GET", which scored a
+    # perfectly good plan as zero recall.
+    for verb in ("GET ", "POST ", "PUT ", "PATCH ", "DELETE ", "ANY ", "HEAD ", "OPTIONS ",
+                 "GRAPHQL ", "FLOW: "):
         if t.upper().startswith(verb):
-            t = t[len(verb):]
+            t = t[len(verb):].strip()
             break
+    # Then cut any trailing prose clause: a model names a target the way a person would
+    # ("/share/{id} - default host versus X-Range-Host: m.range").
+    import re as _re
+    t = _re.split(r"\s+[\u2014\u2013-]\s+|\s*\(|\s{2,}|,\s|\s+(?:with|using|vs\.?|versus|then|followed)\s+",
+                  t, maxsplit=1)[0].strip()
+    t = t.split()[0] if t.split() else t
     if "://" in t:
         import urllib.parse
         t = urllib.parse.urlsplit(t).path or t
@@ -109,6 +127,29 @@ def score(plan: list[dict]) -> dict:
                 matched_idx.add(i)
                 break
 
+    # PRECISION@K: a plan is a QUEUE, so what matters is whether the real defects sort to
+    # the top, not the purity of the whole list. A reviewer works down from the first item
+    # and stops when the budget runs out, so a plan with perfect recall buried under
+    # thirty maybes is worth much less than its recall suggests.
+    planted_at = {}
+    decoy_at = {}
+    for rank, n in enumerate(norm):
+        for pl in PLANTED:
+            if (n["path"] == _norm_path(pl["path"]) or n["stem"] == _stem(pl["path"])) \
+                    and any(k in n["text"] for k in pl["keys"]):
+                planted_at.setdefault(pl["id"], rank)
+        for d in DECOYS:
+            if n["path"] == _norm_path(d["path"]) or n["stem"] == _stem(d["path"]):
+                decoy_at.setdefault(d["id"], rank)
+    at_k = {}
+    for k in (5, 9, 15, 25):
+        hits = sum(1 for r in planted_at.values() if r < k)
+        dec = sum(1 for r in decoy_at.values() if r < k)
+        at_k[k] = {"planted_in_top_k": hits,
+                   "decoys_in_top_k": dec,
+                   "precision_at_k": round(hits / max(1, min(k, len(norm))), 3),
+                   "recall_at_k": round(hits / max(1, len(PLANTED)), 3)}
+
     unmatched = [norm[i]["h"].get("target") for i in range(len(norm)) if i not in matched_idx]
     tp = len(found)
     denom = tp + len(false_pos) + len(unmatched)
@@ -118,6 +159,9 @@ def score(plan: list[dict]) -> dict:
         "false_positives": false_pos, "unscored_targets": unmatched,
         "recall": round(tp / max(1, len(PLANTED)), 3),
         "precision": round(tp / max(1, denom), 3),
+        "at_k": at_k,
+        "planted_rank": planted_at,
+        "decoy_rank": decoy_at,
     }
 
 
@@ -138,6 +182,17 @@ def make_real_session():
 
 def main() -> int:
     recon_only = "--recon-only" in sys.argv
+    # BLACK BOX BY DEFAULT. The engine session gets an EMPTY working directory, so it
+    # cannot read range_app.py.
+    #
+    # This matters more than any other setting here. The first scored run passed the
+    # bench directory as cwd, the model read the range's source, and its hypotheses cited
+    # line numbers -- a white-box result that scored 9/9 and predicts nothing about a
+    # bounty target, where there is no source to read. --whitebox keeps the old behaviour
+    # for comparison, because the GAP between the two numbers is itself the interesting
+    # measurement: it is how much of the finding came from reasoning over observed
+    # behaviour rather than from reading the answer.
+    whitebox = "--whitebox" in sys.argv
     out_dir = os.path.dirname(__file__)
     with Range() as rng:
         print(f"range up on {rng.base}  ({len(PLANTED)} planted, {len(DECOYS)} decoys)")
@@ -173,8 +228,13 @@ def main() -> int:
         except Exception as exc:
             print(f"!! could not build a session: {exc}")
             return 2
+        import tempfile
+        box = tempfile.mkdtemp(prefix="range_blackbox_")
+        session_cwd = os.path.abspath(out_dir) if whitebox else box
+        print(f"session cwd: {session_cwd}"
+              f"{'  (WHITE BOX - source readable)' if whitebox else '  (BLACK BOX - empty dir)'}")
         out = asyncio.run(T.triage(
-            surface, session=sess, cwd=os.path.abspath(out_dir),
+            surface, session=sess, cwd=session_cwd,
             target_name=rng.base,
             scope_note=f"Authorized hosts ONLY: 127.0.0.1. This is a local range the "
                        f"operator owns. A sibling mobile host is simulated with the "
@@ -205,7 +265,18 @@ def main() -> int:
 
         s = score(plan)
         print("\n================ SCORE ================")
+        print(f"mode: {'WHITE BOX (source readable)' if whitebox else 'BLACK BOX (no source)'}")
         print(f"hypotheses: {s['hypotheses']}   recall: {s['recall']}   precision: {s['precision']}")
+        print("\nqueue quality (a plan is worked top-down, so this matters more than "
+              "overall precision):")
+        for k, v in s["at_k"].items():
+            print(f"   top {k:>2}: {v['planted_in_top_k']}/{s['planted']} real "
+                  f"({v['recall_at_k']} recall), {v['decoys_in_top_k']} decoys, "
+                  f"precision@{k}={v['precision_at_k']}")
+        if s.get("planted_rank"):
+            print("\n   rank of each real defect: "
+                  + ", ".join(f"{k}@{v + 1}" for k, v in sorted(s["planted_rank"].items(),
+                                                                key=lambda x: x[1])))
         print(f"\nFOUND ({len(s['found'])}/{s['planted']}):")
         for f in s["found"]:
             print(f"  + {f['id']:18} [{f['class']}]  {f['target']}")

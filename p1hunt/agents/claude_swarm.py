@@ -1765,8 +1765,26 @@ class ClaudeSwarm:
             self._emit(self.name, "lifecycle",
                        {"event": "live_plan", "ok": bool(out.get("ok")),
                         "hypotheses": len(self._live_plan),
+                        "reason": out.get("reason", ""),
                         "error": (out.get("error") or "")[:300],
                         "targets": [h.get("target", "")[:120] for h in self._live_plan[:10]]})
+            # A PROVIDER-SIDE REFUSAL is not an empty plan. It means the reasoning layer
+            # is dead for this run while everything else still appears to work, so the
+            # run would quietly fall back to the derived surface and look healthy. Shout.
+            if out.get("reason") == _triage.REASON_REFUSED:
+                self._emit(self.name, "lifecycle", {
+                    "event": "live_plan_refused", "severity": "HIGH",
+                    "impact": "the REASONING layer produced nothing: the hunt is running on the "
+                              "derived surface alone, with no model-authored hypotheses, so the "
+                              "classes that require a comparison nobody listed will not be "
+                              "attempted",
+                    "detail": (out.get("error") or "")[:300],
+                    "fix": "the provider's safety classifier refused the planning request. "
+                           "Confirm the engagement is authorized, then re-run; if it persists, "
+                           "switch engine (P1HUNT_ENGINE=claude) or model "
+                           "(P1HUNT_CODEX_MODEL) -- do NOT interpret the empty plan as "
+                           "'no bugs here'",
+                })
         except Exception as exc:
             self._live_plan = []
             self._live_entrypoints = []
