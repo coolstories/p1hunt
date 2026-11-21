@@ -885,6 +885,37 @@ ITERATE: for iOS apply the same checks to Info.plist (NSAppTransportSecurity exc
 arbitrary loads, URL schemes) and scan resource bundles. A single violation IS your PoC."""
 
 
+def plan_note(plan: list[dict], *, limit: int = 8) -> str:
+    """Render a model-authored attack plan for a hunter's prompt.
+
+    Handed to a hunter as a STARTING POINT, not a script. The plan came from a reasoning
+    pass over the live surface, so it already encodes what is worth attacking on this
+    specific target -- but the hunter sees things the planner could not, so it is told
+    explicitly that it may discard any item and that a better mechanism it finds itself
+    outranks everything here. Each item carries its refutation condition, because a
+    hunter that cannot refute an idea will circle it.
+    """
+    if not plan:
+        return ""
+    lines = ["", "🎯 PLANNED LINES OF ATTACK, from a reasoning pass over the live surface.",
+             "These are a STARTING POINT, not a script. Discard any item the evidence kills, and",
+             "if you find a better mechanism than any of these, follow YOURS instead and say so.",
+             ""]
+    for i, h in enumerate(plan[:limit], 1):
+        lines.append(f"{i}. TARGET: {h.get('target', '')}")
+        lines.append(f"   MECHANISM: {h.get('mechanism', '')}")
+        if h.get("vary"):
+            lines.append(f"   VARY ONLY: {h['vary']}")
+        lines.append(f"   INSTRUMENT: {h.get('instrument', '')}")
+        lines.append(f"   CONFIRMED IF: {h.get('confirm_if', '')}")
+        lines.append(f"   REFUTED IF: {h.get('refute_if', '')}   <- if you observe this, record it "
+                     f"as refuted and move on; do not keep circling it")
+        if h.get("impact_if_true"):
+            lines.append(f"   IMPACT IF TRUE: {h['impact_if_true']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _live_testing_note(target_url: str) -> str:
     """Appended to a web scaffold when an AUTHORIZED live target is armed: tells the harness it can
     interact for real and points it at the shipped, scope-enforced client + OOB listener."""

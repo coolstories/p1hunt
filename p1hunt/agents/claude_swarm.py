@@ -1571,6 +1571,10 @@ class ClaudeSwarm:
         # callback-based behavior can be CONFIRMED. All graceful — any failure just narrows the run.
         if self._dynamic_armed:
             self._arm_dynamic()
+            # The reasoning pass over the live surface. Awaited HERE because this is the
+            # first async context after arming, and because every later mechanism wants
+            # its output: the plan drives entrypoints, and it is handed to each hunter.
+            await self._plan_live_attack()
 
         # 7) TOOLCHAIN CHECK (loud). The confirmed-critical gate can ONLY fire if the class's
         # reproduction toolchain is installed — without it EVERY finding is quarantined forever, no
@@ -1706,6 +1710,87 @@ class ClaudeSwarm:
                     "browser_shipped": ship_report.get("p1hunt_browser.py", False)
                                        and ship_report.get("htmlctx.py", False)})
 
+    async def _plan_live_attack(self) -> None:
+        """Ask the engine what to attack on THIS target, given the live surface.
+
+        This is the judgement step, and it is deliberately a model call rather than a
+        scoring table: the comparisons that produce criticals (serve one resource to two
+        hosts and diff; remove a precondition; skip a step) are not enumerable in
+        advance, so a keyword list ceilings the hunt at whatever its author listed.
+
+        Entirely optional. No surface, no engine, or an unparseable reply all degrade to
+        "no plan" and the hunt proceeds on the derived surface alone -- it never falls
+        back to a heuristic dressed up as reasoning, and it never blocks the run.
+        """
+        self._live_plan = []
+        self._live_entrypoints = []
+        surface = getattr(self, "_live_surface", None)
+        if not surface or not (surface.get("endpoints") or surface.get("hosts")):
+            return
+        try:
+            from ..dynamic import triage as _triage
+
+            # What the ledger has already RULED OUT, so the planner does not re-spend
+            # effort on it. Each line carries the mechanism that closed it, because
+            # "refuted" without a reason invites the same idea back in new words.
+            ruled_out: list[str] = []
+            ledger = getattr(self, "ledger", None)
+            if ledger is not None:
+                try:
+                    from ..ledger import OUTCOME_FALSIFIED
+
+                    for rec in ledger.records():
+                        if rec.outcome != OUTCOME_FALSIFIED:
+                            continue
+                        line = rec.hypothesis
+                        if rec.mechanism:
+                            line += f"  [closed by: {rec.mechanism}]"
+                        ruled_out.append(line[:300])
+                        if len(ruled_out) >= 40:
+                            break
+                except Exception:
+                    ruled_out = []
+            idents = [i.name for i in self.scope.test_identities if i.resolve()]
+            # Reasoning tier: the falsifier/orchestrator model, not the worker tier.
+            session = self._make_planning_session()
+            out = await _triage.triage(
+                surface, session=session, cwd=self.repo_path or ".",
+                target_name=self._base_url or "",
+                scope_note=self._scope_note_for_plan(),
+                ruled_out=ruled_out, identities=idents,
+            )
+            self._live_plan = out.get("plan") or []
+            if self._live_plan:
+                self._live_entrypoints = _triage.plan_to_entrypoints(self._live_plan)
+            self._emit(self.name, "lifecycle",
+                       {"event": "live_plan", "ok": bool(out.get("ok")),
+                        "hypotheses": len(self._live_plan),
+                        "error": (out.get("error") or "")[:300],
+                        "targets": [h.get("target", "")[:120] for h in self._live_plan[:10]]})
+        except Exception as exc:
+            self._live_plan = []
+            self._live_entrypoints = []
+            self._emit(self.name, "lifecycle",
+                       {"event": "live_plan_failed", "error": str(exc)[:300]})
+
+    def _make_planning_session(self):
+        """A session on the REASONING tier for the planning pass."""
+        from .claude_session import make_session
+
+        m = self.config.models
+        return make_session(model=m.falsifier or m.orchestrator,
+                            engine=m.engine, effort=m.codex_effort,
+                            codex_model=m.codex_model,
+                            agent_name=f"{self.name}:planner",
+                            on_event=self._emit)
+
+    def _scope_note_for_plan(self) -> str:
+        """The rules of engagement, stated to the planner so it cannot plan out of scope."""
+        hosts = ", ".join(self._egress_hosts or []) or "(none authorized)"
+        return (f"Authorized hosts ONLY: {hosts}. Every instrument enforces this and a request "
+                f"elsewhere raises. Do not plan anything destructive, any denial of service, or "
+                f"any action against a third party. Non-production target.")
+
     def _stop_fork(self) -> None:
         """Tear down the local fork (no-op when none was started). Called at every hunt exit.
         Also clears the inherited fork-URL env var so a torn-down (dead) endpoint can't leak into
@@ -1761,10 +1846,17 @@ class ClaudeSwarm:
                 # A bounty target has no repository, so every repo-derived source is
                 # empty and the coverage loop has nothing to compound on. A surface
                 # derived from the running target arrives in the same shape.
-                self._entrypoints_by_subsystem[subsystem] = entrypoints_for(
-                    self._target_class, self.repo_path, focus_files,
-                    live_surface=getattr(self, "_live_surface", None),
-                )
+                # Order of trust: a REASONED plan over this target, then the surface
+                # derived from it, then the repository. live_surface is what keeps a
+                # black-box target from resolving to [] at all.
+                planned = list(getattr(self, "_live_entrypoints", None) or [])
+                if planned:
+                    self._entrypoints_by_subsystem[subsystem] = planned
+                else:
+                    self._entrypoints_by_subsystem[subsystem] = entrypoints_for(
+                        self._target_class, self.repo_path, focus_files,
+                        live_surface=getattr(self, "_live_surface", None),
+                    )
             except Exception:
                 self._entrypoints_by_subsystem[subsystem] = []
         return self._entrypoints_by_subsystem[subsystem]
@@ -1823,6 +1915,27 @@ class ClaudeSwarm:
                 "shipped at ./.p1hunt-poc/p1hunt_dyn.py (from p1hunt_dyn import Client) — it confines "
                 "every request to the in-scope host(s); contacting anything else raises. Use real "
                 "requests to PROVE the bug; only contact the authorized host and loopback.")
+            lines.append(
+                "A REAL BROWSER is shipped too, at ./.p1hunt-poc/p1hunt_browser.py (with "
+                "htmlctx.py beside it): from p1hunt_browser import Browser. Use it when the target "
+                "renders HTML — the HTTP client cannot execute JavaScript, so without it a "
+                "single-page app's rendered output, its DOM sinks and its client-side routes are "
+                "invisible. It is jailed at the same chokepoint, subresources included.")
+        # A plan DERIVED FROM THIS TARGET, not a preset recipe. The no-preset rule above
+        # exists so a hunter is never handed someone's generic attack template and stops
+        # thinking; this is the opposite — it is the output of a reasoning pass over the
+        # live surface of the target in front of it, it is explicitly labelled a starting
+        # point the hunter may discard, and each item states what would refute it.
+        plan = list(getattr(self, "_live_plan", None) or [])
+        if plan:
+            try:
+                from .harness_scaffold import plan_note
+
+                note = plan_note(plan)
+                if note:
+                    lines.append(note)
+            except Exception:
+                pass
         return "\n\n".join(lines)
 
     def _static_leads_for(self, focus_files: list[str]) -> list[str]:
