@@ -34,12 +34,35 @@ def _bare_name(symbol: object) -> str:
     return found[-1].lower() if found else ""
 
 
+def _coverage_key(symbol: object) -> str:
+    """The identity of one entrypoint for coverage matching.
+
+    Two shapes of entrypoint exist and they cannot share a keying rule:
+
+    * a FUNCTION SIGNATURE (``fulfillOrder(Order,bytes32)``) keys on its bare name, because a
+      fuzzer reports coverage as just ``fulfillOrder``; and
+    * a ROUTE / ENDPOINT (``GET /doc/{p}``) keys on the WHOLE normalized string. Keying a route
+      on its last identifier would make every parameterized route collide on the placeholder —
+      ``GET /doc/{p}`` and ``GET /users/{p}`` would look like one entrypoint, and all but the
+      first would be silently dropped from the uncovered list.
+    """
+
+    text = " ".join(str(symbol or "").split())
+    if "/" in text:
+        return text.lower()
+    return _bare_name(text)
+
+
 def _covered_names(covered_symbols: Iterable[str] | None) -> set[str]:
-    """Every identifier token across the (free-form) covered symbols, lowercased — so a detected
-    entrypoint counts as covered if its bare name appears anywhere in the reported coverage."""
+    """Everything the reported coverage can be matched against, lowercased: each symbol's whole
+    route-style key (when it looks like a route) plus every identifier token it contains — so a
+    detected entrypoint counts as covered if either form shows up in the report."""
     names: set[str] = set()
     for s in covered_symbols or []:
-        for tok in _IDENT.findall(str(s)):
+        text = " ".join(str(s or "").split())
+        if "/" in text:
+            names.add(text.lower())
+        for tok in _IDENT.findall(text):
             names.add(tok.lower())
     return names
 
@@ -204,7 +227,7 @@ class CorpusStore:
             if ep is None:
                 continue
             text = str(ep).strip()
-            key = _bare_name(text) or text.lower()
+            key = _coverage_key(text) or text.lower()
             if not text or key in seen or key in covered:
                 continue
             uncovered.append(text)

@@ -11,7 +11,19 @@ requires-python = ">=3.11"
 # claude-agent-sdk is an OPTIONAL runtime dependency. The system defaults to dry-run
 # (§9, §13) and is fully runnable and testable without it; install it to enable the
 # live agentic "brain".
-dependencies = []
+#
+# These two, by contrast, are REQUIRED at runtime even though p1hunt's own modules never
+# import them: they are the toolchain of the PROOF HARNESSES the web runner materializes and
+# executes. The web scaffolds in p1hunt/agents/harness_scaffold.py emit pytest files that
+# `import requests`, and p1hunt/runners/web.py derives a `pytest` argv to run them. Leaving
+# them undeclared made a harness die on ModuleNotFoundError — which the parser then read as a
+# demonstrated bug. A missing dependency must never be able to masquerade as a finding, so the
+# dependency is declared here and the parser treats a collection/import error as ran=False.
+# (pytest-cov is deliberately NOT required: the runner asks for --cov and retries without it.)
+dependencies = [
+  "requests>=2.31",
+  "pytest>=7",
+]
 
 [project.optional-dependencies]
 agent = ["claude-agent-sdk>=0.2.105"]

@@ -18,22 +18,33 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-from ..dynamic.egress import url_allowed
+from ..dynamic.egress import normalize_host, url_allowed
 from ..models import GuardDecision, ScopeGuardPolicy
 
 
 class RateLimiter:
-    """Sliding-window limiter, per target. A breach is a *deny*, never a wait-then-send."""
+    """Sliding-window limiter, per TARGET HOST. A breach is a *deny*, never a wait-then-send.
+
+    Keyed on the host, never the full URL: keying on the URL made the limit meaningless, because
+    varying only the path (or adding a cache-busting query) started a fresh window — 6/6 requests
+    passed a ``max_per_minute=2`` limit. The rate limit exists to honor a program's rate-of-
+    engagement ceiling for a HOST, so the host is the key."""
 
     def __init__(self, max_per_minute: int) -> None:
         self.max_per_minute = max_per_minute
         self._hits: dict[str, deque[float]] = {}
 
+    @staticmethod
+    def key_for(target: str) -> str:
+        """The limiter key: the normalized host, falling back to the raw target when it has no
+        host-like part (e.g. a local tool target), so a non-URL target is still rate-limited."""
+        return normalize_host(target) or str(target or "").strip().lower()
+
     def allow(self, target: str, now: float | None = None) -> bool:
         if self.max_per_minute <= 0:
             return False  # no rate => no live contact permitted
         now = now if now is not None else time.time()
-        window = self._hits.setdefault(target, deque())
+        window = self._hits.setdefault(self.key_for(target), deque())
         while window and now - window[0] > 60.0:
             window.popleft()
         if len(window) >= self.max_per_minute:
@@ -63,6 +74,49 @@ def _is_url(target: str) -> bool:
     """A target that is itself an http(s) URL is a live network call regardless of which key it
     arrived under — so it must go through the egress jail, never the substring asset allowlist."""
     return target.lower().startswith(("http://", "https://"))
+
+
+# Keys whose value names WHERE a call will connect. On a network call EVERY one of these is run
+# through the egress jail, because the guard cannot know which key the tool will read. It used to
+# evaluate a single "primary" target chosen by key order — ``target`` before ``url`` — while
+# ``tools.http_sandbox`` reads ``url``: ``{"target": in-scope, "url": attacker}`` was ALLOWED and
+# the audit trail logged the in-scope host that was never contacted.
+_CONNECT_KEYS = frozenset({
+    "url", "urls", "target", "targets", "host", "hosts", "address", "addresses",
+    "endpoint", "endpoints", "uri", "uris", "base_url", "origin", "proxy", "callback_url",
+})
+# Keys that carry PAYLOAD, not a destination. A URL inside a body/header/param is the TARGET's
+# egress (an SSRF probe, a Host-header test, an OOB callback payload) — legitimate authorized
+# testing — so it is deliberately NOT treated as this call's connection target.
+_PAYLOAD_KEYS = frozenset({
+    "body", "data", "json", "payload", "headers", "params", "query", "form", "cookies",
+    "content", "files", "prompt", "command", "reason", "note", "notes", "description",
+})
+
+
+def _connect_urls(tool_input: dict) -> list[str]:
+    """Every value in ``tool_input`` that names a host this call would CONTACT: anything under a
+    ``_CONNECT_KEYS`` key, plus any bare http(s) URL under a key that is not payload. Ordered,
+    de-duplicated; ``url`` first when present so the logged target is what the tool really uses."""
+    out: list[str] = []
+
+    def _add(value: object) -> None:
+        s = str(value).strip()
+        if s and s not in out:
+            out.append(s)
+
+    for key in ("url", "target"):  # the two the tools actually read, in the tools' own order
+        if tool_input.get(key):
+            _add(tool_input[key])
+    for key, value in tool_input.items():
+        k = str(key).lower()
+        if k in _PAYLOAD_KEYS:
+            continue
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for v in values:
+            if isinstance(v, str) and v.strip() and (k in _CONNECT_KEYS or _is_url(v)):
+                _add(v)
+    return out
 
 
 class ScopeGuard:
@@ -132,21 +186,33 @@ class ScopeGuard:
         method = str(tool_input.get("http_method", tool_input.get("method", ""))).upper()
         is_network = bool(method) or bool(tool_input.get("url")) or _is_url(target)
         if is_network:
-            from ..dynamic.egress import is_loopback, normalize_host
+            from ..dynamic.egress import is_loopback
+
+            # EVERY url-bearing value is checked, not just the one key ``_target_of`` picked: the
+            # TOOL decides which key it reads, so an alias (``target`` vs ``url``) must not be able
+            # to show the guard one host and hand the tool another.
+            urls = _connect_urls(tool_input) or ([target] if target else [])
+            # The audit trail must name what is ACTUALLY contacted — all of it, not the first key
+            # that happened to parse (the safe-harbor attestation is generated from this log).
+            logged = ", ".join(urls) if urls else target
+            if not urls:  # a network call with nothing to check is denied (fail-closed)
+                return self._deny(agent, tool, target, "no host in target")
             # In dry-run, NO live contact except loopback (a local OOB listener / local app). Even a
             # build/registry host requires active mode — so dry_run can never reach a remote host.
-            if self.policy.run_mode != "active" and not is_loopback(normalize_host(target)):
-                return self._deny(agent, tool, target, "live contact disabled (dry-run)")
-            ok, why = url_allowed(target, self.policy.egress_allowlist)
-            if not ok:
-                return self._deny(agent, tool, target, why)
-            if any(term in a or term in t for term in self.policy.destructive_denylist):
-                return self._deny(agent, tool, target, "destructive / prohibited by safe harbor")
+            if self.policy.run_mode != "active" and not all(is_loopback(u) for u in urls):
+                return self._deny(agent, tool, logged, "live contact disabled (dry-run)")
+            for candidate in urls:
+                ok, why = url_allowed(candidate, self.policy.egress_allowlist)
+                if not ok:
+                    return self._deny(agent, tool, candidate, why)
+            t_all = " ".join([t, *(u.lower() for u in urls)])
+            if any(term in a or term in t_all for term in self.policy.destructive_denylist):
+                return self._deny(agent, tool, logged, "destructive / prohibited by safe harbor")
             if method and method not in self.policy.allowed_http_methods:
-                return self._deny(agent, tool, target, f"HTTP method {method} not permitted")
-            if not self._rate.allow(target):
-                return self._deny(agent, tool, target, "rate limit")
-            return self._allow(agent, tool, target)
+                return self._deny(agent, tool, logged, f"HTTP method {method} not permitted")
+            if not self._rate.allow(urls[0] if urls else target):  # host-keyed (see RateLimiter)
+                return self._deny(agent, tool, logged, "rate limit")
+            return self._allow(agent, tool, logged)
 
         # 1. In-scope allowlist (substring match against derived allowlist).
         if not self.policy.allowlist or not any(
@@ -193,7 +259,11 @@ class ScopeGuard:
     # --- helpers ----------------------------------------------------------
     @staticmethod
     def _target_of(tool_input: dict) -> str:
-        for key in ("target", "url", "host", "address", "file_path", "path", "repo", "asset"):
+        # ``url`` FIRST: it is the key the network tools actually connect to (``http_sandbox``
+        # reads ``args["url"]``), so the primary/logged target must agree with the tool. With
+        # ``target`` first, ``{"target": in-scope, "url": attacker}`` logged the in-scope host.
+        # (The network branch additionally checks EVERY connect key — see ``_connect_urls``.)
+        for key in ("url", "target", "host", "address", "file_path", "path", "repo", "asset"):
             if key in tool_input and tool_input[key]:
                 return str(tool_input[key])
         return ""

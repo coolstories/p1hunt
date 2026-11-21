@@ -70,9 +70,15 @@ class Clamp(unittest.TestCase):
 
 class BashEnforcement(unittest.TestCase):
     def test_default_policy_none_is_permissive(self) -> None:
-        # Unchanged loosened-jail behavior when no Parent-A policy is set.
-        for cmd in ("curl https://api.test/x", "pip install requests", "git push origin main"):
+        # Unchanged loosened-jail behavior when no Parent-A policy is set: local work, installs and
+        # host-less network commands pass. Note the egress ALLOWLIST is independent of the
+        # permission policy and is always enforced, so a command naming a host needs that host
+        # armed (`curl https://api.test/x` below) — an unarmed run reaches loopback + registries
+        # only. See tests/test_egress_hardening.py.
+        for cmd in ("pip install requests", "git push origin main", "forge test -vvv"):
             self.assertTrue(bash_safety(cmd, policy=None)[0], cmd)
+        self.assertTrue(bash_safety("curl https://api.test/x", policy=None,
+                                    egress_hosts=["api.test"])[0])
 
     def test_network_off_denies_egress(self) -> None:
         pol = PermissionPolicy(allow_network=False)

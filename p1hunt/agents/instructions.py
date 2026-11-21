@@ -11,10 +11,24 @@ a per-target playbook. They are applied to whatever surface was derived for this
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from ..classify.signals import SignalHit
 from ..models import EngagementPlan, ImpactSurface
+
+
+def _ruled_out_budget() -> int:
+    """How many already-falsified hypotheses to carry in a brief.
+
+    Dial: ``P1HUNT_RULED_OUT_IN_BRIEF`` (default 40). Generous on purpose — the agents reading
+    these briefs are long-context, and the accumulated "do not re-test" list is the single most
+    useful thing to hand a reframed track. A short list is what lets a dead end slip back in."""
+
+    raw = str(os.environ.get("P1HUNT_RULED_OUT_IN_BRIEF", "")).strip()
+    if raw.isdigit() and int(raw) >= 0:
+        return int(raw)
+    return 40
 
 # Lens -> creative analytical paths (techniques, not target playbooks). Parent A selects
 # and *anchors* these to real files/lines before handing them to Child B.
@@ -126,8 +140,15 @@ def parent_directive(
     *,
     hits: list[SignalHit] | None = None,
     track_index: int = 1,
+    coverage_hint: str = "",
+    ruled_out: list[str] | None = None,
 ) -> TrackDirective:
-    """Build Parent A's concrete brief for a Child B track, anchored to real signals."""
+    """Build Parent A's concrete brief for a Child B track, anchored to real signals.
+
+    ``coverage_hint`` carries the corpus's round-over-round steer (which entrypoints are still
+    dark) so each round attacks what the last one never reached instead of re-covering it.
+    ``ruled_out`` carries the falsification ledger's closed hypotheses, so a reframed track is
+    told what NOT to re-test — persistence that compounds rather than loops."""
     lens_paths = _PATHS_BY_LENS.get(surface.lens, _PATHS_BY_LENS["business-logic"])
     anchored = [h for h in (hits or []) if h.signal.lens == surface.lens]
     start_points = [f"{h.file}:{h.line} — {h.signal.title}" for h in anchored[:5]]
@@ -137,6 +158,14 @@ def parent_directive(
     if anchored:
         top = anchored[0]
         creative = [f"Begin at {top.file}:{top.line}. " + lens_paths[0]] + lens_paths[1:]
+
+    # Coverage steer FIRST: the still-dark surface is where an unfound bug actually is.
+    if coverage_hint:
+        creative = [str(coverage_hint)] + creative
+    for closed in (ruled_out or [])[:_ruled_out_budget()]:
+        text = str(closed or "").strip()
+        if text:
+            creative.append(f"ALREADY FALSIFIED — do not re-test: {text}")
 
     mission = (
         f"Find and reproduce a {surface.lens} weakness on {surface.target_asset} that the "
@@ -157,6 +186,76 @@ def parent_directive(
             "Validation would require a destructive or production action",
         ],
         impact_definition=plan.impact_definition,
+    )
+
+
+def objective_directive(
+    surface: ImpactSurface,
+    plan: EngagementPlan,
+    frame: str,
+    *,
+    mission: str,
+    objectives: list[str],
+    track_index: int = 1,
+    ruled_out: list[str] | None = None,
+) -> TrackDirective:
+    """A brief whose creative paths ARE a given list of objectives.
+
+    Used when Parent A has something specific it wants attacked rather than a lens to sweep —
+    an escalation pass on a confirmed finding, a precondition-removal objective, or an
+    asymmetry sweep. Same TrackDirective shape as a normal brief, so Child B consumes it with
+    no special case; only the content is narrower and more directed."""
+    paths = [str(o).strip() for o in (objectives or []) if str(o or "").strip()]
+    for closed in (ruled_out or [])[:_ruled_out_budget()]:
+        text = str(closed or "").strip()
+        if text:
+            paths.append(f"ALREADY FALSIFIED — do not re-test: {text}")
+    if not paths:
+        paths = ["Characterize the objective precisely, then enumerate where it does not hold."]
+    return TrackDirective(
+        track_id=f"T{track_index:02d}",
+        surface=surface,
+        frame=frame,
+        mission=mission,
+        start_points=[],
+        creative_paths=paths,
+        safe_validation_environment=surface.safe_validation_environment,
+        stop_conditions=[
+            "Out-of-scope asset encountered",
+            "Unexpected third-party data appears",
+            "Validation would require a destructive or production action",
+        ],
+        impact_definition=plan.impact_definition,
+    )
+
+
+def escalation_directive(
+    surface: ImpactSurface,
+    plan: EngagementPlan,
+    escalation_plan: object,
+    *,
+    track_index: int = 1,
+    ruled_out: list[str] | None = None,
+) -> TrackDirective:
+    """Turn an escalation plan for a CONFIRMED finding into a track brief.
+
+    The mission is deliberately blunt about not re-proving the finding: the bug is already
+    confirmed, so spending the pass re-demonstrating it is the waste this mechanism exists to
+    prevent. Duck-typed on the plan object to keep this module free of agent-layer imports."""
+    title = str(getattr(escalation_plan, "finding_title", "") or "the confirmed finding")
+    attempt = getattr(escalation_plan, "attempt", 1)
+    objectives = list(getattr(escalation_plan, "objectives", ()) or ())
+    paths = [o.as_prompt() if hasattr(o, "as_prompt") else str(o) for o in objectives]
+    mission = (
+        f"ESCALATE a CONFIRMED finding (pass {attempt}): {title}. Do NOT re-prove it — it is "
+        f"already reproduced. Make it WORSE: remove a precondition, find a location where it is "
+        f"unconditional, or widen the crossed authority. A positive, mechanism-named negative "
+        f"('this cannot be escalated because X enforces it everywhere') closes the question and "
+        f"is a real result."
+    )
+    return objective_directive(
+        surface, plan, frame=f"escalation pass {attempt}", mission=mission,
+        objectives=paths, track_index=track_index, ruled_out=ruled_out,
     )
 
 

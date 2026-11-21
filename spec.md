@@ -295,8 +295,9 @@ The final human-reviewed report package contains:
   - Hooks: https://platform.claude.com/docs/en/agent-sdk/hooks
   - Subagents: https://platform.claude.com/docs/en/agent-sdk/subagents
   - Repo: https://github.com/anthropics/claude-agent-sdk-python
-- **Models (verify current strings):** orchestrator/verifier `claude-opus-4-8`,
-  workers `claude-sonnet-4-6`, warm-pool watcher `claude-haiku-4-5`.
+- **Models (Claude 5 family):** orchestrator/verifier `claude-fable-5-2` (1M context
+  for the long-horizon loop), workers `claude-opus-5-5`, warm-pool watcher
+  `claude-haiku-5-5`.
 - **Per-engagement tooling** (installed only when the derivation step selects it):
   Foundry/anvil for EVM forks; static-analysis runners; APK tooling; a sandboxed
   HTTP client. These are **interfaces** (§12), not bundled exploit kits.
@@ -323,7 +324,7 @@ The final human-reviewed report package contains:
             │               │                   │
       ┌─────▼─────┐   ┌─────▼─────┐       ┌──────▼──────┐
       │ Parent A  │   │ Child B1  │  ...  │  Falsifier  │
-      │ (Opus,    │   │ (Sonnet,  │       │  (Opus,     │
+      │ (Fable,   │   │ (Opus,    │       │  (Fable,    │
       │ long-     │   │ long-     │       │  adversarial│
       │ lived)    │   │ lived)    │       │  prior)     │
       └─────┬─────┘   └─────┬─────┘       └─────────────┘
@@ -428,16 +429,16 @@ hardcoded surface/hypothesis/tool content.
 
 ## 7. Agents & delegation
 
-- **Parent A** (`claude-opus-4-8`): runs §6, decomposes the plan into tracks, assigns
+- **Parent A** (`claude-fable-5-2`): runs §6, decomposes the plan into tracks, assigns
   each to a Child B via the message bus, watches the blackboard, joins cross-track
   threads, runs the never-quit loop (§8) and the severity gate (§10). Carries the
   optimistic "a P1 exists" prior.
-- **Child B** (`claude-sonnet-4-6`, long-lived, addressable): owns one track. May spawn
+- **Child B** (`claude-opus-5-5`, long-lived, addressable): owns one track. May spawn
   **Child C** ephemeral subagents for parallel hypotheses. Reports results to the
   blackboard. Persistence policy is bounded in cost/safety, unbounded in creativity.
 - **Child C** (ephemeral subagent): one narrow hypothesis, blank context — B MUST pack
   all needed context into the spawn prompt. Returns a result string + artifact refs.
-- **Falsifier** (`claude-opus-4-8`, adversarial prior): receives every CANDIDATE and
+- **Falsifier** (`claude-fable-5-2`, adversarial prior): receives every CANDIDATE and
   tries to kill it (wrong / duplicate / overclaimed). Only survivors are promoted.
 
 Tool scoping per agent via `allowed_tools` / `disallowed_tools`; recon/analysis agents
@@ -459,8 +460,8 @@ on Stop(agent=A):
 - **Stop is allowed only** on (a) operator `stop` directive, or (b) a safety/scope
   event. Saturation/dry-spell is **not** a stop — it triggers a **reframe** (rotate
   the analytical lens or move to an unexplored ranked surface) and, when expensive
-  frames saturate, **tier demotion**: A keeps running on the `claude-haiku-4-5`
-  warm-pool cadence, re-escalating to Opus only when **novelty** arrives (new audit,
+  frames saturate, **tier demotion**: A keeps running on the `claude-haiku-5-5`
+  warm-pool cadence, re-escalating to Fable only when **novelty** arrives (new audit,
   sibling-protocol bug, new technique, changed on-chain state).
 - Budgets are **throttles, not stops** — exhausting a budget demotes to warm-pool, it
   does not end the engagement.

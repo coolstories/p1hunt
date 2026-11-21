@@ -14,6 +14,28 @@ order/marketplace/AMM/etc. is assumed.
 Everything here is PURE (filesystem reads only) — no Claude, no network, no toolchain. The
 skeleton is generic class-level methodology the model adapts to the specific target; it names no
 specific protocol or target shape.
+
+THE ``expect`` CONVENTION (must match ``p1hunt/runners/web.py``, which defines it)
+---------------------------------------------------------------------------------
+Every scaffold states the ``ReproSpec.expect`` value that pairs with the harness it emits.
+``expect`` describes **which direction the emitted harness's own assertions point**, never the
+desired outcome of the run:
+
+  * ``expect="fail"`` — the harness ASSERTS THE SECURE BEHAVIOR (the attacker is refused, the
+    invariant holds, value is conserved), so the bug is DEMONSTRATED when the targeted test
+    FAILS. Every scaffold here whose template contains an assertion like
+    ``assert r.status_code in (401, 403, 404)`` is ``expect="fail"`` — that covers the web
+    authz, payments and GraphQL scaffolds as well as crypto/supply-chain/infra/mobile.
+  * ``expect="pass"`` — the harness ASSERTS THE INSECURE BEHAVIOR (it performs the exploit and
+    asserts it worked), so the bug is DEMONSTRATED when the targeted test PASSES.
+
+Litmus test before editing any scaffold: read the assertions in the template below it. Asserting
+a 403 => ``expect="fail"``. Asserting a 200 on another principal's object => ``expect="pass"``.
+Declaring the wrong one silently inverts every verdict the runner produces for that scaffold: a
+genuine reproduced IDOR is filed as "attack not demonstrated" (false negative) while a WAF that
+blanket-refuses everything satisfies every assertion and is stamped reproduced (false positive).
+``tests/test_harness_scaffold.py`` pins each scaffold's declared value against the direction of
+the assertions it emits.
 """
 
 from __future__ import annotations
@@ -268,7 +290,8 @@ A failing property WITH a reproducing input IS your PoC."""
 # right framework for the TARGET CLASS, the invariants to assert, the run
 # command + materialized file path, AND the EXPECTED-OUTCOME wording that
 # pairs with ReproSpec.expect (it states explicitly whether a reproduced bug
-# makes the test FAIL or PASS). Everything is generic to the CLASS — no
+# makes the test FAIL or PASS — see the convention in this module's
+# docstring). Everything is generic to the CLASS — no
 # per-target/product literals, no hardcoded endpoints. The harness reads
 # target/credentials from the ENVIRONMENT at runtime so nothing is preset.
 # ===========================================================================
@@ -283,8 +306,11 @@ def _files_block(focus_files: list[str]) -> str:
 
 
 def _web_authz_skeleton(subsystem: str, focus_files: list[str], target_url: str) -> str:
-    """Two-principal resource-boundary harness — pytest + requests, expect='pass' (bug = an
-    unexpected cross-principal permit, so the assertion that it FAILS does not hold)."""
+    """Two-principal resource-boundary harness — pytest + requests, expect='fail'.
+
+    The emitted template asserts the SECURE behavior (``assert r.status_code in (401, 403, 404)``
+    — B is refused on A's object), so a reproduced cross-principal permit makes that assertion,
+    and therefore the targeted test, FAIL. Per the module convention that is ``expect="fail"``."""
     files = _files_block(focus_files)
     base = target_url or "(read from P1HUNT_BASE_URL)"
     poc = f"{_POC_DIR}/test_authz.py"
@@ -302,10 +328,15 @@ so no target literal is baked in.
 MATERIALIZE THIS at {poc} and RUN:
     P1HUNT_BASE_URL=... pytest {poc} -v
 
-EXPECTED OUTCOME (ReproSpec.expect="pass"): the bug is DEMONSTRATED when an assertion that the
+EXPECTED OUTCOME (ReproSpec.expect="fail"): the bug is DEMONSTRATED when an assertion that the
 unauthorized access is BLOCKED FAILS — i.e. B successfully read/wrote A's object (status 2xx where
 a 403/404 was required). A reproduced finding makes the targeted test FAIL with that assertion;
-a clean target keeps the test PASSING (every cross-principal request refused).
+a clean target keeps the test PASSING (every cross-principal request refused). Set
+expect="fail" because this harness asserts the SECURE behavior.
+
+A BLANKET BLOCK IS NOT A PASS: if a WAF/CDN or a dead endpoint refuses everything, every
+assertion above "holds" while proving nothing. Probe liveness FIRST (see the live-target note if
+one is armed) and treat an edge block as a non-result, never as an enforced boundary.
 
 ```python
 import os
@@ -363,8 +394,11 @@ guessable ids and UUIDs both count. A single 2xx where a refusal was required IS
 
 
 def _web_payment_skeleton(subsystem: str, focus_files: list[str], target_url: str) -> str:
-    """Web payment / accounting / idempotency — pytest, expect='pass' (bug = conservation broken:
-    a double-credit / value created, so the assertion that balances are conserved does not hold)."""
+    """Web payment / accounting / idempotency — pytest, expect='fail'.
+
+    The emitted template asserts the SECURE behavior (value is CONSERVED — no double-charge, no
+    value created), so a reproduced conservation break makes that assertion, and therefore the
+    targeted test, FAIL. Per the module convention that is ``expect="fail"``."""
     files = _files_block(focus_files)
     poc = f"{_POC_DIR}/test_payments.py"
     return f"""SCAFFOLD — pytest payment/accounting/idempotency harness for the '{subsystem}'
@@ -380,10 +414,13 @@ negative-amount refund inflating a balance. Base URL + credentials come from the
 MATERIALIZE THIS at {poc} and RUN:
     P1HUNT_BASE_URL=... pytest {poc} -v
 
-EXPECTED OUTCOME (ReproSpec.expect="pass"): the bug is DEMONSTRATED when a conservation assertion
+EXPECTED OUTCOME (ReproSpec.expect="fail"): the bug is DEMONSTRATED when a conservation assertion
 FAILS — the same idempotency key charged twice, a tampered amount was honored, or a negative/zero
 amount moved value. A reproduced finding makes the targeted test FAIL; a sound ledger keeps every
-test PASSING.
+test PASSING. Set expect="fail" because this harness asserts the SECURE behavior.
+
+A BLANKET BLOCK IS NOT A PASS: if a WAF/CDN or a dead endpoint refuses every charge, nothing moves
+and every conservation assertion "holds" while proving nothing. Probe liveness FIRST.
 
 ```python
 import os, uuid
@@ -453,8 +490,11 @@ value created or any second charge under one key IS your PoC."""
 
 
 def _graphql_skeleton(subsystem: str, focus_files: list[str], target_url: str) -> str:
-    """GraphQL resolver auth — pytest, expect='pass' (bug = field-level authz bypassed: a
-    protected field/mutation returned data to an unauthorized role)."""
+    """GraphQL resolver auth — pytest, expect='fail'.
+
+    The emitted template asserts the SECURE behavior (``assert _denied(resp)`` — the low role is
+    refused), so a reproduced field-level authz bypass makes that assertion, and therefore the
+    targeted test, FAIL. Per the module convention that is ``expect="fail"``."""
     files = _files_block(focus_files)
     poc = f"{_POC_DIR}/test_graphql_authz.py"
     return f"""SCAFFOLD — pytest GraphQL resolver-authorization harness for the '{subsystem}'
@@ -470,10 +510,14 @@ including via introspection, field aliasing, and batched/array operations (ampli
 MATERIALIZE THIS at {poc} and RUN:
     P1HUNT_GQL_URL=... pytest {poc} -v
 
-EXPECTED OUTCOME (ReproSpec.expect="pass"): the bug is DEMONSTRATED when an assertion that the
+EXPECTED OUTCOME (ReproSpec.expect="fail"): the bug is DEMONSTRATED when an assertion that the
 unauthorized role is DENIED FAILS — a protected field/mutation returned data (no top-level
 `errors`, non-null `data`) to a role that should be refused, or an alias/batch slipped past a guard.
 A reproduced finding makes the targeted test FAIL; a correctly-guarded schema keeps tests PASSING.
+Set expect="fail" because this harness asserts the SECURE behavior.
+
+A BLANKET BLOCK IS NOT A PASS: a WAF/CDN challenge or a 5xx endpoint makes `_denied()` true for
+every query, so every assertion "holds" while proving nothing. Probe liveness FIRST.
 
 ```python
 import os
@@ -853,14 +897,24 @@ how a web critical is PROVEN, not by reading alone. Use the shipped client (alre
 
     from p1hunt_dyn import Client
     c = Client()                                  # reads base URL + egress allowlist from env
+    c.require_live_baseline('/')                   # FIRST: raises BlockedError if dead/WAF-blocked
     a = c.get('/me', identity='A')                # authenticate as principal A (env token)
     c.assert_forbidden('GET', f'/objects/{{oid}}', identity='B')   # B must be refused
     url, tok = c.oob_url()                         # feed `url` to callback/fetch behavior, then
     assert c.oob_received(tok)                     # assert the target called back (proof)
 
+PROBE LIVENESS BEFORE ASSERTING. `require_live_baseline()` (or `baseline_health()` for the raw
+dict) tells a REFUSING endpoint apart from a DEAD or WAF-BLOCKED one. This matters because a
+blanket block satisfies every refusal assertion in your harness: without the probe, a Cloudflare
+challenge or a 503 reads as a perfectly enforced authorization boundary. `assert_forbidden` /
+`idor_probe` raise `BlockedError` (NOT AssertionError) on an edge block for the same reason — the
+runner maps that to ran=False, a non-result, instead of a verdict. A bare 403 with no WAF markers
+is still a genuine refusal and still counts as one.
+
 The egress jail confines every request to the in-scope host(s); a request elsewhere raises. Set
-your ReproSpec expect so a reproduced bug makes the targeted test FAIL (an authz/forbidden
-assertion that does NOT hold = the bypass). Only contact {target_url} and loopback."""
+ReproSpec expect="fail" for these harnesses: they assert the SECURE behavior (the forbidden
+request IS refused), so a reproduced bug makes the targeted test FAIL — an authz/forbidden
+assertion that does NOT hold is the bypass. Only contact {target_url} and loopback."""
 
 
 def scaffold_block(
@@ -888,9 +942,11 @@ def scaffold_block(
     ``ReproSpec.expect`` (whether a reproduced bug makes the test FAIL or PASS):
 
       * ``WEB_API`` — subclass-routed via ``detect_web_subclass`` (scanning ``repo_path``):
-        ``auth`` -> resource-boundary checks (pytest+requests, expect='pass'); ``payments`` ->
-        accounting/idempotency conservation (pytest, expect='pass'); ``graphql`` -> resolver
-        field-authz (pytest, expect='pass'); else a generic web property loop.
+        ``auth`` -> resource-boundary checks (pytest+requests, expect='fail'); ``payments`` ->
+        accounting/idempotency conservation (pytest, expect='fail'); ``graphql`` -> resolver
+        field-authz (pytest, expect='fail'); else a generic web property loop. All three assert
+        the SECURE behavior, so a reproduced bug FAILS the targeted test (see the module
+        docstring's ``expect`` convention).
       * ``CRYPTO_LIB`` — ``detect_crypto_subclass`` selects the subclass; a pytest property/
         differential harness for non-malleability / domain-separation / nonce-misuse
         (expect='fail').

@@ -11,10 +11,31 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import re
+
 from p1hunt.agents.harness_scaffold import (
     detect_evm_entrypoints,
     scaffold_block,
 )
+
+_EXPECT_DECL_RE = re.compile(r'ReproSpec\.expect="(\w+)"')
+
+
+def emitted_harness(block: str) -> str:
+    """The fenced ```python template a scaffold tells the model to materialize."""
+    assert "```python" in block, "scaffold emitted no python template"
+    return block.split("```python", 1)[1].split("```", 1)[0]
+
+
+def declared_expect(block: str) -> str:
+    """The single ``ReproSpec.expect`` value a scaffold declares. Asserts it is unambiguous."""
+    found = set(_EXPECT_DECL_RE.findall(block))
+    assert len(found) == 1, f"scaffold must declare exactly one expect value, got {found}"
+    return found.pop()
+
+
+def assertion_lines(template: str) -> list[str]:
+    return [ln.strip() for ln in template.splitlines() if ln.strip().startswith("assert ")]
 
 _MARKETPLACE_SOL = """// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
@@ -185,34 +206,52 @@ class TestNonEvmScaffolds(unittest.TestCase):
         _write(Path(d), name, body)
         return d
 
-    def test_web_access_boundary_pytest_pass_cue(self) -> None:
+    def test_web_access_boundary_declares_expect_fail(self) -> None:
         repo = self._web_repo("auth_routes.py", "def login(): pass  # oauth jwt session bearer token")
         block = scaffold_block("WEB_API", "accounts", ["src/auth_routes.py"], repo_path=repo)
         self.assertIn("pytest", block)
         self.assertIn("requests", block)
-        # expect="pass" semantics stated explicitly: unauthorized access SUCCEEDING => bug => FAIL.
-        self.assertIn('expect="pass"', block)
+        # THE CONVENTION, derived rather than string-matched: this scaffold emits a harness whose
+        # assertions state the SECURE behavior (B IS refused on A's object), so a reproduced
+        # cross-principal permit makes the targeted test FAIL => expect="fail".
+        template = emitted_harness(block)
+        refusal_asserts = [a for a in assertion_lines(template)
+                           if "401, 403, 404" in a or "not in ids" in a]
+        self.assertTrue(refusal_asserts, "authz scaffold must assert the secure behavior")
+        self.assertEqual(declared_expect(block), "fail")
+        self.assertNotIn('expect="pass"', block)
         for needle in ("cross-principal", "TOKEN_A", "TOKEN_B", "test_authz.py"):
             self.assertIn(needle, block)
         self.assertNotIn("IDOR", block)
         self.assertNotIn("BOLA", block)
         self.assertNotIn("vm.sign", block)
 
-    def test_web_payment_idempotency_pytest_pass_cue(self) -> None:
+    def test_web_payment_idempotency_declares_expect_fail(self) -> None:
         repo = self._web_repo(
             "billing.py", "def charge(): pass  # payment refund idempotency-key ledger currency amount")
         block = scaffold_block("WEB_API", "billing", ["src/billing.py"], repo_path=repo)
         self.assertIn("pytest", block)
-        self.assertIn('expect="pass"', block)
+        # The emitted harness asserts CONSERVATION (the secure behavior), so a reproduced
+        # double-charge / value-creation makes the targeted test FAIL => expect="fail".
+        conservation = [a for a in assertion_lines(emitted_harness(block))
+                        if "_balance()" in a or "moved ==" in a]
+        self.assertTrue(conservation, "payments scaffold must assert value is conserved")
+        self.assertEqual(declared_expect(block), "fail")
+        self.assertNotIn('expect="pass"', block)
         for needle in ("Idempotency-Key", "DOUBLE CHARGE", "conserve", "test_payments.py"):
             self.assertIn(needle, block)
 
-    def test_graphql_resolver_authz_pytest_pass_cue(self) -> None:
+    def test_graphql_resolver_authz_declares_expect_fail(self) -> None:
         repo = self._web_repo(
             "schema.py", "resolver typedefs apollo introspection __schema query { mutation {")
         block = scaffold_block("WEB_API", "api", ["src/schema.py"], repo_path=repo)
         self.assertIn("pytest", block)
-        self.assertIn('expect="pass"', block)
+        # The emitted harness asserts DENIAL (the secure behavior), so a reproduced field-level
+        # authz bypass makes the targeted test FAIL => expect="fail".
+        denials = [a for a in assertion_lines(emitted_harness(block)) if "_denied(" in a]
+        self.assertTrue(denials, "graphql scaffold must assert the low role is denied")
+        self.assertEqual(declared_expect(block), "fail")
+        self.assertNotIn('expect="pass"', block)
         for needle in ("GraphQL", "alias", "batch", "introspection", "test_graphql_authz.py"):
             self.assertIn(needle, block)
 

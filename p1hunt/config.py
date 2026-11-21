@@ -13,15 +13,17 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Models:
-    """Per-tier model strings (verify current). Orchestrator/verifier on the strongest
-    tier, workers a step down, warm-pool watcher cheapest (§3)."""
+    """Per-tier model strings (Claude 5 family). Orchestrator/verifier on the strongest
+    tier — Fable 5.2, whose 1M context carries the long-horizon never-quit loop's
+    accumulated record of what has already been tried — workers a step down on Opus 5.5,
+    warm-pool watcher cheapest on Haiku 5.5 (§3)."""
 
-    orchestrator: str = "claude-opus-4-8"  # legacy Claude slug, ignored when engine=codex
-    worker: str = "claude-opus-4-8"        # legacy Claude slug, ignored when engine=codex
-    warm_pool: str = "claude-haiku-4-5"    # legacy Claude slug, ignored when engine=codex
-    falsifier: str = "claude-opus-4-8"     # legacy Claude slug, ignored when engine=codex
+    orchestrator: str = "claude-fable-5-2"  # current Claude slug, ignored when engine=codex
+    worker: str = "claude-opus-5-5"         # current Claude slug, ignored when engine=codex
+    warm_pool: str = "claude-haiku-5-5"     # current Claude slug, ignored when engine=codex
+    falsifier: str = "claude-fable-5-2"     # current Claude slug, ignored when engine=codex
     # GLOBAL ENGINE: Codex is the default for EVERY AI role: orchestrator, hunters, verifier,
-    # prover, exploit-depth, debate, dedup, and fuzz harness writing. The old Claude model strings
+    # prover, exploit-depth, debate, dedup, and fuzz harness writing. The Claude model strings
     # stay only as compatibility fields for explicit P1HUNT_ENGINE=claude runs.
     engine: str = "codex"                  # GLOBAL engine for ALL roles ("codex" | "claude")
     discovery_engine: str = "codex"        # discovery hunters; follows engine unless overridden
@@ -33,10 +35,22 @@ class Models:
 class Budgets:
     """Per-track ceilings. Exhaustion DEMOTES to warm-pool; it never ends an engagement (§8)."""
 
-    max_frames_per_track: int = 24
+    max_frames_per_track: int = 120
     max_subagents_per_track: int = 8
     max_tokens_per_track: int | None = None
     warm_pool_cadence_seconds: float = 60.0
+    # PERSISTENCE DIALS (§8). A frame closes only after this many CONSECUTIVE dry passes -- one
+    # dry round is not evidence that a surface is exhausted. Escalation re-enters a CONFIRMED
+    # finding into the hunt (remove a precondition / find an unconditional location / widen blast
+    # radius) instead of terminating on it; set max_escalation_attempts=0 to restore the old
+    # terminate-on-confirmation behavior. Escalation is bounded per-finding AND engagement-wide,
+    # and the bound survives a restart by counting attempts already recorded on disk.
+    frame_falsify_after: int = 3
+    max_escalation_attempts: int = 3
+    max_escalation_total: int = 24
+    conclusion_min_members: int = 3
+    asymmetry_max_probes: int = 200
+    ruled_out_in_brief: int = 40
 
 
 @dataclass

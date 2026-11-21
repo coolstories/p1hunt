@@ -181,9 +181,15 @@ class ClaudeSwarm:
         # Preset-free guard: no deterministic scanner hits are handed to hunters as leads.
         self._scan_hits: list = []
         # --- live dynamic-testing state (armed in hunt()/_arm_environment when authorized) ---
-        # None = static mode (no live target / dry-run); a list = the authorized egress allowlist
-        # that confines every agent's outbound request to in-scope hosts (the live safe-harbor jail).
-        self._egress_hosts: list[str] | None = None
+        # The authorized egress allowlist that confines every agent's outbound request to in-scope
+        # hosts (the live safe-harbor jail). It is ALWAYS A LIST and is NEVER None: an empty list
+        # is the UNARMED posture, which the jail reads as "loopback + build/registry hosts only".
+        # Passing None used to mean "no confinement at all" downstream (bash_safety skipped the
+        # jail entirely), so a dry-run with no authorized target could curl anything on the
+        # internet. ``_dynamic_armed`` — not "is the allowlist None" — now answers "is live
+        # testing authorized", so arming state and confinement can never be conflated again.
+        self._egress_hosts: list[str] = []
+        self._dynamic_armed: bool = False
         self._base_url: str = ""                 # the primary authorized dynamic target base URL
         self._oob = None                         # running loopback OOB interaction listener
         self._dynamic_env_keys: list[str] = []   # env vars _arm_dynamic exported (cleared on exit)
@@ -1563,7 +1569,7 @@ class ClaudeSwarm:
         # reproduction harnesses actually fire: export the env vars they read, ship the scope-
         # enforced interaction client into the PoC sandbox, and start the loopback OOB listener so
         # callback-based behavior can be CONFIRMED. All graceful — any failure just narrows the run.
-        if self._egress_hosts is not None:
+        if self._dynamic_armed:
             self._arm_dynamic()
 
         # 7) TOOLCHAIN CHECK (loud). The confirmed-critical gate can ONLY fire if the class's
@@ -1696,13 +1702,20 @@ class ClaudeSwarm:
                 f"FIX THE BUILD FIRST: {b.remediation} — only then can a PoC/fuzz harness deploy it.")
 
     def _entrypoints_for(self, subsystem: str, focus_files: list[str]) -> list[str]:
-        """Cached external/public entrypoints for an EVM subsystem (the real attack surface);
-        empty for non-EVM targets. Drives both the harness scaffold and coverage steering."""
-        if self._target_class != "EVM_CONTRACT":
-            return []
+        """Cached external/public entrypoints for a subsystem (the real attack surface).
+
+        CLASS-AGNOSTIC: EVM still resolves to Solidity signature enumeration (unchanged, it is
+        delegated to detect_evm_entrypoints); web/API and every other class now resolve to real
+        routes/operations instead of []. A NON-EMPTY result here is what lets rounds COMPOUND --
+        it feeds CorpusStore.uncovered_hint, so round N+1 is steered at what round N never
+        reached. Drives both the harness scaffold and coverage steering."""
         if subsystem not in self._entrypoints_by_subsystem:
             try:
-                self._entrypoints_by_subsystem[subsystem] = detect_evm_entrypoints(self.repo_path, focus_files)
+                from .surface_enum import entrypoints_for
+
+                self._entrypoints_by_subsystem[subsystem] = entrypoints_for(
+                    self._target_class, self.repo_path, focus_files
+                )
             except Exception:
                 self._entrypoints_by_subsystem[subsystem] = []
         return self._entrypoints_by_subsystem[subsystem]
@@ -1754,7 +1767,7 @@ class ClaudeSwarm:
         if self._fork_url:
             lines.append(f"A local fork is available at {self._fork_url} (use it only if the PoC "
                          "needs real forked state).")
-        if self._egress_hosts is not None and self._base_url:
+        if self._dynamic_armed and self._base_url:
             lines.append(
                 f"LIVE TARGET ARMED (authorized): an authorized instance is reachable at "
                 f"{self._base_url} with credentials in the environment. A scope-enforced client is "
@@ -1918,6 +1931,7 @@ class ClaudeSwarm:
         auth = authorize_dynamic(policy, self.scope)
         if auth.get("enabled"):
             self._egress_hosts = list(policy.egress_allowlist)
+            self._dynamic_armed = True
             self._base_url = next((t.base_url for t in self.scope.dynamic_targets
                                    if t.base_url and t.environment.lower() != "production"), "")
             self._emit(self.name, "lifecycle",
@@ -2004,14 +2018,14 @@ class ClaudeSwarm:
                 h.invariants = [str(x) for x in (tr.get("invariants") or []) if str(x).strip()]
                 h.fuzz_mode = str(tr.get("fuzz_mode", "") or "")
                 h.perms = self._perms  # Parent A's permission posture for this engagement
-                h.egress_hosts = self._egress_hosts  # live-testing host jail (None = static mode)
+                h.egress_hosts = self._egress_hosts  # host jail (empty = unarmed: loopback/build only)
                 h.poc_reldir = self.poc_reldir  # where forge can actually compile/run PoCs
                 h.discovery_engine = self.config.models.discovery_engine
                 h.codex_model = self.config.models.codex_model
                 h.codex_effort = self.config.models.codex_effort
                 # Live web-app pentest context (XBOW-style). web_mode flips the hunter to the
                 # black-box HTTP methodology when an authorized live target is armed.
-                h.web_mode = self._egress_hosts is not None
+                h.web_mode = self._dynamic_armed
                 h.base_urls = [getattr(t, "base_url", "") for t in (self.scope.dynamic_targets or [])]
                 h.identities = [getattr(idn, "name", "") for idn in (getattr(self.scope, "test_identities", None) or [])]
                 h.oob_available = self._oob is not None
@@ -2053,7 +2067,7 @@ class ClaudeSwarm:
                 so.discovery_engine = self.config.models.discovery_engine
                 so.codex_model = self.config.models.codex_model
                 so.codex_effort = self.config.models.codex_effort
-                so.web_mode = self._egress_hosts is not None
+                so.web_mode = self._dynamic_armed
                 so.base_urls = [getattr(t, "base_url", "") for t in (self.scope.dynamic_targets or [])]
                 so.identities = [getattr(idn, "name", "") for idn in (getattr(self.scope, "test_identities", None) or [])]
                 so.oob_available = self._oob is not None
@@ -2075,7 +2089,7 @@ class ClaudeSwarm:
                                       guard_check=self._guard_check(guard, "falsifier"))
             verifier.perms = self._perms
             verifier.egress_hosts = self._egress_hosts
-            verifier.web_mode = self._egress_hosts is not None
+            verifier.web_mode = self._dynamic_armed
             verifier.base_url = self._base_url
             verifier.poc_reldir = self.poc_reldir
             self._apply_role_engine(verifier)

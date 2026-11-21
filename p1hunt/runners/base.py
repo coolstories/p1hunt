@@ -18,6 +18,10 @@ class derived from the actual target — never a per-target/per-program playbook
 OFFLINE-GRACEFUL: if the toolchain is absent, the harness is missing, or the command cannot launch,
 a runner returns ``ran=False`` / ``reproduced=False`` — so the finding stays a CANDIDATE and is
 never promoted to a confirmed critical. Every subprocess is bounded by a timeout and never raises.
+The same applies to a harness that broke before it could test anything (a collection/import error)
+and to a request an edge/WAF answered instead of the target: neither is evidence about the target,
+so both report ``ran=False`` rather than a verdict. See ``ReproSpec.expect`` below and the
+``expect`` convention in ``p1hunt/runners/web.py`` for which outcome demonstrates a bug.
 """
 
 from __future__ import annotations
@@ -74,8 +78,16 @@ class ReproSpec:
     harness_path: str = ""        # path to the materialized harness, relative to the workdir
     command: str = ""             # advisory only — runners DERIVE their own argv (no exec of this)
     kind: str = ""                # invariant|fork|differential|call-sequence|exploit|property|policy|...
-    expect: str = "fail"          # outcome that DEMONSTRATES the bug: 'fail' = invariant/assert broken
-    #                               (the default, property/invariant style); 'pass' = exploit assertion held
+    # Which direction the HARNESS'S OWN assertions point — not the desired outcome of the run.
+    # 'fail' (the default): the harness asserts the SECURE behavior (attacker refused, invariant
+    #   holds), so the bug is DEMONSTRATED when the targeted test FAILS. Every refusal-asserting
+    #   harness is 'fail' — including all web authz/payments/GraphQL scaffolds.
+    # 'pass': the harness asserts the INSECURE behavior (it performs the exploit and asserts it
+    #   worked), so the bug is DEMONSTRATED when the targeted test PASSES.
+    # Litmus test: asserting a 403 => 'fail'; asserting a 200 on another principal's object =>
+    # 'pass'. The full convention (and why inverting it is a correctness bug in both directions)
+    # lives in p1hunt/runners/web.py's module docstring.
+    expect: str = "fail"
     test_name: str = ""           # specific test/function to target, if any
     target_code_attribution: str = ""     # exact in-scope target behavior/file:line that owns the defect
     non_target_attribution: str = ""      # harness/mock/scaffold behavior used only to drive the target

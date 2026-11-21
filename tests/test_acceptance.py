@@ -512,17 +512,23 @@ class AgentCapabilities(unittest.TestCase):
             self.assertTrue(bash_safety(good)[0], f"should allow build/test: {good}")
 
     def test_bash_safety_allows_installs_and_network_in_workspace(self):
-        # Loosened workspace-jail model: dependency installs, network egress, and inline
-        # interpreters are ALLOWED — they do not by themselves escape the in-scope folder, which
-        # is the one hard guardrail. (Out-of-workspace writes / secret reads are still denied; see
+        # Loosened workspace-jail model: dependency installs and inline interpreters are ALLOWED —
+        # they do not by themselves escape the in-scope folder, which is the one hard guardrail.
+        # (Out-of-workspace writes / secret reads are still denied; see
         # test_bash_safety_denies_jail_escape_and_out_of_workspace.)
+        #
+        # NETWORK egress is the exception, and deliberately so: the host allowlist is ALWAYS
+        # enforced, so a request to a given host is allowed only once that host is authorized.
+        # `egress_hosts` here is the armed allowlist; see
+        # tests/test_egress_hardening.py::DryRunDoesNotPermitLiveContact for the unarmed case.
         from p1hunt.agents.claude_session import bash_safety
 
         for good in ("npm install x", "pip install requests", "cargo install rg", "go install x",
-                     "git push origin main", "curl https://api.test/data",
+                     "git push origin main",
                      "python3 -c 'import os; os.system(\"ls\")'",
                      "node -e 'require(\"child_process\").exec(\"ls\")'"):
             self.assertTrue(bash_safety(good)[0], f"should allow in jail model: {good}")
+        self.assertTrue(bash_safety("curl https://api.test/data", egress_hosts=["api.test"])[0])
 
 
 class PocSandbox(unittest.TestCase):

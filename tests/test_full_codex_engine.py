@@ -22,12 +22,12 @@ class TestEngineFactory(unittest.TestCase):
 
     def test_default_is_codex(self):
         os.environ.pop("P1HUNT_ENGINE", None)
-        self.assertIsInstance(make_session(model="claude-opus-4-8", **_COMMON), CodexSession)
+        self.assertIsInstance(make_session(model="claude-opus-5-5", **_COMMON), CodexSession)
 
     def test_global_codex_routes_all_roles(self):
         os.environ["P1HUNT_ENGINE"] = "codex"
         # any role, given only a claude model, still becomes a CodexSession
-        self.assertIsInstance(make_session(model="claude-opus-4-8", **_COMMON), CodexSession)
+        self.assertIsInstance(make_session(model="claude-opus-5-5", **_COMMON), CodexSession)
 
     def test_explicit_engine_arg_overrides_env(self):
         os.environ["P1HUNT_ENGINE"] = "codex"
