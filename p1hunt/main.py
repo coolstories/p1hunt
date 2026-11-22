@@ -395,7 +395,28 @@ def _web_hunt(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_scope_note(args: argparse.Namespace) -> None:
+    """Fold --scope-note-file into args.scope_note.
+
+    The file wins when both are given, because the only reason to pass a file is that the
+    note should not be in argv -- so silently preferring the inline copy would defeat it.
+    A note is rules-of-engagement text, not a secret by nature, but an operator may paste
+    account details or an internal hostname into it, and `ps` shows every argument to
+    every user on the machine.
+    """
+    path = str(getattr(args, "scope_note_file", "") or "").strip()
+    if not path:
+        return
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"--scope-note-file: cannot read {path}: {exc}")
+        raise SystemExit(2) from exc
+    args.scope_note = text
+
+
 def _hunt(args: argparse.Namespace) -> int:
+    _resolve_scope_note(args)
     config = Config.from_env()
     _configure_cli_engine(config, args)
     if getattr(args, "claude_account", None):
@@ -986,6 +1007,11 @@ def main(argv: list[str] | None = None) -> int:
                            "in-scope hosts, derive attacker-win hypotheses from observed app behavior, "
                            "and prove them against the live target. Implies run_mode=active; pair with "
                            "--program/--platform (auto-scope the in-scope domains) or a target URL/domain.")
+    hunt.add_argument("--scope-note-file", dest="scope_note_file", default="",
+                      help="Read the scope note from this FILE instead of the command line. "
+                           "Prefer this for anything sensitive: process arguments are "
+                           "world-readable via `ps`, a file is not. Also easier than "
+                           "shell-quoting a multi-line note.")
     hunt.add_argument("--scope-note", dest="scope_note",
                       help="Rules-of-engagement note surfaced to Parent A and the hunters.")
     hunt.add_argument("--engine", choices=("codex", "claude"), default=None,

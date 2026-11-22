@@ -199,27 +199,54 @@ def collect_claims(eng: Path) -> list[dict]:
             doc = data.get("finding") if isinstance(data.get("finding"), dict) else data
             _add(doc, "candidate")
 
-    # Overlay runner verdicts from the status stream, by dedup_key. candidate_status does
-    # not carry a location, which is why it is an overlay on the docs above and not a
-    # claim source of its own.
+    # THE STATUS STREAM IS ALSO A CLAIM SOURCE, not only an overlay.
+    #
+    # This was a real gap, and it reported a successful run as a total failure. A live run
+    # on the Claude engine drove three planted defects all the way to `runner: reproduced`
+    # -- BOLA on /api/v1/accounts/{id}, BFLA on /internal/admin/users, SSRF on
+    # /api/v1/fetch -- and this scorer said CONFIRMED 0/9, because findings.json is only
+    # written at a ROUND BOUNDARY and the round had not closed. The pipeline's candidates
+    # existed solely as candidate_status events.
+    #
+    # They have no `location` field, which is why they were originally an overlay. But
+    # their TITLE carries the endpoint ("BOLA on /api/v1/accounts/{id}"), and `reason`
+    # carries the verifier's evidence -- enough to score, through the same strict
+    # path-token matcher the title fallback already uses. Under-reporting is the safe
+    # direction for a scorer to fail in, but it is still wrong, and here it hid a 3/9.
     by_key = {c["key"]: c for c in claims.values()}
+    synth: dict[str, dict] = {}
     for ev in _read_jsonl(eng / "events.jsonl"):
         data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
-        if data.get("event") != "candidate_status" or data.get("stage") != "runner":
+        if data.get("event") != "candidate_status":
             continue
-        tgt = by_key.get(str(data.get("dedup_key") or ""))
-        if tgt is None:
-            # Fall back to the title, which the hunter usually writes with the endpoint in
-            # it. Only used when the dedup_key is unknown to the docs.
-            title = str(data.get("title") or "").strip().lower()
-            tgt = next((c for c in claims.values()
-                        if title and c["title"].strip().lower() == title), None)
-        if tgt is None:
-            continue
+        key = str(data.get("dedup_key") or "")
+        stage = str(data.get("stage") or "")
         status = str(data.get("status") or "")
-        if status == "reproduced" or not tgt["runner_verdict"]:
+        title = str(data.get("title") or "").strip()
+        tgt = by_key.get(key)
+        if tgt is None:
+            title_l = title.lower()
+            tgt = next((c for c in claims.values()
+                        if title_l and c["title"].strip().lower() == title_l), None)
+        if tgt is None:
+            # No document anywhere records this candidate: build one from the stream.
+            rec = synth.setdefault(key or title, {
+                "key": key or title, "title": title, "location": "", "tier": "candidate",
+                "text": "", "severity": str(data.get("severity") or ""),
+                "runner_verdict": "", "blocked_by": "",
+            })
+            for piece in (title, data.get("reason"), data.get("next_action")):
+                piece = str(piece or "").strip()
+                if piece and piece not in rec["text"]:
+                    rec["text"] = (rec["text"] + " " + piece).strip()
+            if not rec["title"]:
+                rec["title"] = title
+            tgt = rec
+        if stage == "runner" and (status == "reproduced" or not tgt["runner_verdict"]):
             tgt["runner_verdict"] = status
             tgt["blocked_by"] = str(data.get("blocked_by") or "")
+    for key, rec in synth.items():
+        claims.setdefault(key, rec)
     return list(claims.values())
 
 

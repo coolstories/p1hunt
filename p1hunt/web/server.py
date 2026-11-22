@@ -881,8 +881,16 @@ class _Handler(BaseHTTPRequestHandler):
         path = u.path
         if path == "/" or path == "/index.html":
             return self._static("index.html")
-        if path in ("/app.css", "/app.js"):
+        if path in ("/app.css", "/app.js", "/launch.js"):
             return self._static(path.lstrip("/"))
+        if path in ("/launch", "/launch.html", "/new"):
+            return self._static("launch.html")
+        if path == "/api/preflight":
+            # Deliberately a GET with no side effects: it launches a browser and runs a
+            # trivial pytest, nothing more. See p1hunt/doctor.py for why it exists.
+            from .launcher import preflight
+            eng = (q.get("engine", [""])[0] or "").strip().lower()
+            return self._json(preflight(eng if eng in ("claude", "codex") else ""))
         if path == "/api/engagements":
             return self._json(_list_engagements())
         if path == "/api/supervisor":
@@ -911,13 +919,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         u = urlparse(self.path)
-        if u.path not in ("/api/control", "/api/session-limit-check"):
+        if u.path not in ("/api/control", "/api/session-limit-check", "/api/launch",
+                          "/api/parse-scope"):
             return self._send(404, b"not found", "text/plain")
         try:
             n = int(self.headers.get("Content-Length", "0") or 0)
         except ValueError:
             n = 0
-        if n > 64_000 or (n <= 0 and u.path == "/api/control"):
+        # The launch body carries a scope note, which is legitimately long.
+        limit = 256_000 if u.path in ("/api/launch", "/api/parse-scope") else 64_000
+        if n > limit or (n <= 0 and u.path in ("/api/control", "/api/launch",
+                                               "/api/parse-scope")):
             return self._json({"error": "invalid body"}, 400)
         data = {}
         try:
@@ -928,6 +940,29 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"error": "invalid json"}, 400)
         if not isinstance(data, dict):
             return self._json({"error": "invalid json"}, 400)
+        if u.path == "/api/parse-scope":
+            # Deterministic, offline, no side effects: it reads the text it was handed and
+            # says what it concluded, for the operator to confirm. See web/scope_parse.py
+            # for why deriving hosts replaced a free-text target field.
+            from .scope_parse import parse_scope
+            text = str(data.get("scope") or "")
+            if len(text) > 200_000:
+                return self._json({"error": "scope text is too long"}, 400)
+            return self._json(parse_scope(text,
+                                          program_url=str(data.get("program_url") or "")))
+        if u.path == "/api/launch":
+            # Spawning a process from an HTTP request is the most dangerous thing in this
+            # package, so ALL of the validation lives in launcher.py and is unit-tested:
+            # no shell, operator values never in flag positions, credentials into the
+            # child's environment only (argv is world-readable via `ps`), and an explicit
+            # authorization attestation. This handler only translates the result.
+            from .launcher import LaunchError, launch
+            try:
+                return self._json(launch(data))
+            except LaunchError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            except Exception as exc:
+                return self._json({"ok": False, "error": f"launch failed: {exc}"}, 500)
         if u.path == "/api/session-limit-check":
             eng_dir = _safe_eng_dir(str(data.get("eng") or ""))
             if data.get("eng") and eng_dir is None:
@@ -990,6 +1025,7 @@ def serve(host: str = "127.0.0.1", port: int = 8787) -> int:
     print("\n  P1HUNT // THREAT OPERATIONS CENTER")
     print(f"  ├─ engagements : {root.resolve()}")
     print(f"  ├─ serving     : http://{host}:{port}")
+    print(f"  ├─ NEW HUNT    : http://{host}:{port}/launch")
     print("  └─ viewer + control queue · loopback · Ctrl-C to stop\n")
     try:
         srv.serve_forever()
